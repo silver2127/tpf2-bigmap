@@ -87,7 +87,31 @@ static int g_tilesX      = 0;     // 0 = plugin does nothing
 static int g_tilesY      = 0;
 static int g_sizeIndex   = 6;     // which dropdown entry we take over
 static int g_formatIndex = 0;     // 0 = 1:1
-static int g_maxTiles    = 224;   // the stock clamp; raise deliberately
+// 184, NOT the stock clamp of 224. The engine cannot survive 224.
+//
+// "Creating streets" builds a 1-metre occupancy raster over the whole map
+// bounding box (RVA 0x90d410) and sizes it with a 32-bit signed multiply:
+//
+//     mov    eax, [rbx+0x44]          ; ny
+//     imul   eax, dword [rbx+0x40]    ; nx * ny   <-- 32-bit
+//     movsxd rdx, eax                 ; sign-extend into size_t
+//     call   vector<bool>::resize
+//
+// At 224 tiles the map is 56000 m per side, so nx*ny = 56001^2 =
+// 3,136,112,001 > INT_MAX. It wraps to -1,158,855,295, sign-extends to ~1.8e19,
+// and vector<bool>::resize throws std::length_error. Nothing catches it:
+// std::terminate -> abort -> SIGABRT with no message (it is an uncaught C++
+// exception, not an assert, which is why the game's assert handler prints
+// nothing). Confirmed by resolving the thrown object's RTTI in the minidump:
+// .?AVlength_error@std@@
+//
+// The rule is (width_m + 1) * (height_m + 1) <= 2147483647, i.e. <= 46339 m on
+// a square map. 184 tiles = 46000 m -> 46001^2 = 2,116,092,001, fits. 186 tiles
+// = 46500 m -> 2,162,343,001, does not. 185 would fit but is odd.
+//
+// Non-square maps get more in one axis under the same product rule: 300 x 114
+// tiles (75 x 28.5 km) is legal.
+static int g_maxTiles    = 184;
 static int g_logEvery    = 1;
 
 // Even, and inside [2, max]. The engine's own override path asserts on
@@ -136,7 +160,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_tilesY      = H->cfgInt ("tpf2_bigmap", "tiles_y",      0);
     g_sizeIndex   = H->cfgInt ("tpf2_bigmap", "size_index",   6);
     g_formatIndex = H->cfgInt ("tpf2_bigmap", "format_index", 0);
-    g_maxTiles    = H->cfgInt ("tpf2_bigmap", "max_tiles",    224);
+    g_maxTiles    = H->cfgInt ("tpf2_bigmap", "max_tiles",    184);
     g_logEvery    = H->cfgBool("tpf2_bigmap", "log",          1);
 
     if (g_tilesX <= 0 || g_tilesY <= 0) {

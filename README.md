@@ -81,26 +81,62 @@ ratio; the override does not.
 
 **With this plugin**, past the clamp — because a detour never reaches it.
 
-## What is actually known
+## The real ceiling: 184 tiles (46 × 46 km) — MEASURED
 
-| tiles | km | heightmap px | status |
+Not the game's 224 clamp. **224 crashes**, and here is exactly why.
+
+The "Creating streets" pass builds a **1-metre occupancy raster over the whole
+map bounding box** and sizes it with a 32-bit signed multiply (RVA `0x90d410`):
+
+```
+mov    eax, [rbx+0x44]          ; ny
+imul   eax, dword [rbx+0x40]    ; nx * ny   <-- 32-bit signed
+movsxd rdx, eax                 ; sign-extend into size_t
+call   vector<bool>::resize
+```
+
+At 224 tiles the map is 56,000 m per side:
+
+```
+56,001 x 56,001 = 3,136,112,001  >  INT_MAX (2,147,483,647)
+                -> -1,158,855,295 as int32
+                -> sign-extended to ~1.8e19
+                -> std::length_error("vector<bool> too long")
+                -> uncaught -> std::terminate -> abort -> SIGABRT
+```
+
+No message is printed because it is an **uncaught C++ exception, not an
+assert** — the game's assert handler never runs. Confirmed by resolving the
+thrown object's RTTI in the minidump: `.?AVlength_error@std@@`.
+
+**The rule:** `(width_m + 1) * (height_m + 1) <= 2147483647`, i.e. ≤ 46,339 m on
+a square map.
+
+| tiles | km | (m+1)² | status |
 | --- | --- | --- | --- |
-| 96 | 24 | 6,145 | stock Megalomaniac 1:1 |
-| 224 | 56 | 14,337 | the clamp — reachable with no plugin |
-| 256 | 64 | **16,385** | = 2¹⁴+1, the largest dimension the heightmap-import docs quote. The most likely real wall, and the interesting data point |
-| 448 | 112 | 28,673 | int32 pixel arithmetic still holds (28673² = 822M ≪ 2³¹) |
+| 96 | 24 | 0.037e9 | stock Megalomaniac 1:1 |
+| **184** | **46** | **2.116e9** | **largest even square that fits** |
+| 185 | 46.25 | 2.139e9 | fits, but odd (the engine requires even) |
+| 186 | 46.5 | 2.162e9 | **overflows** |
+| 224 | 56 | 3.136e9 | the game's own clamp — **crashes** |
 
-**Nothing above 224 has been shown to work.** This is the instrument for finding
-out, not a claim that it does. Ladder it: 224 → 256 → 320 → 448, and note where
-it stops.
+184 × 184 km is still **3.7× the largest stock map by area** (2,116 km² vs 576).
 
-Expected failure modes, in order: something assuming ≤16,385 px or ≤256 tiles
-(the `terrainEcs.baseLevels < terrainEcs.highLevels` assert hints at a quadtree
-depth); then terrain-tile ECS pressure (448² = 200,704 tile entities); then town
-and industry placement, which scales with area.
+Non-square gets more in one axis under the same product rule — `300 × 114` tiles
+(75 × 28.5 km) is legal, `186 × 186` is not.
 
-Float precision is *not* a risk — at 112 km the world spans ±56 km, where the
-float32 ULP is ~4 mm against 3.9 m terrain resolution.
+Float precision is *not* a risk at any of these sizes — at 46 km the world spans
+±23 km, where the float32 ULP is ~2 mm against 3.9 m terrain resolution.
+
+### Generation cost
+
+Towns and industries are placed at a fixed density per km²
+(`res/config/base_config.lua`: `town.maxNumberPerArea = 0.2`,
+`industry.maxNumberPerArea = 0.8`), so both counts are **strictly linear in
+area** — about 423 towns and 1,693 industries at 46 × 46 km. Industry placement
+is single-threaded and roughly O(N²); the parallel CPU burn is the towns and
+streets passes. If generation is too slow, lowering those two density values is
+the highest-value knob, and it is plain Lua config rather than a patch.
 
 ## Build
 
@@ -108,13 +144,14 @@ Needs VS 2022 Build Tools.
 
 ```
 build.bat            -> out\tpf2_bigmap.dll
-build.bat -deploy    -> also copies into %LOCALAPPDATA%\tpf2mp\plugins\
+build.bat -deploy    -> also copies into %LOCALAPPDATA%\tpf2mp\data\plugins\
 ```
 
 ## Install
 
 1. Install the tpf2mp plugin host (`tpf2_pluginhost.dll` + the `alut.dll` proxy).
-2. Drop `tpf2_bigmap.dll` into `%LOCALAPPDATA%\tpf2mp\plugins\`.
+2. Drop `tpf2_bigmap.dll` into `%LOCALAPPDATA%\tpf2mp\data\plugins\`
+   (or `<game>\plugins\` for a shipped install — the host scans both).
 3. Add a `[tpf2_bigmap]` section to `tpf2mp.cfg`:
 
 ```ini
