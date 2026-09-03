@@ -13,10 +13,11 @@
 //     dim = 1 << terrainLevels          (= 64)
 //     heightmapPx = tiles * dim + 1
 //
-// so ONE TILE IS 250 m (64 px at 3.90625 m/px). Confirmed against real saves:
-// the .sav header (after zstd) carries numTilesX/numTilesY at +0x10/+0x14, and
-// five different maps all land exactly on 250 m/tile -- e.g. Megalomaniac 1:4
-// reads (48, 192) = 12 x 48 km.
+// so ONE TILE IS 256 m (64 px at exactly 4.0 m/px). Confirmed twice: against real
+// saves (the .sav header after zstd carries numTilesX/numTilesY at +0x10/+0x14;
+// Megalomaniac 1:4 reads (48, 192) = 12288 x 49152 m), and against the live bbox
+// the streets pass hands us: 224 tiles -> 57344 m = 224 * 256 exactly.
+// The wiki's "24 km" for Megalomaniac is 24576 m rounded down.
 //
 // WHY A HOOK AND NOT A BYTE PATCH
 // GetNumTilesNew has a hard clamp of 224 tiles per axis:
@@ -36,14 +37,9 @@
 // this plugin to go past it.
 //
 // LIMITS, MEASURED AND INFERRED
-//   224 tiles = 56 km   the stock clamp; reachable with no patching at all
-//   256 tiles = 64 km   heightmap 16385 px = 2^14+1, the largest dimension the
-//                       heightmap-import documentation quotes -- the most likely
-//                       real wall, and the interesting data point
-//   448 tiles = 112 km  heightmap 28673 px; int32 pixel arithmetic still holds
-//                       (28673^2 = 822M, well under 2^31)
-// Nothing above 224 has been shown to work. This plugin is the instrument for
-// finding out, not a claim that it does.
+//   180 tiles = 46.1 km  largest even size the STOCK 1 m street raster survives
+//   224 tiles = 57.3 km  the game's own clamp; needs street_raster=1 (MEASURED OK)
+// 224 tiles with the raster hook is measured working, streets included.
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -134,7 +130,7 @@ static int g_tilesX      = 0;     // 0 = plugin does nothing
 static int g_tilesY      = 0;
 static int g_sizeIndex   = 6;     // which dropdown entry we take over
 static int g_formatIndex = 0;     // 0 = 1:1
-// 184, NOT the stock clamp of 224. The engine cannot survive 224.
+// The engine cannot survive its own 224 clamp with the stock street raster.
 //
 // "Creating streets" builds a 1-metre occupancy raster over the whole map
 // bounding box (RVA 0x90d410) and sizes it with a 32-bit signed multiply:
@@ -152,9 +148,10 @@ static int g_formatIndex = 0;     // 0 = 1:1
 // nothing). Confirmed by resolving the thrown object's RTTI in the minidump:
 // .?AVlength_error@std@@
 //
-// The rule is (width_m + 1) * (height_m + 1) <= 2147483647, i.e. <= 46339 m on
-// a square map. 184 tiles = 46000 m -> 46001^2 = 2,116,092,001, fits. 186 tiles
-// = 46500 m -> 2,162,343,001, does not. 185 would fit but is odd.
+// The rule is (width_m + 1) * (height_m + 1) <= 2147483647, i.e. <= 46339 m on a
+// square map. A tile is 256 m, so 180 tiles = 46080 m -> 46081^2 =
+// 2,123,458,561 fits and 182 tiles = 46592 m -> 2,170,907,649 does not.
+// 180 is therefore the stock ceiling -- but street_raster=1 lifts it.
 //
 // Non-square maps get more in one axis under the same product rule: 300 x 114
 // tiles (75 x 28.5 km) is legal.
@@ -182,7 +179,7 @@ static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
         if (g_logEvery) {
             H->log("size=%d format=%d -> %d x %d tiles (%.1f x %.1f km)",
                    sizeIndex, formatIndex, g_tilesX, g_tilesY,
-                   g_tilesX * 0.25, g_tilesY * 0.25);
+                   g_tilesX * 0.256, g_tilesY * 0.256);
         }
         return packed;
     }
@@ -305,8 +302,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
 
     // 184 tiles = 46 km is where the 1 m raster overflows int32. Past that we
     // are relying on the raster hook, so say so loudly if it is not there.
-    if (!g_origRaster && (g_tilesX > 184 || g_tilesY > 184)) {
-        H->log("WARNING: %d x %d tiles exceeds the 184-tile (46 km) limit of the "
+    if (!g_origRaster && (g_tilesX > 180 || g_tilesY > 180)) {
+        H->log("WARNING: %d x %d tiles exceeds the 180-tile (46.1 km) limit of the "
                "stock 1 m street raster and the raster hook is NOT active. "
                "Generation will abort unless makeInitialStreets=false in "
                "res/config/base_config.lua",
@@ -332,7 +329,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     H->log("size index %d, ratio index %d -> %d x %d tiles = %.1f x %.1f km "
            "(heightmap %d x %d px)",
            g_sizeIndex, g_formatIndex, g_tilesX, g_tilesY,
-           g_tilesX * 0.25, g_tilesY * 0.25,
+           g_tilesX * 0.256, g_tilesY * 0.256,
            g_tilesX * 64 + 1, g_tilesY * 64 + 1);
     return TPF2MP_OK;
 }
