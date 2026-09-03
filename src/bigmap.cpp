@@ -74,6 +74,53 @@ static const uint8_t EXPECTED[STEAL] = {
     0xFE, 0xFF, 0xFF, 0xFF,
 };
 
+// ---------------------------------------------------------------------------
+// The street occupancy raster (RVA 0x90d410)
+// ---------------------------------------------------------------------------
+// "Creating streets" allocates a std::vector<bool> with ONE BIT PER SQUARE
+// METRE across the whole map bounding box, and sizes it with a 32-bit multiply.
+// That is the int32 overflow described above: >46 km square and it aborts.
+//
+// The fix is NOT to widen the multiply. nx and ny are stored as int32 at
+// +0x40/+0x44 and every access computes an index like y*nx + x, so a correctly
+// sized vector would still be addressed with wrapped negative indices past
+// 2^31 cells -- silent corruption instead of a clean abort, which is worse.
+//
+// Instead we change the INPUT. cellSize is an argument (xmm2), so scaling it
+// with map size shrinks nx and ny themselves and every downstream int32 index
+// stays in range untouched. No audit, no corruption risk.
+//
+//   ctor(void* this /*rcx*/, const CVec4f* bbox /*rdx*/, float cellSize /*xmm2*/)
+//   bbox = { minX, minY, maxX, maxY }        (read at +0x00/+0x04/+0x08/+0x0c)
+//   this+0x08 bbox copy, +0x18 cellSize, +0x20 vector<bool>, +0x40 nx, +0x44 ny
+//
+//   24 km stock : 1 m -> 0.58e9 cells (27% of INT_MAX)   -- untouched
+//   56 km       : 2 m -> 0.78e9 cells                    -- 392 MB -> 98 MB
+//   112 km      : 3 m -> 1.39e9 cells
+//
+// Below the threshold this is a no-op: stock maps keep their 1 m raster and
+// behave exactly as before.
+static const uintptr_t RVA_RASTER   = 0x90d410;
+static const int       STEAL_RASTER = 19;
+
+//   48 89 4C 24 08           mov   [rsp+8], rcx
+//   53                       push  rbx
+//   48 83 EC 30              sub   rsp, 0x30
+//   48 C7 44 24 20 FE..FF    mov   qword [rsp+0x20], -2
+static const uint8_t EXPECTED_RASTER[STEAL_RASTER] = {
+    0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x48, 0x83, 0xEC, 0x30,
+    0x48, 0xC7, 0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF,
+};
+
+typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
+static RasterCtorFn g_origRaster = nullptr;
+
+// Cell budget. The hard wall is INT_MAX (2.147e9) for the resize, but every
+// downstream index is int32 too, so leave real headroom rather than sitting
+// just under the cliff.
+static double g_cellBudget = 1.5e9;
+static int    g_rasterOn   = 1;
+
 // CVec2i is 8 bytes and trivially copyable, so it comes back packed in rax:
 // x in the low 32 bits, y in the high 32. Verified at the call site
 // (0x140654bc6): `mov rbx, rax` then `mov ecx, ebx` / `shr r15, 0x20`.
@@ -144,6 +191,41 @@ static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
     return g_orig(sizeIndex, formatIndex, cfg);
 }
 
+// Number of cells the ctor will produce for a given cell size, using the
+// engine's own rounding: n = floor(extent / cell) + 1 per axis.
+static double CellsFor(float w, float h, float cell)
+{
+    double nx = (double)(int)(w / cell) + 1.0;
+    double ny = (double)(int)(h / cell) + 1.0;
+    return nx * ny;
+}
+
+static void* __fastcall RasterDetour(void* self, const float* bbox, float cellSize)
+{
+    float cell = cellSize;
+    if (!(cell > 0.0f)) cell = 1.0f;            // also catches NaN
+    float w = bbox[2] - bbox[0];
+    float h = bbox[3] - bbox[1];
+    if (!(w > 0.0f) || !(h > 0.0f))
+        return g_origRaster(self, bbox, cellSize);   // degenerate: leave alone
+
+    double cells = CellsFor(w, h, cell);
+    if (cells > g_cellBudget) {
+        float grown = cell;
+        // Integer cell sizes only -- a fractional grid buys nothing and makes
+        // the raster harder to reason about. 64 is a sanity stop, not a limit
+        // we expect to reach (it would be a ~3000 km map).
+        for (int i = 0; i < 64 && CellsFor(w, h, grown) > g_cellBudget; ++i)
+            grown += 1.0f;
+        H->log("street raster: %.0f x %.0f m at %.0f m/cell = %.3fe9 cells "
+               "(over budget) -> %.0f m/cell = %.3fe9 cells, %.0f MB",
+               w, h, cell, cells / 1e9, grown,
+               CellsFor(w, h, grown) / 1e9, CellsFor(w, h, grown) / 8.0 / 1e6);
+        cell = grown;
+    }
+    return g_origRaster(self, bbox, cell);
+}
+
 // ---------------------------------------------------------------------------
 extern "C" __declspec(dllexport)
 int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
@@ -160,22 +242,17 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_tilesY      = H->cfgInt ("tpf2_bigmap", "tiles_y",      0);
     g_sizeIndex   = H->cfgInt ("tpf2_bigmap", "size_index",   6);
     g_formatIndex = H->cfgInt ("tpf2_bigmap", "format_index", 0);
-    g_maxTiles    = H->cfgInt ("tpf2_bigmap", "max_tiles",    184);
+    g_maxTiles    = H->cfgInt ("tpf2_bigmap", "max_tiles",    224);
     g_logEvery    = H->cfgBool("tpf2_bigmap", "log",          1);
-
-    if (g_tilesX <= 0 || g_tilesY <= 0) {
-        H->log("tiles_x/tiles_y not set -- nothing to do "
-               "(set them in [tpf2_bigmap] of tpf2mp.cfg)");
-        return TPF2MP_ERR_DISABLED;
+    g_rasterOn    = H->cfgBool("tpf2_bigmap", "street_raster", 1);
+    {
+        int budgetM = H->cfgInt("tpf2_bigmap", "cell_budget_millions", 1500);
+        if (budgetM > 0) g_cellBudget = (double)budgetM * 1e6;
     }
 
-    int wantX = Sanitise(g_tilesX), wantY = Sanitise(g_tilesY);
-    if (wantX != g_tilesX || wantY != g_tilesY) {
-        H->log("requested %d x %d adjusted to %d x %d (must be even, 2..%d)",
-               g_tilesX, g_tilesY, wantX, wantY, g_maxTiles);
-    }
-    g_tilesX = wantX; g_tilesY = wantY;
-
+    // Build checks come FIRST: both hooks need them, and the raster hook is
+    // useful even when this plugin is not choosing the map size (the game's own
+    // settings.lua worldDimensionsOverride reaches sizes that overflow too).
     if (!H->moduleBase()) {
         H->log("not running inside TransportFever2.exe -- refusing to patch");
         return TPF2MP_ERR_BUILD;
@@ -185,19 +262,71 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                "build, so refusing to patch (re-run the recon if the game updated)");
         return TPF2MP_ERR_BUILD;
     }
+
+    int installed = 0;
+
+    // ---- street occupancy raster: scale cell size with map size -----------
+    if (g_rasterOn) {
+        if (!H->verifyBytes(RVA_RASTER, EXPECTED_RASTER, STEAL_RASTER)) {
+            H->log("raster: prologue mismatch at RVA 0x%llx -- NOT hooked; maps "
+                   "over ~46 km will abort in Creating streets",
+                   (unsigned long long)RVA_RASTER);
+        } else {
+            void* t = nullptr;
+            if (H->installHook(H->moduleBase() + RVA_RASTER, (void*)&RasterDetour,
+                               STEAL_RASTER, &t)) {
+                g_origRaster = (RasterCtorFn)t;
+                installed++;
+                H->log("raster: hooked street occupancy ctor at %p, budget %.2fe9 "
+                       "cells (1 m grid kept below that; coarsened above)",
+                       (void*)(H->moduleBase() + RVA_RASTER), g_cellBudget / 1e9);
+            } else {
+                H->log("raster: installHook failed -- NOT hooked");
+            }
+        }
+    } else {
+        H->log("raster: disabled (street_raster=0); the int32 overflow at ~46 km "
+               "is live -- keep makeInitialStreets=false above that size");
+    }
+
+    // ---- map size ----------------------------------------------------------
+    if (g_tilesX <= 0 || g_tilesY <= 0) {
+        H->log("tiles_x/tiles_y not set -- not overriding any map size "
+               "(set them in [tpf2_bigmap] of tpf2mp.cfg)");
+        return installed ? TPF2MP_OK : TPF2MP_ERR_DISABLED;
+    }
+
+    int wantX = Sanitise(g_tilesX), wantY = Sanitise(g_tilesY);
+    if (wantX != g_tilesX || wantY != g_tilesY) {
+        H->log("requested %d x %d adjusted to %d x %d (must be even, 2..%d)",
+               g_tilesX, g_tilesY, wantX, wantY, g_maxTiles);
+    }
+    g_tilesX = wantX; g_tilesY = wantY;
+
+    // 184 tiles = 46 km is where the 1 m raster overflows int32. Past that we
+    // are relying on the raster hook, so say so loudly if it is not there.
+    if (!g_origRaster && (g_tilesX > 184 || g_tilesY > 184)) {
+        H->log("WARNING: %d x %d tiles exceeds the 184-tile (46 km) limit of the "
+               "stock 1 m street raster and the raster hook is NOT active. "
+               "Generation will abort unless makeInitialStreets=false in "
+               "res/config/base_config.lua",
+               g_tilesX, g_tilesY);
+    }
+
     if (!H->verifyBytes(RVA_GETNUMTILES, EXPECTED, STEAL)) {
         H->log("prologue mismatch at RVA 0x%llx -- refusing to patch",
                (unsigned long long)RVA_GETNUMTILES);
-        return TPF2MP_ERR_BUILD;
+        return installed ? TPF2MP_OK : TPF2MP_ERR_BUILD;
     }
 
     void* tramp = nullptr;
     uintptr_t target = H->moduleBase() + RVA_GETNUMTILES;
     if (!H->installHook(target, (void*)&Detour, STEAL, &tramp)) {
         H->log("installHook failed at %p", (void*)target);
-        return TPF2MP_ERR_FAILED;
+        return installed ? TPF2MP_OK : TPF2MP_ERR_FAILED;
     }
     g_orig = (GetNumTilesFn)tramp;
+    installed++;
 
     H->log("hooked GetNumTilesNew at %p (tramp %p)", (void*)target, tramp);
     H->log("size index %d, ratio index %d -> %d x %d tiles = %.1f x %.1f km "

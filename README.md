@@ -81,12 +81,11 @@ ratio; the override does not.
 
 **With this plugin**, past the clamp — because a detour never reaches it.
 
-## The real ceiling: 184 tiles (46 × 46 km) — MEASURED
+## The 184-tile wall, and how the plugin gets past it
 
-Not the game's 224 clamp. **224 crashes**, and here is exactly why.
-
-The "Creating streets" pass builds a **1-metre occupancy raster over the whole
-map bounding box** and sizes it with a 32-bit signed multiply (RVA `0x90d410`):
+The game's own 224-tile clamp is not reachable with stock code. "Creating
+streets" allocates a `std::vector<bool>` with **one bit per square metre** over
+the whole map bounding box, and sizes it with a 32-bit multiply (RVA `0x90d410`):
 
 ```
 mov    eax, [rbx+0x44]          ; ny
@@ -95,48 +94,79 @@ movsxd rdx, eax                 ; sign-extend into size_t
 call   vector<bool>::resize
 ```
 
-At 224 tiles the map is 56,000 m per side:
+At 224 tiles the map is 56,000 m per side, so `56,001² = 3,136,112,001 > INT_MAX`.
+It wraps negative, sign-extends to ~1.8e19, and `resize` throws
+`std::length_error`. Nothing catches it: `terminate` → `abort` → SIGABRT with no
+message, because it is an **uncaught C++ exception, not an assert**. Confirmed by
+resolving the thrown object's RTTI in the minidump (`.?AVlength_error@std@@`).
 
-```
-56,001 x 56,001 = 3,136,112,001  >  INT_MAX (2,147,483,647)
-                -> -1,158,855,295 as int32
-                -> sign-extended to ~1.8e19
-                -> std::length_error("vector<bool> too long")
-                -> uncaught -> std::terminate -> abort -> SIGABRT
-```
+Stock ceiling: `(width_m + 1) × (height_m + 1) ≤ 2,147,483,647`, i.e. **184 tiles
+(46 km)** on a square map. 186 overflows.
 
-No message is printed because it is an **uncaught C++ exception, not an
-assert** — the game's assert handler never runs. Confirmed by resolving the
-thrown object's RTTI in the minidump: `.?AVlength_error@std@@`.
+### Why we do not just widen the multiply
 
-**The rule:** `(width_m + 1) * (height_m + 1) <= 2147483647`, i.e. ≤ 46,339 m on
-a square map.
+Because it would make things worse. `nx` and `ny` are stored as `int32` at
+`+0x40`/`+0x44` and every access computes an index like `y*nx + x`. A correctly
+sized vector would still be addressed with wrapped negative indices past 2³¹
+cells — **silent memory corruption instead of a clean abort**. Fixing it properly
+means auditing every indexing site in the streets pass, and one missed site has
+no symptom.
 
-| tiles | km | (m+1)² | status |
-| --- | --- | --- | --- |
-| 96 | 24 | 0.037e9 | stock Megalomaniac 1:1 |
-| **184** | **46** | **2.116e9** | **largest even square that fits** |
-| 185 | 46.25 | 2.139e9 | fits, but odd (the engine requires even) |
-| 186 | 46.5 | 2.162e9 | **overflows** |
-| 224 | 56 | 3.136e9 | the game's own clamp — **crashes** |
+### What we do instead: scale the cell size (`street_raster=1`)
 
-184 × 184 km is still **3.7× the largest stock map by area** (2,116 km² vs 576).
+`cellSize` is an *argument* (`xmm2`), so the plugin detours the constructor and
+grows it until the cell count fits a budget. `nx` and `ny` shrink, so every
+downstream int32 index stays in range untouched — no audit, no corruption risk.
 
-Non-square gets more in one axis under the same product rule — `300 × 114` tiles
-(75 × 28.5 km) is legal, `186 × 186` is not.
+| map | cell | cells | vs INT_MAX | raster |
+| --- | --- | --- | --- | --- |
+| 24 km (stock) | 1 m | 0.58e9 | 27% | 72 MB — **untouched** |
+| 56 km | 2 m | 0.78e9 | 37% | 98 MB |
+| 112 km | 3 m | 1.39e9 | 65% | 174 MB |
 
-Float precision is *not* a risk at any of these sizes — at 46 km the world spans
-±23 km, where the float32 ULP is ~2 mm against 3.9 m terrain resolution.
+Below the budget it is a no-op, so normal maps keep their 1 m grid and behave
+exactly as before. The cost above it is road-placement granularity — 2 m instead
+of 1 m, against roads 10–20 m wide.
 
 ### Generation cost
 
-Towns and industries are placed at a fixed density per km²
-(`res/config/base_config.lua`: `town.maxNumberPerArea = 0.2`,
-`industry.maxNumberPerArea = 0.8`), so both counts are **strictly linear in
-area** — about 423 towns and 1,693 industries at 46 × 46 km. Industry placement
-is single-threaded and roughly O(N²); the parallel CPU burn is the towns and
-streets passes. If generation is too slow, lowering those two density values is
-the highest-value knob, and it is plain Lua config rather than a patch.
+Towns and industries are placed at a **fixed density per km²**, so both counts
+are strictly linear in area (`res/config/base_config.lua`, consumer decompiled at
+RVA `0x35f480`):
+
+```lua
+town.maxNumberPerArea     = 0.2   -- km^-2
+industry.maxNumberPerArea = 0.8   -- km^-2
+```
+
+At stock density a 56 × 56 km map generates **627 towns and 2,509 industries** —
+5.4× the largest map anyone has ever played. That is not just slow, it is
+probably not the map you want: the point of a big map is more room per industry,
+not more industries.
+
+To get the largest stock map's *counts* spread over 56 × 56 km instead:
+
+```lua
+town.maxNumberPerArea     = 0.0367   -- 627  -> ~115 towns
+industry.maxNumberPerArea = 0.147    -- 2509 -> ~461 industries
+targetMaxNumberPerArea    = 0.147
+```
+
+Industry placement is single-threaded and roughly O(N²)
+(`0.1·N² · tags · placed`), so a 5.4× count reduction is a ~30× cut in that
+pass. The *parallel* burn is the towns and streets passes (27 and 13
+thread-pool functions reachable; industries reaches none).
+
+These are plain Lua config, not patches — but note they are **game files**, so
+Steam's "verify integrity" will revert them.
+
+Stock counts for reference, 1:1 (computed from the formula, not observed):
+
+| size | km | towns | industries |
+| --- | --- | --- | --- |
+| Small | 8 | 13 | 51 |
+| Large | 14 | 39 | 157 |
+| Megalomaniac | 24 | 115 | 461 |
 
 ## Build
 
