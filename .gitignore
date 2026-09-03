@@ -1,0 +1,10 @@
+# build output
+out/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# logs
+*.log
