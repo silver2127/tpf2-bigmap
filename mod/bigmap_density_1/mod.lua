@@ -35,7 +35,9 @@
 --     first big map anyone generates is the 2,600-industry one -- the exact
 --     failure this mod exists to prevent, hit by everyone once.
 --   * x0.18 reproduces the counts of Megalomaniac, the largest map the game
---     ships, at any size. That is a known-good target, not a guess.
+--     ships, at any size. That is a measured target, not a guess: Megalomaniac
+--     1:1 is 604 km^2 -> 36 towns and 290 industries at default dropdowns, and
+--     x0.18 on a 57 km map gives 36 towns and 284 industries.
 --   * It is safe because ENABLING THE MOD IS THE OPT-IN. Leave it disabled and
 --     nothing on any map changes; the game file is untouched.
 --
@@ -46,23 +48,36 @@
 local SCALES = { 1.00, 0.50, 0.30, 0.18, 0.10 }
 
 -- Labels quote the resulting count on a 57.3 x 57.3 km map (3,288 km^2), the
--- size this mod exists to make playable. Stock density is 0.2 towns/km^2 and
--- 0.8 industries/km^2, so the counts below are scale * density * 3288.
--- On a normal-size map every level means proportionally fewer, same as vanilla.
+-- size this mod exists to make playable, WITH THE STOCK DROPDOWNS LEFT AT THEIR
+-- DEFAULTS. That last part matters and is easy to get wrong: the stock "Towns"
+-- and "Number of industries" dropdowns each apply their own multiplier BEFORE
+-- ours, and neither defaults to 1.0.
+--
+--   towns:      0.2/km^2 x 0.3 (Medium)  = 0.06/km^2
+--   industries: 0.8/km^2 x 0.6 (Medium)  = 0.48/km^2
+--
+-- Town multipliers are { Low 0.2, Medium 0.3, High 0.4, Very high 0.5 } and are
+-- applied engine-side, not in Lua. Confirmed twice over: read from the dispatch
+-- sites (0x142f304c8=0.2, 0x142f28810=0.3, 0x142f65170=0.4, inline 0x3f000000=0.5),
+-- and by a real 57 km map that generated 36 towns where 0.0367 x 0.3 x 3288
+-- predicts 36.2. Industry multipliers are { .4, .6, .8, 1.0 } from base_mod.lua:280.
+--
+-- Change a stock dropdown and every number below scales with it. On a
+-- normal-size map every level means proportionally fewer, same as vanilla.
 local TOWN_LABELS = {
-	_("Vanilla  (x1.00)  -- ~660 towns on a 57 km map"),
-	_("Reduced  (x0.50)  -- ~330 towns"),
-	_("Sparse   (x0.30)  -- ~200 towns"),
-	_("Megalomaniac count (x0.18)  -- ~120 towns"),
-	_("Minimal  (x0.10)  -- ~66 towns"),
+	_("Vanilla  (x1.00)  -- ~197 towns on a 57 km map"),
+	_("Reduced  (x0.50)  -- ~99 towns"),
+	_("Sparse   (x0.30)  -- ~59 towns"),
+	_("Megalomaniac count (x0.18)  -- ~36 towns"),
+	_("Minimal  (x0.10)  -- ~20 towns"),
 }
 
 local INDUSTRY_LABELS = {
-	_("Vanilla  (x1.00)  -- ~2630 industries on a 57 km map"),
-	_("Reduced  (x0.50)  -- ~1320 industries"),
-	_("Sparse   (x0.30)  -- ~790 industries"),
-	_("Megalomaniac count (x0.18)  -- ~470 industries"),
-	_("Minimal  (x0.10)  -- ~260 industries"),
+	_("Vanilla  (x1.00)  -- ~1578 industries on a 57 km map"),
+	_("Reduced  (x0.50)  -- ~789 industries"),
+	_("Sparse   (x0.30)  -- ~474 industries"),
+	_("Megalomaniac count (x0.18)  -- ~284 industries"),
+	_("Minimal  (x0.10)  -- ~158 industries"),
 }
 
 function data()
@@ -77,8 +92,8 @@ Selectable town and industry density, for maps far larger than the ones the game
 ships with.
 
 Counts are a density per square kilometre, so they scale with map area. At stock
-density a 57 x 57 km map generates roughly 2,600 industries and 660 towns. These
-two settings scale that down to something playable, and stack with the stock
+density a 57 x 57 km map generates roughly 1,600 industries and 200 towns at the
+default dropdown settings. These two settings scale that down, and stack with the stock
 "Towns" and "Number of industries" dropdowns rather than overriding them.
 
 Both default to Vanilla, so this mod does nothing until you choose a level.

@@ -140,20 +140,43 @@ of 1 m, against roads 10–20 m wide.
 
 ### Town and industry levels: `mod/bigmap_density_1`
 
-Counts are a **fixed density per km²**, so they scale with area. At stock density
-(0.2 towns, 0.8 industries per km²) a 57 × 57 km map generates ~660 towns and
-~2,600 industries — 5.4× the largest map the game ships, which is neither fun nor
-quick to generate.
+Counts are a **fixed density per km²**, so they scale with area. A 57 × 57 km
+map is 3,288 km² — 5.4× the largest map the game ships — and generates ~1,600
+industries and ~200 towns, which is neither fun nor quick to generate.
 
-This repo ships a **Lua mod** that makes that a choice in the New Game menu:
+**Two multipliers are applied before ours, and neither defaults to 1.0.** This is
+the easy thing to get wrong, and getting it wrong overstates every count by
+1.7–3.3×:
 
-| level | scale | towns @ 57 km | industries @ 57 km |
+| | base density | stock dropdown default | effective |
 | --- | --- | --- | --- |
-| Vanilla | ×1.00 | ~660 | ~2630 |
-| Reduced | ×0.50 | ~330 | ~1320 |
-| Sparse | ×0.30 | ~200 | ~790 |
-| **Megalomaniac count** (default) | ×0.18 | ~120 | ~470 |
-| Minimal | ×0.10 | ~66 | ~260 |
+| towns | 0.2 /km² | Medium ×0.3 | 0.06 /km² |
+| industries | 0.8 /km² | Medium ×0.6 | 0.48 /km² |
+
+Town multipliers are `{ Low 0.2, Medium 0.3, High 0.4, Very high 0.5 }`, applied
+**engine-side** — they are not in the shipped Lua. Read from the dispatch sites
+(`0x142f304c8`=0.2, `0x142f28810`=0.3, `0x142f65170`=0.4, inline `0x3f000000`=0.5),
+and independently confirmed by a real map: a 57 km map at the old hand-patched
+0.0367 /km² generated **36 towns**, and `0.0367 × 0.3 × 3288 = 36.2`. That also
+settles a discrepancy this README used to record as unexplained — the "36 towns
+where the formula predicts 115" was the ×0.3, nothing to do with
+`allowInRoughTerrain`. Industry multipliers are `{ .4, .6, .8, 1.0 }` from
+`base_mod.lua:280`.
+
+This repo ships a **Lua mod** that makes the rest a choice in the New Game menu.
+Counts below are for a 57 km map with the stock dropdowns left alone:
+
+| level | scale | towns | industries |
+| --- | --- | --- | --- |
+| Vanilla | ×1.00 | ~197 | ~1578 |
+| Reduced | ×0.50 | ~99 | ~789 |
+| Sparse | ×0.30 | ~59 | ~474 |
+| **Megalomaniac count** (default) | ×0.18 | **~36** | **~284** |
+| Minimal | ×0.10 | ~20 | ~158 |
+
+The default is named for a measured target, not a guess: Megalomaniac 1:1 is
+604 km², which gives **36 towns and 290 industries** at the same default
+dropdowns. ×0.18 on a map 5.4× the size reproduces that to within 2%.
 
 Two design points worth stating, because the obvious alternatives are worse:
 
@@ -196,9 +219,33 @@ Game menu under the base catalog, with no mod in scope.
 The msgids are real and confirmed — `'1:1'`, `'1:2'`, `'1:3'` and
 `'map-sizeMegalomaniac'` all live in `res/strings/*/LC_MESSAGES/base.mo` —
 so the only ways to change them are editing `base.mo` (a game file, reverted by
-Steam) or a DLL hook on the text lookup. Neither is worth it for a cosmetic
-label. Our *own* mod params are unaffected: they resolve while our mod is
-current, so their labels are exactly what `mod.lua` says.
+Steam) or a DLL hook on the text lookup. Our *own* mod params are unaffected:
+they resolve while our mod is current, so their labels are exactly what
+`mod.lua` says.
+
+The DLL route is viable if it ever becomes worth it. `0x14221d1b0` is
+`pgettext(std::string* out, const char* ctx, const char* msgid)` — 172 xrefs, all
+UI text, with 11 clean relocatable prologue bytes. Two traps: the `mov r11,rsp`
+must be **copied into the trampoline**, not skipped, because `r11` is used later
+as a frame base; and the hook must gate on the **context**, not the msgid, since
+`"Tiny"`/`"Small"`/`"Large"`/`"Huge"` are the same `char*` literals the town-size
+dropdown uses. Call the original first — `*out` is uninitialised on entry — then
+append rather than replace, so all 13 languages keep working.
+
+A better idea than relabelling, if the guard below gets written: claim one row
+**per size** (4, 5 and 6) instead of spending the ratio dropdown. Then every
+label stays honest — "Very Large < Huge < Megalomaniac" is still ordinally true
+after a remap, and "1:3" still means 1:3 — with no text hook at all. Nothing on
+the New Game page displays a derived tile count to contradict it:
+`CreatePageNewGame` (`0x14066c2b0`) never calls `GetNumTilesNew`.
+
+**That remap is gated on a guard this plugin does not yet have.** `Detour()`
+receives the raw combo index, and at `0x140674b2f` the engine keys the preset
+table on `sizeIndex` when `experimentalMapSizes` (`GlobalSettings+0x2fc`) is set
+but on `sizeIndex+1` when it is clear. With the flag clear a `size4`/`size5`
+claim would land on a different, stock preset — silently redefining a normal map.
+The shipped ladder is safe from this only because it claims size 6, which is
+unreachable unless the flag is on.
 
 ## Build
 

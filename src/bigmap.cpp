@@ -75,7 +75,7 @@ static const uint8_t EXPECTED[STEAL] = {
 // ---------------------------------------------------------------------------
 // "Creating streets" allocates a std::vector<bool> with ONE BIT PER SQUARE
 // METRE across the whole map bounding box, and sizes it with a 32-bit multiply.
-// That is the int32 overflow described above: >46 km square and it aborts.
+// That is the int32 overflow described above: >46.1 km square and it aborts.
 //
 // The fix is NOT to widen the multiply. nx and ny are stored as int32 at
 // +0x40/+0x44 and every access computes an index like y*nx + x, so a correctly
@@ -90,9 +90,9 @@ static const uint8_t EXPECTED[STEAL] = {
 //   bbox = { minX, minY, maxX, maxY }        (read at +0x00/+0x04/+0x08/+0x0c)
 //   this+0x08 bbox copy, +0x18 cellSize, +0x20 vector<bool>, +0x40 nx, +0x44 ny
 //
-//   24 km stock : 1 m -> 0.58e9 cells (27% of INT_MAX)   -- untouched
-//   56 km       : 2 m -> 0.78e9 cells                    -- 392 MB -> 98 MB
-//   112 km      : 3 m -> 1.39e9 cells
+//   24.6 km stock : 1 m -> 0.60e9 cells (28% of INT_MAX)  -- untouched
+//   57.3 km       : 2 m -> 0.82e9 cells                   -- 411 MB -> 103 MB
+//   114.7 km      : 3 m -> 1.46e9 cells
 //
 // Below the threshold this is a no-op: stock maps keep their 1 m raster and
 // behave exactly as before.
@@ -143,8 +143,8 @@ static int g_formatIndex = 0;     // 0 = 1:1
 // Config form, one key per claimed cell:
 //     size<S>_format<F> = <tilesX>x<tilesY>
 // e.g.  size6_format0 = 96x96      (the stock Megalomaniac 1:1, 24.6 x 24.6 km)
-//       size6_format1 = 160x160    (41 x 41 km)
-//       size6_format2 = 224x224    (57 x 57 km)
+//       size6_format1 = 160x160    (41.0 x 41.0 km)
+//       size6_format2 = 224x224    (57.3 x 57.3 km)
 //
 // Anything not claimed falls through to the game's own function, so every other
 // preset keeps its stock behaviour exactly.
@@ -356,7 +356,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     if (g_rasterOn) {
         if (!H->verifyBytes(RVA_RASTER, EXPECTED_RASTER, STEAL_RASTER)) {
             H->log("raster: prologue mismatch at RVA 0x%llx -- NOT hooked; maps "
-                   "over ~46 km will abort in Creating streets",
+                   "over ~46.1 km will abort in Creating streets",
                    (unsigned long long)RVA_RASTER);
         } else {
             void* t = nullptr;
@@ -372,7 +372,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
             }
         }
     } else {
-        H->log("raster: disabled (street_raster=0); the int32 overflow at ~46 km "
+        H->log("raster: disabled (street_raster=0); the int32 overflow at ~46.1 km "
                "is live -- keep makeInitialStreets=false above that size");
     }
 
