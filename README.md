@@ -30,17 +30,26 @@ dim         = 1 << terrainLevels        // 64
 heightmapPx = tiles * dim + 1
 ```
 
-**One tile is 250 m** (64 px at 3.90625 m/px). That is not inferred — the `.sav`
-header carries `numTilesX`/`numTilesY` at +0x10/+0x14 after zstd decompression,
-and five different real maps all land exactly on 250 m/tile:
+**One tile is 256 m** (64 px at 4.0 m/px). Measured directly: a 224 x 224 map
+reports a world bounding box of **57,344 m** per side, and 57344 / 224 = 256
+exactly. 4.0 m/px is also the round number you would expect a terrain LOD scheme
+to use; 3.90625 is not.
+
+Every shipped preset, at 256 m/tile:
 
 | tiles | km | preset |
 | --- | --- | --- |
-| 18 × 54 | 4.5 × 13.5 | Small 1:3 |
-| 22 × 88 | 5.5 × 22 | Medium 1:4 |
-| 48 × 192 | 12 × 48 | Megalomaniac 1:4 |
-| 54 × 162 | 13.5 × 40.5 | Megalomaniac 1:3 |
-| 66 × 132 | 16.5 × 33 | Megalomaniac 1:2 |
+| 18 x 54 | 4.6 x 13.8 | Small 1:3 |
+| 22 x 88 | 5.6 x 22.5 | Medium 1:4 |
+| 48 x 192 | 12.3 x 49.2 | Megalomaniac 1:4 |
+| 54 x 162 | 13.8 x 41.5 | Megalomaniac 1:3 |
+| 66 x 132 | 16.9 x 33.8 | Megalomaniac 1:2 |
+| 96 x 96 | 24.6 x 24.6 | Megalomaniac 1:1 |
+
+The tile COUNTS come from the `.sav` header (`numTilesX`/`numTilesY` at
++0x10/+0x14 after zstd decompression) and are certain. The km column is derived
+from them -- so it is not independent evidence for the tile size, which is why
+the bounding box above is what settles it.
 
 Read them yourself:
 
@@ -81,7 +90,7 @@ ratio; the override does not.
 
 **With this plugin**, past the clamp — because a detour never reaches it.
 
-## The 184-tile wall, and how the plugin gets past it
+## The 180-tile wall, and how the plugin gets past it
 
 The game's own 224-tile clamp is not reachable with stock code. "Creating
 streets" allocates a `std::vector<bool>` with **one bit per square metre** over
@@ -94,14 +103,15 @@ movsxd rdx, eax                 ; sign-extend into size_t
 call   vector<bool>::resize
 ```
 
-At 224 tiles the map is 56,000 m per side, so `56,001² = 3,136,112,001 > INT_MAX`.
+At 224 tiles the map is 57,344 m per side, so `57,345² = 3,288,449,025 > INT_MAX`.
 It wraps negative, sign-extends to ~1.8e19, and `resize` throws
 `std::length_error`. Nothing catches it: `terminate` → `abort` → SIGABRT with no
 message, because it is an **uncaught C++ exception, not an assert**. Confirmed by
 resolving the thrown object's RTTI in the minidump (`.?AVlength_error@std@@`).
 
-Stock ceiling: `(width_m + 1) × (height_m + 1) ≤ 2,147,483,647`, i.e. **184 tiles
-(46 km)** on a square map. 186 overflows.
+Stock ceiling: `(width_m + 1) × (height_m + 1) ≤ 2,147,483,647`, i.e. width_m ≤
+46,340, i.e. **180 tiles (46.1 km)** on a square map -- tiles must be even, and
+182 (46,592 m) already overflows.
 
 ### Why we do not just widen the multiply
 
@@ -120,53 +130,75 @@ downstream int32 index stays in range untouched — no audit, no corruption risk
 
 | map | cell | cells | vs INT_MAX | raster |
 | --- | --- | --- | --- | --- |
-| 24 km (stock) | 1 m | 0.58e9 | 27% | 72 MB — **untouched** |
-| 56 km | 2 m | 0.78e9 | 37% | 98 MB |
-| 112 km | 3 m | 1.39e9 | 65% | 174 MB |
+| 24.6 km (stock) | 1 m | 0.60e9 | 28% | 75 MB — **untouched** |
+| 57.3 km | 2 m | 0.82e9 | 38% | 103 MB |
+| 114.7 km | 3 m | 1.46e9 | 68% | 183 MB |
 
 Below the budget it is a no-op, so normal maps keep their 1 m grid and behave
 exactly as before. The cost above it is road-placement granularity — 2 m instead
 of 1 m, against roads 10–20 m wide.
 
-### Generation cost
+### Town and industry levels: `mod/bigmap_density_1`
 
-Towns and industries are placed at a **fixed density per km²**, so both counts
-are strictly linear in area (`res/config/base_config.lua`, consumer decompiled at
-RVA `0x35f480`):
+Counts are a **fixed density per km²**, so they scale with area. At stock density
+(0.2 towns, 0.8 industries per km²) a 57 × 57 km map generates ~660 towns and
+~2,600 industries — 5.4× the largest map the game ships, which is neither fun nor
+quick to generate.
 
-```lua
-town.maxNumberPerArea     = 0.2   -- km^-2
-industry.maxNumberPerArea = 0.8   -- km^-2
-```
+This repo ships a **Lua mod** that makes that a choice in the New Game menu:
 
-At stock density a 56 × 56 km map generates **627 towns and 2,509 industries** —
-5.4× the largest map anyone has ever played. That is not just slow, it is
-probably not the map you want: the point of a big map is more room per industry,
-not more industries.
-
-To get the largest stock map's *counts* spread over 56 × 56 km instead:
-
-```lua
-town.maxNumberPerArea     = 0.0367   -- 627  -> ~115 towns
-industry.maxNumberPerArea = 0.147    -- 2509 -> ~461 industries
-targetMaxNumberPerArea    = 0.147
-```
-
-Industry placement is single-threaded and roughly O(N²)
-(`0.1·N² · tags · placed`), so a 5.4× count reduction is a ~30× cut in that
-pass. The *parallel* burn is the towns and streets passes (27 and 13
-thread-pool functions reachable; industries reaches none).
-
-These are plain Lua config, not patches — but note they are **game files**, so
-Steam's "verify integrity" will revert them.
-
-Stock counts for reference, 1:1 (computed from the formula, not observed):
-
-| size | km | towns | industries |
+| level | scale | towns @ 57 km | industries @ 57 km |
 | --- | --- | --- | --- |
-| Small | 8 | 13 | 51 |
-| Large | 14 | 39 | 157 |
-| Megalomaniac | 24 | 115 | 461 |
+| Vanilla | ×1.00 | ~660 | ~2630 |
+| Reduced | ×0.50 | ~330 | ~1320 |
+| Sparse | ×0.30 | ~200 | ~790 |
+| **Megalomaniac count** (default) | ×0.18 | ~120 | ~470 |
+| Minimal | ×0.10 | ~66 | ~260 |
+
+Two design points worth stating, because the obvious alternatives are worse:
+
+**It is a mod, not an edit to `res/config/base_config.lua`.** That file is a game
+file: Steam's *verify integrity of game files* reverts it and an update
+overwrites it, both silently. It is also global, so values tuned for a 57 km map
+make a stock-size map sparse.
+
+**It multiplies `game.config`, it does not assign to it.** `base_mod.lua:280`
+already multiplies industry density by `{.4,.6,.8,1.0}` from the stock "Number of
+industries" dropdown. Multiplication commutes, so our scale and the stock
+dropdown stack instead of fighting — and mod load order, which we do not control,
+stops mattering. Assignment would have made it a race.
+
+The default is ×0.18 rather than vanilla because a mod you had to tick a box named
+"Big Map Density" to enable should not quietly do nothing; ×0.18 reproduces
+Megalomaniac's own counts at any size. Enabling the mod *is* the opt-in — leave it
+off and no map changes.
+
+Install it like any mod: copy `mod/bigmap_density_1` into
+`<game>\mods\`. Enable it when you **create** the map — density is a worldgen
+setting.
+
+### What we could not do: relabel the size dropdown
+
+The ladder above reuses the *ratio* dropdown, so it still reads "1:1 … 1:5" while
+selecting a size. That is not fixable from a mod, and the reason is worth
+recording so nobody retries it:
+
+```
+res/scripts/mod.lua:165
+    local txt = translateModStr(_currentModIdTr, _locale, concatId)
+```
+
+`pGetText` resolves a string against the **currently executing mod's** own table
+only. A mod's `strings.lua` can retranslate strings its own Lua asks for; it can
+never reach a string the base game resolves. `"1:1"` is looked up by the C++ New
+Game menu under the base catalog, with no mod in scope.
+
+The msgids are real and confirmed — `'1:1'`, `'1:2'`, `'1:3'` and
+`'map-sizeMegalomaniac'` all live in `res/strings/*/LC_MESSAGES/base.mo` —
+so the only ways to change them are editing `base.mo` (a game file, reverted by
+Steam) or a DLL hook on the text lookup. Neither is worth it for a cosmetic
+label. Our *own* mod params are unaffected: they resolve while our mod is
+current, so their labels are exactly what `mod.lua` says.
 
 ## Build
 

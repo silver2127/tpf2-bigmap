@@ -130,6 +130,55 @@ static int g_tilesX      = 0;     // 0 = plugin does nothing
 static int g_tilesY      = 0;
 static int g_sizeIndex   = 6;     // which dropdown entry we take over
 static int g_formatIndex = 0;     // 0 = 1:1
+
+// ---------------------------------------------------------------------------
+// A LADDER, not a single size.
+//
+// GetNumTilesNew is asked for every (sizeIndex 0..6, formatIndex 0..4) pair, so
+// the two dropdowns the game already draws are a 7x5 grid we can answer however
+// we like. Claiming one cell gives one big map and no choice; claiming a ROW
+// turns the ratio dropdown into a size selector, which is a usable UI without
+// adding a single widget.
+//
+// Config form, one key per claimed cell:
+//     size<S>_format<F> = <tilesX>x<tilesY>
+// e.g.  size6_format0 = 96x96      (the stock Megalomaniac 1:1, 24.6 x 24.6 km)
+//       size6_format1 = 160x160    (41 x 41 km)
+//       size6_format2 = 224x224    (57 x 57 km)
+//
+// Anything not claimed falls through to the game's own function, so every other
+// preset keeps its stock behaviour exactly.
+//
+// The labels still say "1:1 / 1:2 / 1:3", which will not match what they now
+// produce. That is a real wart and it is why the mapping is config-driven and
+// documented rather than hardcoded: whether the strings can be changed cheaply
+// is still being established, and until then the honest thing is to keep the
+// mapping in one visible place.
+struct Claim { int size, format, tx, ty; };
+static const int MAX_CLAIMS = 35;      // 7 sizes x 5 formats, the whole grid
+static Claim g_claims[MAX_CLAIMS];
+static int   g_numClaims = 0;
+
+// Parse "<w>x<h>", tolerating "<w>X<h>" and surrounding spaces. Returns false
+// on anything it does not fully understand -- a half-parsed size would silently
+// build the wrong map, which is worse than ignoring the line.
+static bool ParseWxH(const char* s, int* w, int* h)
+{
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    long a = strtol(s, &end, 10);
+    if (end == s || a <= 0) return false;
+    while (*end == ' ' || *end == '\t') ++end;
+    if (*end != 'x' && *end != 'X') return false;
+    ++end;
+    const char* p2 = end;
+    long b = strtol(p2, &end, 10);
+    if (end == p2 || b <= 0) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+    if (*end) return false;                 // trailing junk: refuse
+    *w = (int)a; *h = (int)b;
+    return true;
+}
 // The engine cannot survive its own 224 clamp with the stock street raster.
 //
 // "Creating streets" builds a 1-metre occupancy raster over the whole map
@@ -173,6 +222,20 @@ static int Sanitise(int tiles)
 // ---------------------------------------------------------------------------
 static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
 {
+    // The ladder is checked first: an explicit size<S>_format<F> entry is a
+    // deliberate statement about one cell and should beat the older single
+    // tiles_x/tiles_y pair, which is kept only so existing configs keep working.
+    for (int i = 0; i < g_numClaims; ++i) {
+        if (g_claims[i].size == sizeIndex && g_claims[i].format == formatIndex) {
+            int tx = g_claims[i].tx, ty = g_claims[i].ty;
+            uint64_t packed = ((uint64_t)(uint32_t)ty << 32) | (uint32_t)tx;
+            if (g_logEvery) {
+                H->log("size=%d format=%d -> %d x %d tiles (%.1f x %.1f km) [ladder]",
+                       sizeIndex, formatIndex, tx, ty, tx * 0.256, ty * 0.256);
+            }
+            return packed;
+        }
+    }
     if (sizeIndex == g_sizeIndex && formatIndex == g_formatIndex
         && g_tilesX > 0 && g_tilesY > 0) {
         uint64_t packed = ((uint64_t)(uint32_t)g_tilesY << 32) | (uint32_t)g_tilesX;
@@ -184,7 +247,7 @@ static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
         return packed;
     }
     // Not ours: the stock size, computed by the game's own code. Every preset
-    // keeps working, including the one we did not claim.
+    // keeps working, including the ones we did not claim.
     return g_orig(sizeIndex, formatIndex, cfg);
 }
 
@@ -250,6 +313,33 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     // Build checks come FIRST: both hooks need them, and the raster hook is
     // useful even when this plugin is not choosing the map size (the game's own
     // settings.lua worldDimensionsOverride reaches sizes that overflow too).
+    // Read the ladder: one key per (size, format) cell we claim.
+    for (int s = 0; s < 7; ++s) {
+        for (int f = 0; f < 5; ++f) {
+            char key[32];
+            _snprintf_s(key, sizeof(key), _TRUNCATE, "size%d_format%d", s, f);
+            const char* v = H->cfgStr("tpf2_bigmap", key, nullptr);
+            if (!v || !*v) continue;
+            int tx = 0, ty = 0;
+            if (!ParseWxH(v, &tx, &ty)) {
+                H->log("%s = '%s' is not <tiles>x<tiles> -- IGNORED", key, v);
+                continue;
+            }
+            int sx = Sanitise(tx), sy = Sanitise(ty);
+            if (sx != tx || sy != ty) {
+                H->log("%s: %dx%d adjusted to %dx%d (even, 2..%d)",
+                       key, tx, ty, sx, sy, g_maxTiles);
+            }
+            if (g_numClaims < MAX_CLAIMS) {
+                g_claims[g_numClaims].size = s;
+                g_claims[g_numClaims].format = f;
+                g_claims[g_numClaims].tx = sx;
+                g_claims[g_numClaims].ty = sy;
+                ++g_numClaims;
+            }
+        }
+    }
+
     if (!H->moduleBase()) {
         H->log("not running inside TransportFever2.exe -- refusing to patch");
         return TPF2MP_ERR_BUILD;
@@ -287,14 +377,26 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     }
 
     // ---- map size ----------------------------------------------------------
-    if (g_tilesX <= 0 || g_tilesY <= 0) {
-        H->log("tiles_x/tiles_y not set -- not overriding any map size "
-               "(set them in [tpf2_bigmap] of tpf2mp.cfg)");
+    if (g_numClaims > 0) {
+        H->log("map-size ladder: %d cell(s) claimed", g_numClaims);
+        for (int i = 0; i < g_numClaims; ++i) {
+            H->log("   size=%d format=%d -> %d x %d tiles = %.1f x %.1f km "
+                   "(heightmap %d x %d px)",
+                   g_claims[i].size, g_claims[i].format,
+                   g_claims[i].tx, g_claims[i].ty,
+                   g_claims[i].tx * 0.256, g_claims[i].ty * 0.256,
+                   g_claims[i].tx * 64 + 1, g_claims[i].ty * 64 + 1);
+        }
+    }
+    if (g_numClaims == 0 && (g_tilesX <= 0 || g_tilesY <= 0)) {
+        H->log("no map size configured -- set size<S>_format<F> = <w>x<h> "
+               "(or tiles_x/tiles_y) in [tpf2_bigmap] of tpf2mp.cfg");
         return installed ? TPF2MP_OK : TPF2MP_ERR_DISABLED;
     }
 
-    int wantX = Sanitise(g_tilesX), wantY = Sanitise(g_tilesY);
-    if (wantX != g_tilesX || wantY != g_tilesY) {
+    int wantX = Sanitise(g_tilesX > 0 ? g_tilesX : 2);
+    int wantY = Sanitise(g_tilesY > 0 ? g_tilesY : 2);
+    if (g_tilesX > 0 && g_tilesY > 0 && (wantX != g_tilesX || wantY != g_tilesY)) {
         H->log("requested %d x %d adjusted to %d x %d (must be even, 2..%d)",
                g_tilesX, g_tilesY, wantX, wantY, g_maxTiles);
     }
@@ -302,12 +404,17 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
 
     // 184 tiles = 46 km is where the 1 m raster overflows int32. Past that we
     // are relying on the raster hook, so say so loudly if it is not there.
-    if (!g_origRaster && (g_tilesX > 180 || g_tilesY > 180)) {
+    int biggest = (g_tilesX > g_tilesY) ? g_tilesX : g_tilesY;
+    for (int i = 0; i < g_numClaims; ++i) {
+        if (g_claims[i].tx > biggest) biggest = g_claims[i].tx;
+        if (g_claims[i].ty > biggest) biggest = g_claims[i].ty;
+    }
+    if (!g_origRaster && biggest > 180) {
         H->log("WARNING: %d x %d tiles exceeds the 180-tile (46.1 km) limit of the "
                "stock 1 m street raster and the raster hook is NOT active. "
                "Generation will abort unless makeInitialStreets=false in "
                "res/config/base_config.lua",
-               g_tilesX, g_tilesY);
+               biggest, biggest);
     }
 
     if (!H->verifyBytes(RVA_GETNUMTILES, EXPECTED, STEAL)) {
