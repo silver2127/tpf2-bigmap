@@ -161,12 +161,85 @@ The positions are the tell. All 21 distinct duplicate positions have
 `max(|x|,|y|)` between **34,175 and 40,082 m — not one inside 32,768 m** — spread
 evenly over all four edges. A 224-tile map (±28,672 m) shows none of it.
 
-**32,768 = 2¹⁵ = 256 tiles ÷ 2.** Something in the engine stops working past it:
-an `int16` metre coordinate, a spatial index sized for 256 tiles, or a terrain
-quadtree of depth 8. Which one is being established. Until it is patched, **254
-tiles (65.0 km, ±32,512 m) is the largest size predicted clean** — and that is a
-prediction, not yet a measurement. The heightmap-pixel `INT_MAX` ceiling at 722
-tiles described earlier is real but irrelevant: this wall is hit first.
+**32,768 = 2¹⁵ = 256 tiles ÷ 2 — and it is `ecs::OctreeSystem`'s root box.** Every
+street node, construction and vehicle lives in that octree, and its root is a
+two-tier *constant*, never derived from the map:
+
+```
+0x1402304de  cmp dword [r14], 0x80        ; numTilesX > 128 ?
+0x1402304ee  cmp dword [r14+4], 0x80      ; numTilesY > 128 ?
+0x1402304f8  movss xmm2, [32768.0f]       ; > 128 tiles: ±32,768 m
+0x140230500  mov   edx, 0xa               ;              depth 10
+0x140230509  call  Octree::Resize
+```
+
+(≤ 128 tiles gets ±16,384 m / depth 9. There is no third branch.) Inserts never
+test containment, so an entity past the box just walks to the boundary leaf.
+Every query prunes on node boxes *first*, so anything beyond ~32,832 m is
+invisible to lookups — and the street builder, finding nothing there, stacks a
+new node on top of the old one. That is the whole bug.
+
+The `Duplicate base nodes found` lines are printed by a *load-time* repair pass,
+not at creation: the duplicates were made silently during play and reported when
+the autosave reloaded. The repair's merge fails on them and its delete path is
+what trips `ctx.size() >= 2`. An existing 320-tile save is therefore not
+repairable — regenerate.
+
+**The fix (`octree=1`)**: a 13-byte in-place rewrite at `0x1402304f8` that puts
+`65536.0f` inline and asks for depth 11:
+
+```
+b8 00 00 80 47     mov  eax, 0x47800000    ; 65536.0f
+66 0f 6e d0        movd xmm2, eax
+31 d2              xor  edx, edx
+b2 0b              mov  dl, 0xb            ; depth 11
+```
+
+`eax` is dead there and the length is identical, so nothing shifts. The
+`32768.0f` in `.rdata` sits in a `{64, 16384, 32768, FLT_MAX, −90}` run with
+~100 readers and is deliberately **not** touched. Depth 11 is a hard cap — node
+indices are `int32` linear (`child = 8·parent + 1 + octant`) and the renderer's
+skip-manager decoder overflows at level 11+ — so **the patched ceiling is 512
+tiles (131 km)**. The leaf stays 128 m, so query behaviour is unchanged; the cost
+is one extra tree level. The patch is applied only when the config asks for a
+size over 256 tiles.
+
+Byte-verified before writing, and the plugin logs exactly what it did. What is
+*not* yet verified at depth 11 is the renderer's per-level skip vector sizing:
+the first 320-tile map generated with this on is the test.
+
+Terrain LOD at the edge was **not** traced to the same limit. The only
+terrain-side 32,768 is an asymmetric legacy vertex packer (tiles −128..895),
+which can't produce a four-edge effect. If the edge renders right with `octree=1`
+and wrong without, the LOD symptom was octree-driven render culling.
+
+### Industry founding after start
+
+A 320-tile map placed **387 industries — exactly** `round(6711 km² × 0.0576)` —
+and then kept founding more. The spawner was reversed to find out why:
+
+- **What it counts (N):** every `Construction` entity with a non-empty
+  `simBuildings` list. No filter on road connectivity, level or town distance —
+  the 239 unconnected industries count fully.
+- **What it targets (T):** `round(map_area_km² × targetMaxNumberPerArea)`. Whole
+  map, no town term.
+- **Two timers**, both registered only if `spawnIndustries` is true *and* both
+  densities are positive: a fixed-cadence one (`spawnTargetTimeSpan / n`, one
+  attempt per fire, logs `Connect industry`) and a daily probabilistic one
+  (`p = ((T−N)/T)^spawnProbabilityExponent` per newly-supplied building, silent).
+- **Both are gated strictly `N < T`.** The static code cannot found at `N ≥ T`.
+
+So the "counts only connected" and "per-town" theories are both refuted, and the
+foundings past 387 mean a runtime premise was off — most likely
+`targetMaxNumberPerArea` not carrying the mod's scale. The mod now prints target
+and `spawnIndustries` at startup so that is measurable rather than argued.
+
+**The switch that works regardless:** `Industry density target: Disabled` in the
+New Game menu, which sets `spawnIndustries = false` and registers neither timer.
+Closures still happen (that system never reads the flag), so closed industries
+are not replaced; add `closureProbability = 0` to freeze those too. Raising
+road-connect success does **not** touch the founding rate — connectivity is in
+neither N nor T.
 
 ### Town and industry levels: `mod/bigmap_density_1`
 

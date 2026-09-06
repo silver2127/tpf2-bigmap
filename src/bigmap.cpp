@@ -108,6 +108,60 @@ static const uint8_t EXPECTED_RASTER[STEAL_RASTER] = {
     0x48, 0xC7, 0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF,
 };
 
+// ---------------------------------------------------------------------------
+// OCTREE ROOT BOX -- the 32,768 m wall.
+//
+// ecs::OctreeSystem (every street node, construction and vehicle lives in it)
+// gets its root box from a two-tier CONSTANT, never from the map:
+//     tiles <= 128  ->  +-16,384 m, depth  9
+//     tiles  > 128  ->  +-32,768 m, depth 10      (= exactly 256 tiles)
+// Inserts never test containment, so an entity past the box just walks to the
+// boundary leaf. Every query prunes on node boxes FIRST, so anything beyond
+// ~32,832 m is invisible to lookups -- and the street builder, finding nothing
+// there, stacks a new node on top of the old one. MEASURED on a 320-tile map:
+// 21 duplicate-node positions, all with max(|x|,|y|) in [34,175 .. 40,082],
+// not one inside 32,768. Towns in that band never get streets (zero pop).
+//
+// Fix: widen the >128 tier to +-65,536 m, depth 11. Depth 11 is a HARD cap --
+// node indices are int32 linear (child = 8*parent + 1 + octant) and the
+// renderer's skip-manager decoder overflows at level 11+. The leaf stays 128 m
+// so query granularity is unchanged; the cost is one extra level per occupied
+// path. Ceiling with this patch: 512 tiles (131 km). Past that the leaf would
+// have to grow, which is a different patch.
+//
+// Site: RVA 0x2304f8, the sole caller of Octree::Resize for the >128 tier
+// (reached from InitNewGame, CGame::Load, GameState::Load AND
+// GameState::Replicate -- so the multiplayer replicate path is covered too):
+//     f3 0f 10 15 98 4c d3 02   movss xmm2, [rip+0x2d34c98]   ; 32768.0f
+//     ba 0a 00 00 00            mov   edx, 0xa                ; depth 10
+// The 32768.0f lives in a {64, 16384, 32768, FLT_MAX, -90} run in .rdata with
+// ~100 readers, so it is NOT touched; the value goes inline as an immediate:
+//     b8 00 00 80 47            mov   eax, 0x47800000         ; 65536.0f
+//     66 0f 6e d0               movd  xmm2, eax
+//     31 d2                     xor   edx, edx
+//     b2 0b                     mov   dl, 0xb                 ; depth 11
+// eax is dead at that point (the earlier result is already in rbx/[rbp+7] and
+// the call 0x11 bytes later clobbers it). Same 13 bytes, so nothing shifts.
+//
+// Only applied when the config asks for a size over 256 tiles: below that the
+// stock box already contains the whole map, and the one thing NOT yet verified
+// at depth 11 is the renderer's per-level skip vector sizing -- no reason to
+// expose stock-size maps to that.
+static const uintptr_t RVA_OCTREE = 0x2304f8;
+static const uint8_t EXPECTED_OCTREE[13] = {
+    0xf3,0x0f,0x10,0x15,0x98,0x4c,0xd3,0x02,   // movss xmm2,[rip+0x2d34c98]
+    0xba,0x0a,0x00,0x00,0x00                   // mov edx,0xa
+};
+static const uint8_t PATCH_OCTREE[13] = {
+    0xb8,0x00,0x00,0x80,0x47,                  // mov eax,0x47800000 (65536.0f)
+    0x66,0x0f,0x6e,0xd0,                       // movd xmm2,eax
+    0x31,0xd2,                                 // xor edx,edx
+    0xb2,0x0b                                  // mov dl,0xb (depth 11)
+};
+static const int OCTREE_STOCK_TILES  = 256;    // what the shipped box holds
+static const int OCTREE_PATCH_TILES  = 512;    // what the patched box holds
+static bool g_octreeOn = true;
+
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
 static RasterCtorFn g_origRaster = nullptr;
 
@@ -305,6 +359,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_maxTiles    = H->cfgInt ("tpf2_bigmap", "max_tiles",    224);
     g_logEvery    = H->cfgBool("tpf2_bigmap", "log",          1);
     g_rasterOn    = H->cfgBool("tpf2_bigmap", "street_raster", 1);
+    g_octreeOn    = H->cfgBool("tpf2_bigmap", "octree",        1);
     {
         int budgetM = H->cfgInt("tpf2_bigmap", "cell_budget_millions", 1500);
         if (budgetM > 0) g_cellBudget = (double)budgetM * 1e6;
@@ -374,6 +429,38 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     } else {
         H->log("raster: disabled (street_raster=0); the int32 overflow at ~46.1 km "
                "is live -- keep makeInitialStreets=false above that size");
+    }
+
+    // ---- octree root box: +-32768 m -> +-65536 m for maps over 256 tiles ---
+    {
+        int biggest = (g_tilesX > g_tilesY) ? g_tilesX : g_tilesY;
+        for (int i = 0; i < g_numClaims; ++i) {
+            if (g_claims[i].tx > biggest) biggest = g_claims[i].tx;
+            if (g_claims[i].ty > biggest) biggest = g_claims[i].ty;
+        }
+        if (!g_octreeOn) {
+            H->log("octree: disabled (octree=0); maps over %d tiles will grow "
+                   "duplicate street nodes past +-32,768 m", OCTREE_STOCK_TILES);
+        } else if (biggest <= OCTREE_STOCK_TILES) {
+            H->log("octree: not needed (largest configured size %d <= %d tiles), "
+                   "shipped +-32,768 m root left alone", biggest, OCTREE_STOCK_TILES);
+        } else if (!H->verifyBytes(RVA_OCTREE, EXPECTED_OCTREE, sizeof EXPECTED_OCTREE)) {
+            H->log("octree: byte mismatch at RVA 0x%llx -- NOT patched; sizes over "
+                   "%d tiles WILL corrupt street nodes near the edge",
+                   (unsigned long long)RVA_OCTREE, OCTREE_STOCK_TILES);
+        } else if (!H->patchBytes(RVA_OCTREE, PATCH_OCTREE, sizeof PATCH_OCTREE)) {
+            H->log("octree: patchBytes failed at RVA 0x%llx -- NOT patched",
+                   (unsigned long long)RVA_OCTREE);
+        } else {
+            installed++;
+            H->log("octree: root box widened +-32,768 -> +-65,536 m (depth 10 -> 11) "
+                   "at RVA 0x%llx; ceiling is now %d tiles",
+                   (unsigned long long)RVA_OCTREE, OCTREE_PATCH_TILES);
+            if (biggest > OCTREE_PATCH_TILES)
+                H->log("octree: WARNING configured size %d exceeds %d tiles -- the "
+                       "patched box does not reach that far either", biggest,
+                       OCTREE_PATCH_TILES);
+        }
     }
 
     // ---- map size ----------------------------------------------------------
