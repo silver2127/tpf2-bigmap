@@ -188,14 +188,19 @@ Enable it when you CREATE the map -- density is a worldgen setting.
 			print("[bigmap_density] INACTIVE -- game.config.locations missing")
 			return
 		end
+		local dev = game.config.economy and game.config.economy.industryDevelopment
 		print(string.format(
 			"[bigmap_density] ACTIVE  town x%.3f  industry x%.3f"
-			.. "  (town %.4f -> %.4f, industry %.4f -> %.4f per km2)",
+			.. "  (town %.4f -> %.4f, industry %.4f -> %.4f, target %.4f -> %.4f per km2,"
+			.. " spawnIndustries=%s)",
 			townScale, industryScale,
 			loc.town and loc.town.maxNumberPerArea or -1,
 			(loc.town and loc.town.maxNumberPerArea or -1) * townScale,
 			loc.industry and loc.industry.maxNumberPerArea or -1,
-			(loc.industry and loc.industry.maxNumberPerArea or -1) * industryScale))
+			(loc.industry and loc.industry.maxNumberPerArea or -1) * industryScale,
+			loc.industry and loc.industry.targetMaxNumberPerArea or -1,
+			(loc.industry and loc.industry.targetMaxNumberPerArea or -1) * industryScale,
+			tostring(dev and dev.spawnIndustries)))
 
 		if townScale ~= 1.0 and loc.town and loc.town.maxNumberPerArea then
 			loc.town.maxNumberPerArea = loc.town.maxNumberPerArea * townScale

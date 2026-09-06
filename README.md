@@ -138,6 +138,36 @@ Below the budget it is a no-op, so normal maps keep their 1 m grid and behave
 exactly as before. The cost above it is road-placement granularity — 2 m instead
 of 1 m, against roads 10–20 m wide.
 
+### The 32,768 m wall (the real ceiling, for now)
+
+A 320-tile map (±40,960 m) generates fine and then corrupts itself during play.
+The street builder creates **duplicate base nodes** — 2 to 5 nodes at one
+position — and every town-development or industry-connect step that touches one
+fails down the same chain:
+
+```
+Duplicate base nodes found at world position: (36918 / 17379 / 6.75) with entitiy IDs ...
+ Trying to merge duplicate nodes with 2005741
+ Base node deduplication failed.
+ Merging did not succeed, trying to delete now.
+ Trying to delete duplicate node 2005741
+transition_util.cpp:41 GetNodeShapeAttributes: Assertion `ctx.size() >= 2' failed
+```
+
+168 times in half an hour. Towns in the affected band never get streets, so they
+generate with **zero population**; terrain LOD is visibly wrong in the same band.
+
+The positions are the tell. All 21 distinct duplicate positions have
+`max(|x|,|y|)` between **34,175 and 40,082 m — not one inside 32,768 m** — spread
+evenly over all four edges. A 224-tile map (±28,672 m) shows none of it.
+
+**32,768 = 2¹⁵ = 256 tiles ÷ 2.** Something in the engine stops working past it:
+an `int16` metre coordinate, a spatial index sized for 256 tiles, or a terrain
+quadtree of depth 8. Which one is being established. Until it is patched, **254
+tiles (65.0 km, ±32,512 m) is the largest size predicted clean** — and that is a
+prediction, not yet a measurement. The heightmap-pixel `INT_MAX` ceiling at 722
+tiles described earlier is real but irrelevant: this wall is hit first.
+
 ### Town and industry levels: `mod/bigmap_density_1`
 
 Counts are a **fixed density per km²**, so they scale with area. A 57 × 57 km
