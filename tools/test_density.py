@@ -45,8 +45,26 @@ for idx, sc in enumerate(SCALES):
     print(f"  idx={idx} x{sc:<5} town={t:.4f} ind={i:.4f} tgt={tg:.4f}  {'OK' if good else 'MISMATCH exp='+str(exp)}")
 
 # guards
-fresh_game(); runFn(None, None); print("nil allModParams -> no crash, town =", L.globals().game.config.locations.town.maxNumberPerArea)
-fresh_game(); runFn(None, L.table_from({"other_mod": L.table_from({"x":1})})); print("missing our key -> inert, town =", L.globals().game.config.locations.town.maxNumberPerArea)
+fresh_game(); runFn(None, None)
+g1 = L.globals().game.config.locations.town.maxNumberPerArea
+print("nil allModParams -> no crash, town =", g1); ok &= (g1 == 0.2)
+
+fresh_game(); runFn(None, L.table_from({"other_mod": L.table_from({"x":1})}))
+g2 = L.globals().game.config.locations.town.maxNumberPerArea
+print("no params anywhere -> inert, town =", g2); ok &= (g2 == 0.2)
+
+# The reason this test exists: runFn used to call getCurrentModId(), which the
+# loader redefines per-mod at LOAD time, so at world-generation time it names
+# whichever mod loaded last. The mod must still find its own params when the id
+# it was given does not match the key the engine used.
+fresh_game()
+runFn(None, L.table_from({"some_other_mod_that_loaded_last": L.table_from(
+    {"bigmap_town_scale": 4, "bigmap_industry_scale": 4})}))
+g3 = L.globals().game.config.locations.town.maxNumberPerArea
+good3 = abs(g3 - 0.2*0.10) < 1e-9
+ok &= good3
+print(f"params under a DIFFERENT id -> fallback finds them, town = {g3:.4f} "
+      f"({'OK' if good3 else 'MISMATCH exp 0.0200'})")
 fresh_game()
 runFn(None, L.table_from({"bigmap_density_1": L.table_from({"bigmap_town_scale": 99})}))
 print("out-of-range idx -> falls back to 1.0, town =", L.globals().game.config.locations.town.maxNumberPerArea)

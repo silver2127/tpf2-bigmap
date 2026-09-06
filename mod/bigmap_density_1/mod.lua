@@ -50,6 +50,15 @@
 -- falls off roughly 4x every time you double the map's edge. The bottom three
 -- rungs exist so the big sizes have somewhere to land: without them the lowest
 -- setting still gives 631 industries at 115 km and 1288 at 164 km.
+-- Captured at FILE LOAD time, and that timing is the whole point. The loader
+-- injects `function getCurrentModId() return "<id>" end` as a GLOBAL and
+-- redefines it for each mod as that mod's files load (res/scripts/init.lua:106
+-- seeds it as `false`). runFn does not run then -- it runs much later, at world
+-- generation -- so by the time it is called the global names whichever mod
+-- loaded LAST, not us. base_mod.lua:275 dodges the same trap by hardcoding "".
+-- Reading it here, while our own file is being loaded, is the only correct time.
+local MOD_ID = (type(getCurrentModId) == "function") and getCurrentModId() or nil
+
 local SCALES = { 1.00, 0.50, 0.30, 0.18, 0.10, 0.046, 0.022 }
 
 -- Rungs are named for the map size at which they reproduce Megalomaniac's own
@@ -134,10 +143,36 @@ Enable it when you CREATE the map -- density is a worldgen setting.
 	},
 
 	runFn = function(settings, allModParams)
-		-- allModParams is keyed by mod id; the base game uses "" because its own
-		-- getCurrentModId() is nil. Ours is a real id.
-		local params = allModParams and allModParams[getCurrentModId()]
-		if not params then return end   -- no params yet (menu not filled in): stay inert
+		-- allModParams is keyed by mod id. Trust MOD_ID first, but do not depend
+		-- on it: if the engine keyed us under something other than what the
+		-- loader told us we were called, find our table by a key only we declare.
+		-- Identifying ourselves by our own data beats trusting an id we were
+		-- handed, and it costs one short loop over a table with tens of entries.
+		local params = nil
+		if allModParams then
+			if MOD_ID ~= nil then params = allModParams[MOD_ID] end
+			if params == nil then
+				for id, p in pairs(allModParams) do
+					if type(p) == "table" and p["bigmap_town_scale"] ~= nil then
+						params = p
+						print("[bigmap_density] MOD_ID '" .. tostring(MOD_ID)
+						      .. "' missed; found our params under '"
+						      .. tostring(id) .. "'")
+						break
+					end
+				end
+			end
+		end
+		if params == nil then
+			-- Not enabled for this map, or params never reached us. Say so:
+			-- silence here is indistinguishable from working, and that cost a
+			-- whole 320x320 generation once already.
+			print("[bigmap_density] INACTIVE -- no params found (MOD_ID="
+			      .. tostring(MOD_ID) .. ", allModParams="
+			      .. tostring(allModParams ~= nil)
+			      .. "). Densities left at vanilla.")
+			return
+		end
 
 		local function scaleOf(key)
 			local idx = params[key]
@@ -149,7 +184,18 @@ Enable it when you CREATE the map -- density is a worldgen setting.
 		local industryScale = scaleOf("bigmap_industry_scale")
 
 		local loc = game and game.config and game.config.locations
-		if not loc then return end
+		if not loc then
+			print("[bigmap_density] INACTIVE -- game.config.locations missing")
+			return
+		end
+		print(string.format(
+			"[bigmap_density] ACTIVE  town x%.3f  industry x%.3f"
+			.. "  (town %.4f -> %.4f, industry %.4f -> %.4f per km2)",
+			townScale, industryScale,
+			loc.town and loc.town.maxNumberPerArea or -1,
+			(loc.town and loc.town.maxNumberPerArea or -1) * townScale,
+			loc.industry and loc.industry.maxNumberPerArea or -1,
+			(loc.industry and loc.industry.maxNumberPerArea or -1) * industryScale))
 
 		if townScale ~= 1.0 and loc.town and loc.town.maxNumberPerArea then
 			loc.town.maxNumberPerArea = loc.town.maxNumberPerArea * townScale
