@@ -171,8 +171,25 @@ Counts below are for a 57 km map with the stock dropdowns left alone:
 | Vanilla | ×1.00 | ~197 | ~1578 |
 | Reduced | ×0.50 | ~99 | ~789 |
 | Sparse | ×0.30 | ~59 | ~474 |
-| **Megalomaniac count** (default) | ×0.18 | **~36** | **~284** |
+| **Megalomaniac count at 57 km** (default) | ×0.18 | **~36** | **~284** |
 | Minimal | ×0.10 | ~20 | ~158 |
+| Megalomaniac count at 115 km | ×0.046 | ~9 | ~73 |
+| Megalomaniac count at 164 km | ×0.022 | ~4 | ~35 |
+
+**A fixed multiplier does not hold a count as the map grows.** The scale needed to
+keep Megalomaniac's 36 towns / 290 industries is just `604 / area`, so it falls
+off ~4× every time the map's edge doubles: ×0.18 at 57 km, ×0.089 at 82 km,
+×0.046 at 115 km, ×0.022 at 164 km. That is why the bottom two rungs exist and
+why they are named for a size rather than a number — without them the lowest
+setting still produced 631 industries at 115 km and 1,288 at 164 km. Pick the
+rung that names the size you are generating:
+
+| rung | at 320² (82 km) | at 448² (115 km) | at 640² (164 km) |
+| --- | --- | --- | --- |
+| ×0.18 | 72 / 580 | 142 / 1136 | 290 / 2319 |
+| ×0.10 | 40 / 322 | 79 / 631 | 161 / 1288 |
+| ×0.046 | 19 / 148 | **36 / 290** | 74 / 593 |
+| ×0.022 | 9 / 71 | 17 / 139 | **35 / 283** |
 
 The default is named for a measured target, not a guess: Megalomaniac 1:1 is
 604 km², which gives **36 towns and 290 industries** at the same default

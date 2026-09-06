@@ -45,13 +45,20 @@
 -- into base_config.lua by hand (0.0367 towns, 0.147 industries per km^2), so
 -- moving that patch here changes nothing about how existing setups generate.
 
-local SCALES = { 1.00, 0.50, 0.30, 0.18, 0.10 }
+-- A fixed multiplier does NOT hold a count as the map grows -- the scale needed
+-- to keep Megalomaniac's own 36 towns / 290 industries is just 604/area, so it
+-- falls off roughly 4x every time you double the map's edge. The bottom three
+-- rungs exist so the big sizes have somewhere to land: without them the lowest
+-- setting still gives 631 industries at 115 km and 1288 at 164 km.
+local SCALES = { 1.00, 0.50, 0.30, 0.18, 0.10, 0.046, 0.022 }
 
--- Labels quote the resulting count on a 57.3 x 57.3 km map (3,288 km^2), the
--- size this mod exists to make playable, WITH THE STOCK DROPDOWNS LEFT AT THEIR
--- DEFAULTS. That last part matters and is easy to get wrong: the stock "Towns"
--- and "Number of industries" dropdowns each apply their own multiplier BEFORE
--- ours, and neither defaults to 1.0.
+-- Rungs are named for the map size at which they reproduce Megalomaniac's own
+-- counts (36 towns / 290 industries), because "x0.046" means nothing on its own.
+-- Pick the rung that names the size you are generating.
+--
+-- All counts assume THE STOCK DROPDOWNS ARE LEFT AT THEIR DEFAULTS. That matters
+-- and is easy to get wrong: the stock "Towns" and "Number of industries"
+-- dropdowns each apply their own multiplier BEFORE ours, and neither is 1.0.
 --
 --   towns:      0.2/km^2 x 0.3 (Medium)  = 0.06/km^2
 --   industries: 0.8/km^2 x 0.6 (Medium)  = 0.48/km^2
@@ -65,19 +72,23 @@ local SCALES = { 1.00, 0.50, 0.30, 0.18, 0.10 }
 -- Change a stock dropdown and every number below scales with it. On a
 -- normal-size map every level means proportionally fewer, same as vanilla.
 local TOWN_LABELS = {
-	_("Vanilla  (x1.00)  -- ~197 towns on a 57 km map"),
-	_("Reduced  (x0.50)  -- ~99 towns"),
-	_("Sparse   (x0.30)  -- ~59 towns"),
-	_("Megalomaniac count (x0.18)  -- ~36 towns"),
-	_("Minimal  (x0.10)  -- ~20 towns"),
+	_("Vanilla  (x1.00)"),
+	_("Reduced  (x0.50)"),
+	_("Sparse   (x0.30)"),
+	_("Megalomaniac count at 57 km  (x0.18)"),
+	_("Minimal  (x0.10)"),
+	_("Megalomaniac count at 115 km  (x0.046)"),
+	_("Megalomaniac count at 164 km  (x0.022)"),
 }
 
 local INDUSTRY_LABELS = {
-	_("Vanilla  (x1.00)  -- ~1578 industries on a 57 km map"),
-	_("Reduced  (x0.50)  -- ~789 industries"),
-	_("Sparse   (x0.30)  -- ~474 industries"),
-	_("Megalomaniac count (x0.18)  -- ~284 industries"),
-	_("Minimal  (x0.10)  -- ~158 industries"),
+	_("Vanilla  (x1.00)"),
+	_("Reduced  (x0.50)"),
+	_("Sparse   (x0.30)"),
+	_("Megalomaniac count at 57 km  (x0.18)"),
+	_("Minimal  (x0.10)"),
+	_("Megalomaniac count at 115 km  (x0.046)"),
+	_("Megalomaniac count at 164 km  (x0.022)"),
 }
 
 function data()

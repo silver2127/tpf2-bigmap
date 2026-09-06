@@ -29,7 +29,7 @@ print("defaults      :", [params[i]['defaultIndex'] for i in range(1, len(params
 print("town labels   :", len(params[1]['values']), "industry labels:", len(params[2]['values']))
 
 runFn = d['runFn']
-SCALES = [1.00, 0.50, 0.30, 0.18, 0.10]
+SCALES = [1.00, 0.50, 0.30, 0.18, 0.10, 0.046, 0.022]
 ok = True
 for idx, sc in enumerate(SCALES):
     fresh_game()
