@@ -367,46 +367,94 @@ claim would land on a different, stock preset — silently redefining a normal m
 The shipped ladder is safe from this only because it claims size 6, which is
 unreachable unless the flag is on.
 
+## Install
+
+**Download `TpF2BigMaps-<version>.msi` from the
+[latest release](https://github.com/silver2127/tpf2-bigmap/releases) and run it.**
+It finds the Transport Fever 2 folder Steam registered, asks you to confirm it,
+and puts these in place:
+
+| file | what |
+| --- | --- |
+| `alut.dll` | the proxy the game loads in place of its own (the original is kept as `alut_real.dll`) |
+| `tpf2_pluginhost.dll` | the plugin host the proxy loads |
+| `plugins	pf2_bigmap.dll` | this plugin |
+| `plugins	pf2_bigmap.cfg` | its settings — the size ladder, `octree`, `street_raster`. Never overwritten once present, so edits survive upgrades |
+| `modsigmap_density_1\mod.lua` | the town/industry density mod — enable it when you **create** a map |
+
+It also sets the Segment Heap switch for `TransportFever2.exe` (a registry
+value, removed on uninstall) — that is what makes a big map load in about a
+minute instead of a quarter of an hour; the measurements are in the
+[multiplayer installer README](https://github.com/silver2127/tpf2-multiplayer/blob/main/installer/README.md#segment-heap).
+
+Then: New Game → **Megalomaniac**, and the *ratio* dropdown picks the size
+(see the ladder above). Tick **Big Map Density** in the mod list and pick the
+rung that names the size you chose.
+
+### Installing alongside TpF2 Multiplayer
+
+Both packages work in either order and can be removed in either order. They
+share the proxy and the plugin host, and both installers declare those under
+the **same component GUIDs** (`installer/PluginHost.wxs`, byte-identical in both
+repositories), so Windows Installer reference-counts them: the second install
+finds them present, the first uninstall leaves them for the other, and only the
+last one out puts the game's own `alut.dll` back. The custom actions that park
+and restore `alut.dll` check that count too, so uninstalling one product never
+restores the stock library out from under the other.
+
+Each product keeps its own config — this one in `plugins	pf2_bigmap.cfg`, which
+the host merges over `tpf2mp.cfg` — so neither installer touches a file the
+other owns.
+
+`installer	est_coexist.ps1` proves all of it against a throwaway folder with
+the real `msiexec` transactions (both orders, both directions, the shared
+registry value tracked and restored). It needs an elevated PowerShell because
+the packages are per-machine.
+
+### Uninstall
+
+Add/Remove Programs → **TpF2 Big Maps**. Removes the plugin, its config, the
+density mod, and — if TpF2 Multiplayer is not installed — the proxy, the
+plugin host, the Segment Heap value, and restores the stock `alut.dll`. Steam's
+*Verify integrity of game files* also puts the stock `alut.dll` back without
+uninstalling anything; **Repair** from Add/Remove Programs reinstalls the proxy.
+
 ## Build
 
 Needs VS 2022 Build Tools.
 
 ```
-build.bat            -> out\tpf2_bigmap.dll
-build.bat -deploy    -> also copies into %LOCALAPPDATA%\tpf2mp\data\plugins\
+build.bat            -> out	pf2_bigmap.dll
+build.bat -deploy    -> also copies into %LOCALAPPDATA%	pf2mp\data\plugins```
+
+For a dev setup without the MSI: install the tpf2mp plugin host from the
+multiplayer repository (`tpf2_pluginhost.dll` + the `alut.dll` proxy), drop
+`out	pf2_bigmap.dll` and `cfg	pf2_bigmap.cfg` into `<game>\plugins\`, and
+copy `modigmap_density_1` into `<game>\mods\`.
+
+### Building the MSI
+
+```
+toolsendor_host.ps1 -Build          # copies alut.dll, tpf2_pluginhost.dll, tpf2ca.dll
+                                      # from a tpf2-multiplayer checkout beside this repo,
+                                      # and records the source commit in installerendor\VENDORED.md
+installeruild_msi.ps1 -Validate -AcceptWixEula
 ```
 
-## Install
-
-1. Install the tpf2mp plugin host (`tpf2_pluginhost.dll` + the `alut.dll` proxy).
-2. Drop `tpf2_bigmap.dll` into `%LOCALAPPDATA%\tpf2mp\data\plugins\`
-   (or `<game>\plugins\` for a shipped install — the host scans both).
-3. Add a `[tpf2_bigmap]` section to `tpf2mp.cfg`:
-
-```ini
-[tpf2_bigmap]
-enabled=1
-tiles_x=224
-tiles_y=224
-size_index=6      ; 0..6 = Tiny..Megalomaniac
-format_index=0    ; 0..4 = 1:1..1:5
-max_tiles=224     ; raise deliberately to test past the stock clamp
-log=1
-```
-
-With that, picking **Megalomaniac + 1:1** in the New Game menu builds 56 × 56 km.
-Every other combination keeps its stock size — the detour calls the game's own
-function for anything it does not claim.
-
-`tiles_x`/`tiles_y` default to 0, so the plugin is inert until you ask for a
-size. It patches game code; it should not surprise anyone who merely installed it.
+The three shared binaries are built in the multiplayer repository and vendored
+here unchanged: both packages must ship the same bytes under the same GUIDs.
+`build_msi.ps1` refuses to build if `PluginHost.wxs` has drifted from the
+multiplayer copy. WiX v7 asks you to accept its
+[OSMF EULA](https://wixtoolset.org/osmf/); `-AcceptWixEula` passes it
+per-invocation and nothing accepts it for you.
 
 ## Verifying it worked
 
-Check `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log` for the hook line, then
-generate, save, and read `numTilesX`/`numTilesY` back out of the `.sav` header
-with the snippet above. That is a stronger check than trusting the log: it
-proves the value survived generation *and* serialization.
+`%LOCALAPPDATA%	pf2mp\data	pf2mp_host.log` shows the hook lines, the
+`octree:` line, and `merged ...\plugins	pf2_bigmap.cfg`. Then generate, save,
+and read `numTilesX`/`numTilesY` back out of the `.sav` header with the snippet
+near the top of this file — that proves the value survived generation *and*
+serialization, which is stronger than trusting the log.
 
 ## Licence
 

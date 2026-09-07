@@ -8,3 +8,6 @@ out/
 
 # logs
 *.log
+
+# installer build output (the MSI is published as a GitHub release asset)
+installer/out/
