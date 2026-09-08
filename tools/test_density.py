@@ -21,7 +21,7 @@ L.execute(src)
 
 def fresh_game():
     L.execute('game = { config = { locations = { town = { maxNumberPerArea = 0.2 }, '
-              'industry = { maxNumberPerArea = 0.8, targetMaxNumberPerArea = 0.8 } } }')
+              'industry = { maxNumberPerArea = 0.8, targetMaxNumberPerArea = 0.8 } } } }')
 
 d = L.globals().data()
 info = d['info']
