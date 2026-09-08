@@ -10,16 +10,18 @@ density maths is checked without launching Transport Fever 2. Verifies:
 
 Needs `pip install lupa`. Exits non-zero on any mismatch.
 """
-import lupa, io, sys
+from pathlib import Path
+
+import lupa, sys
 L = lupa.LuaRuntime(unpack_returned_tuples=True)
 L.execute('function _(s) return s end')
 L.execute('function getCurrentModId() return "bigmap_density_1" end')
-src = io.open(r'C:\Users\james\tpf2-bigmap\mod\bigmap_density_1\mod.lua', encoding='utf-8').read()
+src = (Path(__file__).resolve().parents[1] / 'mod' / 'bigmap_density_1' / 'mod.lua').read_text(encoding='utf-8')
 L.execute(src)
 
 def fresh_game():
     L.execute('game = { config = { locations = { town = { maxNumberPerArea = 0.2 }, '
-              'industry = { maxNumberPerArea = 0.8, targetMaxNumberPerArea = 0.8 } } } }')
+              'industry = { maxNumberPerArea = 0.8, targetMaxNumberPerArea = 0.8 } } }')
 
 d = L.globals().data()
 info = d['info']
