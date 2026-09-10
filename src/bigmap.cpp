@@ -49,10 +49,22 @@
 static const Tpf2mpHost* H = nullptr;
 
 // ---------------------------------------------------------------------------
-// Target
+// Target builds
 // ---------------------------------------------------------------------------
-static const uintptr_t RVA_GETNUMTILES = 0x674aa0;
-static const int       STEAL           = 20;
+// Every RVA and EXPECTED byte string here is measured on one of TWO binaries
+// that share the same code shape (identical prologues at every hook site):
+//   * Steam build 35924 (2024-12-11) -- the one host->buildOk() knows
+//   * GOG build         (2024-12-12) -- same code, shifted RVAs; the octree
+//     site differs only in the RIP displacement to its .rdata 32768.0f
+// g_gog is set once in Tpf2mpPluginInit by byte-verifying all three sites at
+// their GOG RVAs. A build that is neither fails that check and is refused
+// loudly. Do not add a third build without measuring every site on it.
+static bool g_gog = false;
+
+// GetNumTilesNew: the (size, ratio) dropdowns -> tile count (detoured).
+static const uintptr_t RVA_GETNUMTILES     = 0x674aa0;   // Steam 35924
+static const uintptr_t RVA_GETNUMTILES_GOG = 0x674CC0;   // GOG 2024-12-12
+static const int       STEAL               = 20;
 
 // The exact prologue, so a shifted RVA is a loud refusal instead of a jmp into
 // the middle of some other instruction. 20 bytes lands on an instruction
@@ -96,8 +108,9 @@ static const uint8_t EXPECTED[STEAL] = {
 //
 // Below the threshold this is a no-op: stock maps keep their 1 m raster and
 // behave exactly as before.
-static const uintptr_t RVA_RASTER   = 0x90d410;
-static const int       STEAL_RASTER = 19;
+static const uintptr_t RVA_RASTER     = 0x90d410;   // Steam 35924
+static const uintptr_t RVA_RASTER_GOG = 0x90D500;   // GOG 2024-12-12
+static const int       STEAL_RASTER   = 19;
 
 //   48 89 4C 24 08           mov   [rsp+8], rcx
 //   53                       push  rbx
@@ -147,9 +160,14 @@ static const uint8_t EXPECTED_RASTER[STEAL_RASTER] = {
 // stock box already contains the whole map, and the one thing NOT yet verified
 // at depth 11 is the renderer's per-level skip vector sizing -- no reason to
 // expose stock-size maps to that.
-static const uintptr_t RVA_OCTREE = 0x2304f8;
+static const uintptr_t RVA_OCTREE     = 0x2304f8;   // Steam 35924
+static const uintptr_t RVA_OCTREE_GOG = 0x230718;   // GOG 2024-12-12
 static const uint8_t EXPECTED_OCTREE[13] = {
-    0xf3,0x0f,0x10,0x15,0x98,0x4c,0xd3,0x02,   // movss xmm2,[rip+0x2d34c98]
+    0xf3,0x0f,0x10,0x15,0x98,0x4c,0xd3,0x02,   // movss xmm2,[rip+0x2d34c98]  Steam
+    0xba,0x0a,0x00,0x00,0x00                   // mov edx,0xa
+};
+static const uint8_t EXPECTED_OCTREE_GOG[13] = {
+    0xf3,0x0f,0x10,0x15,0x88,0x0a,0xd2,0x02,   // movss xmm2,[rip+0x2d20a88]  GOG
     0xba,0x0a,0x00,0x00,0x00                   // mov edx,0xa
 };
 static const uint8_t PATCH_OCTREE[13] = {
@@ -346,7 +364,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
 {
     out->name    = "bigmap";
     out->version = "0.1";
-    out->summary = "larger maps than the New Game menu offers (build 35924)";
+    out->summary = "larger maps than the New Game menu offers (Steam 35924 / GOG)";
 
     if (!host || host->abiMajor != TPF2MP_ABI_MAJOR
         || host->size < sizeof(Tpf2mpHost)) return TPF2MP_ERR_ABI;
@@ -399,29 +417,46 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
         H->log("not running inside TransportFever2.exe -- refusing to patch");
         return TPF2MP_ERR_BUILD;
     }
+    // Build detection. host->buildOk() knows the Steam 35924 build. The GOG
+    // build is a second measured binary; detect it by byte-verifying all three
+    // sites at their GOG RVAs. A build that is neither fails here (and at the
+    // per-site guards below) and is refused loudly -- the byte check, not the
+    // PE timestamp, is the guard.
+    g_gog = false;
     if (!H->buildOk()) {
-        H->log("game build is not 35924 -- every RVA here was measured on that "
-               "build, so refusing to patch (re-run the recon if the game updated)");
-        return TPF2MP_ERR_BUILD;
+        g_gog = H->verifyBytes(RVA_GETNUMTILES_GOG, EXPECTED, STEAL)
+             && H->verifyBytes(RVA_RASTER_GOG, EXPECTED_RASTER, STEAL_RASTER)
+             && H->verifyBytes(RVA_OCTREE_GOG, EXPECTED_OCTREE_GOG,
+                               sizeof EXPECTED_OCTREE_GOG);
+        if (g_gog) {
+            H->log("game build is the GOG 2024-12-12 binary -- all three sites "
+                   "byte-verify; using the GOG layout");
+        } else {
+            H->log("game build is neither Steam 35924 nor the GOG 2024-12-12 "
+                   "binary -- every RVA here was measured on those two, so "
+                   "refusing to patch (re-run the recon if the game updated)");
+            return TPF2MP_ERR_BUILD;
+        }
     }
 
     int installed = 0;
 
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {
-        if (!H->verifyBytes(RVA_RASTER, EXPECTED_RASTER, STEAL_RASTER)) {
+        uintptr_t rva = g_gog ? RVA_RASTER_GOG : RVA_RASTER;
+        if (!H->verifyBytes(rva, EXPECTED_RASTER, STEAL_RASTER)) {
             H->log("raster: prologue mismatch at RVA 0x%llx -- NOT hooked; maps "
                    "over ~46.1 km will abort in Creating streets",
-                   (unsigned long long)RVA_RASTER);
+                   (unsigned long long)rva);
         } else {
             void* t = nullptr;
-            if (H->installHook(H->moduleBase() + RVA_RASTER, (void*)&RasterDetour,
+            if (H->installHook(H->moduleBase() + rva, (void*)&RasterDetour,
                                STEAL_RASTER, &t)) {
                 g_origRaster = (RasterCtorFn)t;
                 installed++;
                 H->log("raster: hooked street occupancy ctor at %p, budget %.2fe9 "
                        "cells (1 m grid kept below that; coarsened above)",
-                       (void*)(H->moduleBase() + RVA_RASTER), g_cellBudget / 1e9);
+                       (void*)(H->moduleBase() + rva), g_cellBudget / 1e9);
             } else {
                 H->log("raster: installHook failed -- NOT hooked");
             }
@@ -438,24 +473,26 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
             if (g_claims[i].tx > biggest) biggest = g_claims[i].tx;
             if (g_claims[i].ty > biggest) biggest = g_claims[i].ty;
         }
+        uintptr_t rva = g_gog ? RVA_OCTREE_GOG : RVA_OCTREE;
+        const uint8_t* exp = g_gog ? EXPECTED_OCTREE_GOG : EXPECTED_OCTREE;
         if (!g_octreeOn) {
             H->log("octree: disabled (octree=0); maps over %d tiles will grow "
                    "duplicate street nodes past +-32,768 m", OCTREE_STOCK_TILES);
         } else if (biggest <= OCTREE_STOCK_TILES) {
             H->log("octree: not needed (largest configured size %d <= %d tiles), "
                    "shipped +-32,768 m root left alone", biggest, OCTREE_STOCK_TILES);
-        } else if (!H->verifyBytes(RVA_OCTREE, EXPECTED_OCTREE, sizeof EXPECTED_OCTREE)) {
+        } else if (!H->verifyBytes(rva, exp, 13)) {
             H->log("octree: byte mismatch at RVA 0x%llx -- NOT patched; sizes over "
                    "%d tiles WILL corrupt street nodes near the edge",
-                   (unsigned long long)RVA_OCTREE, OCTREE_STOCK_TILES);
-        } else if (!H->patchBytes(RVA_OCTREE, PATCH_OCTREE, sizeof PATCH_OCTREE)) {
+                   (unsigned long long)rva, OCTREE_STOCK_TILES);
+        } else if (!H->patchBytes(rva, PATCH_OCTREE, sizeof PATCH_OCTREE)) {
             H->log("octree: patchBytes failed at RVA 0x%llx -- NOT patched",
-                   (unsigned long long)RVA_OCTREE);
+                   (unsigned long long)rva);
         } else {
             installed++;
             H->log("octree: root box widened +-32,768 -> +-65,536 m (depth 10 -> 11) "
                    "at RVA 0x%llx; ceiling is now %d tiles",
-                   (unsigned long long)RVA_OCTREE, OCTREE_PATCH_TILES);
+                   (unsigned long long)rva, OCTREE_PATCH_TILES);
             if (biggest > OCTREE_PATCH_TILES)
                 H->log("octree: WARNING configured size %d exceeds %d tiles -- the "
                        "patched box does not reach that far either", biggest,
@@ -504,14 +541,15 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                biggest, biggest);
     }
 
-    if (!H->verifyBytes(RVA_GETNUMTILES, EXPECTED, STEAL)) {
+    uintptr_t rva = g_gog ? RVA_GETNUMTILES_GOG : RVA_GETNUMTILES;
+    if (!H->verifyBytes(rva, EXPECTED, STEAL)) {
         H->log("prologue mismatch at RVA 0x%llx -- refusing to patch",
-               (unsigned long long)RVA_GETNUMTILES);
+               (unsigned long long)rva);
         return installed ? TPF2MP_OK : TPF2MP_ERR_BUILD;
     }
 
     void* tramp = nullptr;
-    uintptr_t target = H->moduleBase() + RVA_GETNUMTILES;
+    uintptr_t target = H->moduleBase() + rva;
     if (!H->installHook(target, (void*)&Detour, STEAL, &tramp)) {
         H->log("installHook failed at %p", (void*)target);
         return installed ? TPF2MP_OK : TPF2MP_ERR_FAILED;
