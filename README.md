@@ -6,9 +6,10 @@ A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
 and has no build-time dependency on the host tree — only the vendored
 `src/tpf2mp_plugin.h`, which is the whole ABI.
 
-Target: **Transport Fever 2 build 35924** (2024-12-11, the last release). Every
-address here was measured on that build, and the plugin refuses to patch
-anything else.
+Target: **Transport Fever 2 build 35924** (Steam, 2024-12-11, the last release)
+and the **GOG 2024-12-12** binary, which shares its code shape at shifted RVAs.
+Every address here was measured on one of those two, the build is picked by
+byte-verifying all three sites, and the plugin refuses to patch anything else.
 
 ---
 
