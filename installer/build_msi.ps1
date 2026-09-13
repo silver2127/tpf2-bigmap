@@ -98,20 +98,21 @@ $proxyDll = Join-Path $Vendor "alut.dll"
 $hostDll  = Join-Path $Vendor "tpf2_pluginhost.dll"
 $caDll    = Join-Path $Vendor "tpf2ca.dll"
 foreach ($f in @($proxyDll, $hostDll, $caDll)) {
-    if (-not (Test-Path $f)) { Fail "missing shared binary: $f -- run tools\vendor_host.ps1 (needs a tpf2-multiplayer checkout beside this repo)" }
+    if (-not (Test-Path $f)) { Fail "missing shared binary: $f -- run tools\vendor_host.ps1 -FromMsi <TpF2Multiplayer.msi> -Release <tag>" }
 }
 $vendored = Join-Path $Vendor "VENDORED.md"
-if (Test-Path $vendored) { Say "shared binaries: $((Get-Content $vendored | Select-String '^source commit').Line)" }
+if (Test-Path $vendored) { Get-Content $vendored | Select-String '^source (release|commit):' | ForEach-Object { Say "shared binaries: $($_.Line)" } }
 else { Warn "vendor\VENDORED.md is missing: the shared binaries' provenance is unrecorded" }
 
 # The shared fragment must be the same file in both repositories. A drift here
 # means the two packages disagree about a component GUID, which is exactly the
-# failure this whole arrangement exists to prevent.
+# failure this whole arrangement exists to prevent. Line endings are not part of
+# it: they follow each checkout's core.autocrlf.
 $sibling = Join-Path (Split-Path -Parent $Repo) "tpf2-multiplayer\installer\PluginHost.wxs"
 if (Test-Path $sibling) {
-    $a = (Get-FileHash (Join-Path $Installer "PluginHost.wxs")).Hash
-    $b = (Get-FileHash $sibling).Hash
-    if ($a -ne $b) { Fail "installer\PluginHost.wxs differs from $sibling -- the two packages must share it byte-for-byte" }
+    $a = [IO.File]::ReadAllText((Join-Path $Installer "PluginHost.wxs")) -replace "`r`n", "`n"
+    $b = [IO.File]::ReadAllText($sibling) -replace "`r`n", "`n"
+    if ($a -cne $b) { Fail "installer\PluginHost.wxs differs from $sibling -- the two packages must share it (line endings aside)" }
     Say "PluginHost.wxs matches the tpf2-multiplayer copy"
 }
 
@@ -133,7 +134,6 @@ $wixArgs = @("build") + $eula + @(
     "-d", "ProductVersion=$Version",
     "-d", "BigmapDll=$bigmapDll",
     "-d", "BigmapCfg=$(Join-Path $Repo 'cfg\tpf2_bigmap.cfg')",
-    "-d", "ModSource=$(Join-Path $Repo 'mod\bigmap_density_1')",
     "-d", "ProxyDll=$proxyDll",
     "-d", "HostDll=$hostDll",
     "-d", "CaDll=$caDll",
