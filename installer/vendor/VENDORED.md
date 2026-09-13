@@ -6,10 +6,10 @@ PluginHost.wxs), so they must be the same bytes. Regenerate with
 `tools\vendor_host.ps1`; never edit or rebuild them here.
 
 source repo:    https://github.com/silver2127/tpf2-multiplayer
-source release: v0.4.18 (TpF2Multiplayer-0.4.18.msi, sha256 66b2367747fe2c092e011e2a49f60d9fb17052727e57ca6a1e28b12bcbaed3fe)
-source commit:  5351b5824ae4e5c192ef6182c73617a1d3ce6130 (the tag)
+source release: v0.4.19 (TpF2Multiplayer-v0.4.19.msi, sha256 5c4f94cee2c2ac31668bcbd28ce5914124ea91790ea42588e2cf9d9a133ab630)
+source commit:  ea402aa230dadc08d14279dd4b0434fe5e7267e5 (the tag)
 extracted:      alut.dll and tpf2_pluginhost.dll from an administrative image, tpf2ca.dll from the Binary table
-vendored on:    2026-09-12 20:11
+vendored on:    2026-09-13 12:58
 
 | file | bytes | sha256 |
 | --- | --- | --- |
