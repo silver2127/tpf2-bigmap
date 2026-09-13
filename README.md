@@ -6,10 +6,14 @@ A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
 and has no build-time dependency on the host tree — only the vendored
 `src/tpf2mp_plugin.h`, which is the whole ABI.
 
-Target: **Transport Fever 2 build 35924** (Steam, 2024-12-11, the last release)
-and the **GOG 2024-12-12** binary, which shares its code shape at shifted RVAs.
-Every address here was measured on one of those two, the build is picked by
-byte-verifying all three sites, and the plugin refuses to patch anything else.
+Target: **Transport Fever 2 build 35924** (Steam, 2024-12-11, the last release).
+Every address here was measured on it, each site is byte-verified before it is
+patched, and the plugin refuses to patch anything else.
+
+**GOG is not supported** (since 0.2.0). The installer refuses a GOG folder, and the
+New Game menu rows and density levels exist only for the Steam binary. The GOG
+addresses 0.1.1 added for the size ladder, street raster and octree are still in
+`src/bigmap.cpp`, but nothing tests or maintains them.
 
 ---
 
@@ -232,8 +236,9 @@ and then kept founding more. The spawner was reversed to find out why:
 
 So the "counts only connected" and "per-town" theories are both refuted, and the
 foundings past 387 mean a runtime premise was off — most likely
-`targetMaxNumberPerArea` not carrying the mod's scale. The mod now prints target
-and `spawnIndustries` at startup so that is measurable rather than argued.
+`targetMaxNumberPerArea` not carrying the density scale. The added density levels
+set the target and the start density from the same multiplier, and
+`tools/test_newgame_menu.py` asserts both.
 
 **The switch that works regardless:** `Industry density target: Disabled` in the
 New Game menu, which sets `spawnIndustries = false` and registers neither timer.
@@ -242,7 +247,7 @@ are not replaced; add `closureProbability = 0` to freeze those too. Raising
 road-connect success does **not** touch the founding rate — connectivity is in
 neither N nor T.
 
-### Town and industry levels: `mod/bigmap_density_1`
+### Town and industry levels: the density levels
 
 Counts are a **fixed density per km²**, so they scale with area. A 57 × 57 km
 map is 3,288 km² — 5.4× the largest map the game ships — and generates ~1,600
@@ -267,18 +272,20 @@ where the formula predicts 115" was the ×0.3, nothing to do with
 `allowInRoughTerrain`. Industry multipliers are `{ .4, .6, .8, 1.0 }` from
 `base_mod.lua:280`.
 
-This repo ships a **Lua mod** that makes the rest a choice in the New Game menu.
-Counts below are for a 57 km map with the stock dropdowns left alone:
+The plugin adds six levels to the end of the vanilla *Towns*, *Number of
+industries* and *Industry density target* dropdowns, after *Very high* (see *How
+the levels get there* below). Each level is a scale on the stock **Medium**, which
+stays the default. Counts are for a 57 km map:
 
 | level | scale | towns | industries |
 | --- | --- | --- | --- |
-| Vanilla | ×1.00 | ~197 | ~1578 |
+| Medium (the stock default) | ×1.00 | ~197 | ~1578 |
 | Reduced | ×0.50 | ~99 | ~789 |
 | Sparse | ×0.30 | ~59 | ~474 |
-| **Megalomaniac count at 57 km** (default) | ×0.18 | **~36** | **~284** |
+| Megalomaniac count at 56 km | ×0.18 | ~36 | ~284 |
 | Minimal | ×0.10 | ~20 | ~158 |
-| Megalomaniac count at 115 km | ×0.046 | ~9 | ~73 |
-| Megalomaniac count at 164 km | ×0.022 | ~4 | ~35 |
+| Megalomaniac count at 112 km | ×0.046 | ~9 | ~73 |
+| Megalomaniac count at 160 km | ×0.022 | ~4 | ~35 |
 
 **A fixed multiplier does not hold a count as the map grows.** The scale needed to
 keep Megalomaniac's 36 towns / 290 industries is just `604 / area`, so it falls
@@ -295,35 +302,70 @@ rung that names the size you are generating:
 | ×0.046 | 19 / 148 | **36 / 290** | 74 / 593 |
 | ×0.022 | 9 / 71 | 17 / 139 | **35 / 283** |
 
-The default is named for a measured target, not a guess: Megalomaniac 1:1 is
-604 km², which gives **36 towns and 290 industries** at the same default
-dropdowns. ×0.18 on a map 5.4× the size reproduces that to within 2%.
+The rung names are measured targets, not guesses: Megalomaniac 1:1 is 604 km²,
+which gives **36 towns and 290 industries** at the default stock dropdowns, and
+×0.18 on a map 5.4× that size (224 tiles) reproduces those counts to within 2% —
+hence its name. The ×0.046 and ×0.022 rungs are pinned the same way at 448 and
+640 tiles. The names use the km **the game shows** for a size, which is tiles ÷ 4
+(a 224-tile map reads "56 km" although it measures 57.3 km), so they match the
+size dropdown's rows.
 
-Two design points worth stating, because the obvious alternatives are worse:
+#### How the levels get there
 
-**It is a mod, not an edit to `res/config/base_config.lua`.** That file is a game
-file: Steam's *verify integrity of game files* reverts it and an update
-overwrites it, both silently. It is also global, so values tuned for a 57 km map
-make a stock-size map sparse.
+The New Game page draws *Towns*, *Number of industries* and *Industry density
+target* from base_mod's own params, so the new levels are extra entries in those
+lists — the same way the size rows are extra entries in the size dropdown. Nothing
+is added to the page and no stock index moves: the six levels sit after *Very
+high*, as indices 4–9. Each list's consumer then has to understand those indices
+(`newgame_density=1`, Steam 35924 only):
 
-**It multiplies `game.config`, it does not assign to it.** `base_mod.lua:280`
-already multiplies industry density by `{.4,.6,.8,1.0}` from the stock "Number of
-industries" dropdown. Multiplication commutes, so our scale and the stock
-dropdown stack instead of fighting — and mod load order, which we do not control,
-stops mattering. Assignment would have made it a race.
+1. **Number of industries and Industry density target** reach `runFn` as indices
+   into `industryFreq = { .4, .6, .8, 1.0 }`. The page stores the industries choice
+   as the start index and that + 1 as the target (past *Disabled*), so one
+   appended multiplier per level (Medium ×0.6 × scale) serves both.
+2. **Towns** never reaches Lua. The preview/generation params refresh
+   (`0x14065b620`) maps the index inline — `0 → 0.2, 1 → 0.3, 2 → 0.4, 3 → 0.5`,
+   anything else `→ 1.0` — into the params object Start generates from (Start only
+   logs the index, and no other code in the exe maps it). The plugin redirects the
+   *3 / anything else* tail of that switch to a small stub: 3 stays 0.5, the new
+   levels answer Medium ×0.3 × scale, anything else stays 1.0. The instruction the
+   other cases jump to stays in place, and the switch is byte-verified first.
+3. **The labels and the `industryFreq` tail** go into `res/config/base_mod.lua`.
+   The plugin **patches the game's file on every start**: it takes the stock text
+   (the file itself, or the `base_mod.lua.bigmapbak` backup once the file is
+   patched), applies anchored inserts, requiring each anchor to match exactly once,
+   and writes only when the result differs. A game update or Steam's *verify
+   integrity* is re-patched on the next start; a file whose anchors moved is left
+   alone, levels off, with the reason in the log.
 
-The default is ×0.18 rather than vanilla because a mod you had to tick a box named
-"Big Map Density" to enable should not quietly do nothing; ×0.18 reproduces
-Megalomaniac's own counts at any size. Enabling the mod *is* the opt-in — leave it
-off and no map changes.
+Design points:
 
-Install it like any mod: copy `mod/bigmap_density_1` into
-`<game>\mods\`. Enable it when you **create** the map — density is a worldgen
-setting.
+**It scales Medium, it does not replace anything.** The four stock levels and the
+Medium default behave exactly as in vanilla; the new ones continue below them. The
+lower levels are named for the map size at which they reproduce Megalomaniac's own
+counts, because "×0.046" means nothing on its own.
+
+**A save made with an added industry level needs Big Maps to load.** `runFn` runs
+on *load* as well as at generation, with the index stored in the save, and the
+stock `industryFreq` has no entry past *Very high* — without the patch that is a
+Lua error, not a fallback. So **every player of a multiplayer game on such a map
+needs Big Maps**, and before removing it, set *Number of industries* back to a stock
+level (the page remembers the choice). Whenever the levels cannot go live (the GOG
+build, a byte mismatch, `newgame_density=0`) the plugin puts the stock
+`base_mod.lua` back, and uninstalling does too. Towns only matter at generation, so
+no save depends on the stub.
+
+`runFn` prints `[tpf2_bigmap] industry density level N: x…` to the game's stdout
+when an added industry level is in use. `tools/test_newgame_menu.py` tests it
+offline: the patcher cases through the DLL's own code, the uninstall restore
+through rundll32, the Towns stub's machine code called directly, and the patched
+`base_mod.lua` under Lua 5.2. The standalone `mod/bigmap_density_1` this replaces
+is gone — its settings only ever appeared in the mod list, and with both installed
+a map would be scaled twice.
 
 ### What we could not do: relabel the size dropdown
 
-The ladder above reuses the *ratio* dropdown, so it still reads "1:1 … 1:5" while
+The size6 ratio ladder (an opt-in example in the cfg) reuses the *ratio* dropdown, so it still reads "1:1 … 1:5" while
 selecting a size. That is not fixable from a mod, and the reason is worth
 recording so nobody retries it:
 
@@ -338,11 +380,11 @@ never reach a string the base game resolves. `"1:1"` is looked up by the C++ New
 Game menu under the base catalog, with no mod in scope.
 
 The msgids are real and confirmed — `'1:1'`, `'1:2'`, `'1:3'` and
-`'map-sizeMegalomaniac'` all live in `res/strings/*/LC_MESSAGES/base.mo` —
+`'map-size\x04Megalomaniac'` all live in `res/strings/*/LC_MESSAGES/base.mo` —
 so the only ways to change them are editing `base.mo` (a game file, reverted by
-Steam) or a DLL hook on the text lookup. Our *own* mod params are unaffected:
-they resolve while our mod is current, so their labels are exactly what
-`mod.lua` says.
+Steam) or a DLL hook on the text lookup. The entries this plugin adds are
+unaffected: their labels are strings it supplies itself — `size_label<N>` for the
+size rows, the Lua it inserts into `base_mod.lua` for the density levels.
 
 The DLL route is viable if it ever becomes worth it. `0x14221d1b0` is
 `pgettext(std::string* out, const char* ctx, const char* msgid)` — 172 xrefs, all
@@ -365,8 +407,35 @@ receives the raw combo index, and at `0x140674b2f` the engine keys the preset
 table on `sizeIndex` when `experimentalMapSizes` (`GlobalSettings+0x2fc`) is set
 but on `sizeIndex+1` when it is clear. With the flag clear a `size4`/`size5`
 claim would land on a different, stock preset — silently redefining a normal map.
-The shipped ladder is safe from this only because it claims size 6, which is
+The cfg's size6 example is safe from this only because it claims size 6, which is
 unreachable unless the flag is on.
+
+### Adding size rows instead of taking a vanilla one (`add_size_rows`)
+
+`add_size_rows=1` (the default; Steam 35924 only) **appends** entries to the
+vanilla size dropdown rather than overwriting a stock preset. The dropdown is built
+at one call site (`0x14066ce79`) by a combo factory (`0x142326290`) from a
+`vector<std::string>` of names: base_mod.lua's four (Small … Very Large) with
+*experimental map sizes* off, the C++'s own seven (Tiny … Megalomaniac) with it on.
+The plugin hooks the factory, acts only for that call's return address
+(`0x14066ce7e`), records how many stock rows there are, and appends its own
+`size_label<N>` rows by rebuilding the vector with the engine's own constructor.
+
+`GetNumTilesNew` gets the **raw combo index** from all three of its callers, so the
+detour reads `index >= stock rows` as added row `index − stock rows` and answers it
+from that row's `size<N>_format<F>` claims before the engine's own lookup. That is
+what lets the rows work with the flag **off** too — there the engine would add 1 to
+the index, building a stock preset, and assert past 6. It also sidesteps the
+`experimentalMapSizes` keying trap above: an added row is recognised by its
+position after the stock rows, whichever list is showing. The shipped cfg defines a
+ladder of squares labelled 32 x 32 km to 128 x 128 km — the km the game itself
+shows for those sizes (tiles ÷ 4). The ratio dropdown shapes them like the stock
+sizes: 1:k keeps about the square's area (short side = side ÷ √k to an even tile
+count, long side k times that), the layout of the game's own preset table
+(`0x140881070`: Megalomaniac 96², 66×132, 54×162, 48×192), with the long side
+capped at 512 tiles. A `size<N>_format<F>` cell set in the cfg overrides that one
+shape. A byte mismatch or the GOG build skips the hook and the dropdown stays
+stock.
 
 ## Install
 
@@ -379,18 +448,27 @@ and puts these in place:
 | --- | --- |
 | `alut.dll` | the proxy the game loads in place of its own (the original is kept as `alut_real.dll`) |
 | `tpf2_pluginhost.dll` | the plugin host the proxy loads |
-| `plugins	pf2_bigmap.dll` | this plugin |
-| `plugins	pf2_bigmap.cfg` | its settings — the size ladder, `octree`, `street_raster`. Never overwritten once present, so edits survive upgrades |
-| `modsigmap_density_1\mod.lua` | the town/industry density mod — enable it when you **create** a map |
+| `plugins\tpf2_bigmap.dll` | this plugin |
+| `plugins\tpf2_bigmap.cfg` | its settings — the size ladder, `octree`, `street_raster`. Never overwritten once present, so edits survive upgrades |
+
+At game start the plugin also adds the density levels to the game's own
+`res\config\base_mod.lua`, keeping the stock file beside it as
+`base_mod.lua.bigmapbak` (see *How the levels get there*).
 
 It also sets the Segment Heap switch for `TransportFever2.exe` (a registry
 value, removed on uninstall) — that is what makes a big map load in about a
 minute instead of a quarter of an hour; the measurements are in the
 [multiplayer installer README](https://github.com/silver2127/tpf2-multiplayer/blob/main/installer/README.md#segment-heap).
 
-Then: New Game → **Megalomaniac**, and the *ratio* dropdown picks the size
-(see the ladder above). Tick **Big Map Density** in the mod list and pick the
-rung that names the size you chose.
+Then: **New Game**. The size dropdown has rows after the stock sizes, from
+32 x 32 km up to 128 x 128 km, with *experimental map sizes* on or off, and
+*Towns*, *Number of industries* and *Industry density target* have six more levels
+after *Very high* — pick the one that names the size you chose. Every stock size,
+Megalomaniac included, stays vanilla, and the ratio dropdown shapes the added rows
+the way it shapes the stock ones. To set a shape yourself, add a
+`size<N>_format<F> = <w>x<h>` cell -- both axes even, each up to 512 tiles with
+`octree=1`, and the area within the street-raster budget (`street_raster=1` scales
+the cell to keep it there).
 
 ### Installing alongside TpF2 Multiplayer
 
@@ -403,20 +481,21 @@ last one out puts the game's own `alut.dll` back. The custom actions that park
 and restore `alut.dll` check that count too, so uninstalling one product never
 restores the stock library out from under the other.
 
-Each product keeps its own config — this one in `plugins	pf2_bigmap.cfg`, which
+Each product keeps its own config — this one in `plugins\tpf2_bigmap.cfg`, which
 the host merges over `tpf2mp.cfg` — so neither installer touches a file the
 other owns.
 
-`installer	est_coexist.ps1` proves all of it against a throwaway folder with
+`installer\test_coexist.ps1` proves all of it against a throwaway folder with
 the real `msiexec` transactions (both orders, both directions, the shared
 registry value tracked and restored). It needs an elevated PowerShell because
 the packages are per-machine.
 
 ### Uninstall
 
-Add/Remove Programs → **TpF2 Big Maps**. Removes the plugin, its config, the
-density mod, and — if TpF2 Multiplayer is not installed — the proxy, the
-plugin host, the Segment Heap value, and restores the stock `alut.dll`. Steam's
+Add/Remove Programs → **TpF2 Big Maps**. Puts the stock `res\config\base_mod.lua`
+back (the plugin's own restore, run through rundll32 before its files go), then
+removes the plugin, its config, and — if TpF2 Multiplayer is not installed — the
+proxy, the plugin host, the Segment Heap value, and restores the stock `alut.dll`. Steam's
 *Verify integrity of game files* also puts the stock `alut.dll` back without
 uninstalling anything; **Repair** from Add/Remove Programs reinstalls the proxy.
 
@@ -425,34 +504,43 @@ uninstalling anything; **Repair** from Add/Remove Programs reinstalls the proxy.
 Needs VS 2022 Build Tools.
 
 ```
-build.bat            -> out	pf2_bigmap.dll
-build.bat -deploy    -> also copies into %LOCALAPPDATA%	pf2mp\data\plugins```
+build.bat            -> out\tpf2_bigmap.dll
+build.bat -deploy    -> also copies into %LOCALAPPDATA%\tpf2mp\data\plugins\
+python tools\test_newgame_menu.py   -> offline test of the New Game rows' base_mod.lua patch (pip install lupa)
+```
 
 For a dev setup without the MSI: install the tpf2mp plugin host from the
 multiplayer repository (`tpf2_pluginhost.dll` + the `alut.dll` proxy), drop
-`out	pf2_bigmap.dll` and `cfg	pf2_bigmap.cfg` into `<game>\plugins\`, and
-copy `modigmap_density_1` into `<game>\mods\`.
+`out\tpf2_bigmap.dll` and `cfg\tpf2_bigmap.cfg` into `<game>\plugins\`. If an
+older build left `<game>\mods\bigmap_density_1` behind, delete it: with it enabled
+a map would be scaled twice.
 
 ### Building the MSI
 
 ```
-toolsendor_host.ps1 -Build          # copies alut.dll, tpf2_pluginhost.dll, tpf2ca.dll
-                                      # from a tpf2-multiplayer checkout beside this repo,
-                                      # and records the source commit in installerendor\VENDORED.md
-installeruild_msi.ps1 -Validate -AcceptWixEula
+tools\vendor_host.ps1 -FromMsi TpF2Multiplayer.msi -Release v0.4.18
+                                      # alut.dll, tpf2_pluginhost.dll, tpf2ca.dll out of the
+                                      # latest TpF2 Multiplayer release MSI; the source goes
+                                      # into installer\vendor\VENDORED.md
+installer\build_msi.ps1 -Validate -AcceptWixEula
 ```
 
 The three shared binaries are built in the multiplayer repository and vendored
 here unchanged: both packages must ship the same bytes under the same GUIDs.
-`build_msi.ps1` refuses to build if `PluginHost.wxs` has drifted from the
-multiplayer copy. WiX v7 asks you to accept its
+Vendor them from the **latest multiplayer release MSI** before each release. A
+rebuild of the same commit gives different bytes, so an install of one product
+could replace the other's copy. `tools\vendor_host.ps1 -Build` vendors from a
+checkout's build outputs instead (dev only). `build_msi.ps1` refuses to build if
+`PluginHost.wxs` has drifted from the multiplayer copy (line endings aside). WiX v7 asks you to accept its
 [OSMF EULA](https://wixtoolset.org/osmf/); `-AcceptWixEula` passes it
 per-invocation and nothing accepts it for you.
 
 ## Verifying it worked
 
-`%LOCALAPPDATA%	pf2mp\data	pf2mp_host.log` shows the hook lines, the
-`octree:` line, and `merged ...\plugins	pf2_bigmap.cfg`. Then generate, save,
+`%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log` shows the hook lines, the
+`octree:` line, `merged ...\plugins\tpf2_bigmap.cfg`, and for the New Game menu
+`base_mod.lua: ...`, `density levels: live` and `size rows: live` at start, then
+`size dropdown: N stock row(s) + 9 added` each time the page opens. Then generate, save,
 and read `numTilesX`/`numTilesY` back out of the `.sav` header with the snippet
 near the top of this file — that proves the value survived generation *and*
 serialization, which is stronger than trusting the log.

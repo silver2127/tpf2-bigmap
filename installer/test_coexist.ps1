@@ -93,7 +93,7 @@ function IfeoSet { $v = (Get-ItemProperty $IFEO -Name FrontEndHeapDebugOptions -
 
 $products = @{
     MP  = @{ name = 'TpF2 Multiplayer'; msi = $MpMsi;  own = @('tpf2_menu.dll', 'tpf2_slice.dll', 'tpf2_bridge_mp.dll', 'netpunch\netpunch.exe', 'mods\mp_lockstep_1\mod.lua') }
-    Big = @{ name = 'TpF2 Big Maps';    msi = $BigMsi; own = @('plugins\tpf2_bigmap.dll', 'plugins\tpf2_bigmap.cfg', 'mods\bigmap_density_1\mod.lua') }
+    Big = @{ name = 'TpF2 Big Maps';    msi = $BigMsi; own = @('plugins\tpf2_bigmap.dll', 'plugins\tpf2_bigmap.cfg') }
 }
 $shared = @('alut.dll', 'tpf2_pluginhost.dll')
 
