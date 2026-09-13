@@ -66,6 +66,15 @@ set "PATH=%VC%\bin\Hostx64\x64;%PATH%"
 cd /d "%~dp0"
 if not exist out mkdir out
 
+if /i "%1"=="-pager-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_terrain_pager.cpp /Fo:out\test_terrain_pager.obj /Fe:out\test_terrain_pager.exe
+    exit /b
+)
+if /i "%1"=="-codec-bench" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\benchmark_terrain_codec.cpp /Fo:out\benchmark_terrain_codec.obj /Fe:out\benchmark_terrain_codec.exe
+    exit /b
+)
+
 cl /nologo /O2 /MT /W3 /EHsc /c src\bigmap.cpp /Fo:out\bigmap.obj || exit /b 1
 link /nologo /DLL /OUT:out\tpf2_bigmap.dll out\bigmap.obj          || exit /b 1
 echo BUILD BIGMAP OK

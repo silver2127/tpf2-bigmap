@@ -2,6 +2,18 @@
 
 Maps larger than Transport Fever 2's New Game menu will build.
 
+Experimental [generation performance modes](docs/generation-performance.md)
+add a configurable placement budget and conservative Desert terrain-buffer
+reuse without changing map resolution or octree depth.
+
+[World-entry performance](docs/world-entry-performance.md) adds stage timings
+and an experimental material-index loop optimization based on a live profile.
+
+Large-map preview placement also includes a fix for signed distance-squared
+overflow above approximately 185 km separation. See
+[placement-distance.md](docs/placement-distance.md) for the reverse-engineered
+sites and offline validation; an in-game regeneration check is still pending.
+
 A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
 and has no build-time dependency on the host tree — only the vendored
 `src/tpf2mp_plugin.h`, which is the whole ABI.
@@ -202,16 +214,19 @@ b2 0b              mov  dl, 0xb            ; depth 11
 
 `eax` is dead there and the length is identical, so nothing shifts. The
 `32768.0f` in `.rdata` sits in a `{64, 16384, 32768, FLT_MAX, −90}` run with
-~100 readers and is deliberately **not** touched. Depth 11 is a hard cap — node
-indices are `int32` linear (`child = 8·parent + 1 + octant`) and the renderer's
-skip-manager decoder overflows at level 11+ — so **the patched ceiling is 512
-tiles (131 km)**. The leaf stays 128 m, so query behaviour is unchanged; the cost
-is one extra tree level. The patch is applied only when the config asks for a
-size over 256 tiles.
+~100 readers and is deliberately **not** touched. Depth 11 is the cap of the original node-ID scheme, so the default patched
+ceiling remains **512 tiles (131 km)** with 128 m leaves. The default patch is
+applied only when the configuration asks for a size over 256 tiles.
 
-Byte-verified before writing, and the plugin logs exactly what it did. What is
-*not* yet verified at depth 11 is the renderer's per-level skip vector sizing:
-the first 320-tile map generated with this on is the test.
+**Experimental actual depths 12 and 13 are available.** Set `octree_depth=13`
+and `max_tiles=2048` for **2,048-tile (524.288 km) edge capacity**, or depth 12
+and `max_tiles=1024` for 262.144 km. Both retain **128 m leaves**. The patch
+assigns compact IDs to levels 11/12 and updates the renderer's level decoder.
+It is byte-verified and tested offline against original engine insertion
+instructions, but **not yet validated in a running game**. Heightmap area
+limits still apply, so the longest maps must be narrow. See
+[the implementation and test notes](docs/octree-depth12.md) for configuration,
+evidence and remaining live checks. Defaults retain depth 11.
 
 Terrain LOD at the edge was **not** traced to the same limit. The only
 terrain-side 32,768 is an asymmetric legacy vertex packer (tiles −128..895),
@@ -544,6 +559,53 @@ per-invocation and nothing accepts it for you.
 and read `numTilesX`/`numTilesY` back out of the `.sav` header with the snippet
 near the top of this file — that proves the value survived generation *and*
 serialization, which is stronger than trusting the log.
+
+## Extended map ratios
+
+New Game ratios can now extend through **1:20** with `max_ratio=20` (Steam).
+Both stock and added size rows are supported; map-edge and heightmap limits
+still apply. See [map-ratios.md](docs/map-ratios.md) for dimensions and validation.
+
+## Experimental gameplay RAM reduction
+
+**Lossless 1 m cache compression is implemented separately**: set
+`terrain_cache_spacing_m=1`, `terrain_cache_compress=1` and optionally
+`terrain_cache_hot_mb=1024`, then restart. `terrain_cache_warm_mb=4096` provides
+a temporary larger resident allowance during generation/bulk allocation.
+Version 2 improves lossless encoding, reuses unchanged compressed tiles, and
+shares compressed COW copies. Native ownership/concurrency tests, world loading
+and two connected rail builds followed by save/reload pass. Runtime terrain backing settled near
+2.55 GiB on the 114x570-tile world. It preserves every sample and the octree.
+See [terrain-compression.md](docs/terrain-compression.md) for measured codec
+results, the fixed-address paging mechanism and validation status.
+
+The renderer upload mismatch is patched: 131x131 buffered CPU samples are
+expanded temporarily to the stock 259x259 GPU upload, including borders.
+**The 2 m experiment is discontinued after repeated terrain fragments, large
+tile seams and a rail construction crash. Keep the active setting at 1 m.**
+An alignment-coordinate bridge was deployed; the subsequent construction
+prototype was only built and unit-tested, and is not a validated gameplay fix.
+
+`terrain_cache_spacing_m=2` uses a 2 m derived terrain height cache when creating
+or loading a world. On the measured 114x570-tile map, the calculated cache
+payload saving is 5.98 GiB. The 4 m source heightmap and octree depth remain
+unchanged; fine terrain alignment and deformation become coarser.
+
+Use `1` and reload to restore 1 m caches. `0` preserves the saved/default
+resolution. Steam 35924 only, experimental; full gameplay verification is
+pending. See [gameplay-memory.md](docs/gameplay-memory.md) for evidence, tests
+and rollback. Build and run `python tools/test_terrain_cache.py` to check the
+hook and original game allocation instructions without modifying the game.
+
+## Faster autosaves and manual saves
+
+`save_fast=1` uses zstd level 1 and a 64 KiB input buffer for save streams.
+A full-save compression benchmark was 2.79x faster with 9.23% larger output;
+manual saves of the current world measured 13.7 and 14.4 seconds. A controlled
+same-world comparison with stock total save time remains outstanding.
+Save contents and format are unchanged. Set `0` and restart to restore stock
+compression. See [save-performance.md](docs/save-performance.md) for validation
+and limitations.
 
 ## Licence
 
