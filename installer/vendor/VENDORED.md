@@ -5,13 +5,14 @@ unchanged. Both packages ship them under the SAME component GUIDs (see
 PluginHost.wxs), so they must be the same bytes. Regenerate with
 `tools\vendor_host.ps1`; never edit or rebuild them here.
 
-source repo:   https://github.com/silver2127/tpf2-multiplayer
-source commit: c90e97d81c97018f3fc45468419923a97da94f7d (c90e97d, branch plugin-host)
-source tree:   clean
-vendored on:   2026-09-07 14:12
+source repo:    https://github.com/silver2127/tpf2-multiplayer
+source release: v0.4.18 (TpF2Multiplayer-0.4.18.msi, sha256 66b2367747fe2c092e011e2a49f60d9fb17052727e57ca6a1e28b12bcbaed3fe)
+source commit:  5351b5824ae4e5c192ef6182c73617a1d3ce6130 (the tag)
+extracted:      alut.dll and tpf2_pluginhost.dll from an administrative image, tpf2ca.dll from the Binary table
+vendored on:    2026-09-12 20:11
 
 | file | bytes | sha256 |
 | --- | --- | --- |
-| alut.dll | 161792 | f218c90fd24479930c0f7f07693a8922710d6569befb250c854b3329cee934bb |
-| tpf2_pluginhost.dll | 219136 | 4c3bbdbe1241c0db72da5d5f80bbaa89ed8f1ece81b6b0e51d9ad7c4ab2165c1 |
-| tpf2ca.dll | 139264 | 83d4e3d9fcf8c5551287cb3d7180e6cf9e2d35d39486d38d1a7bf982b78254b8 |
+| alut.dll | 177664 | c1a7c8e01eb10b3f478d50012b5b8f39105740785d7ff028fde8b2ef84387965 |
+| tpf2_pluginhost.dll | 218624 | cde64c6542e89d3bf931c0677d9d5f248ac0a08b3107da451da69074144f5fa4 |
+| tpf2ca.dll | 216064 | fb97fb38851a7e5d87a8479ae19535947bc80b83b92f063eda21501b51aa60e4 |
