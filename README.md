@@ -464,7 +464,7 @@ and puts these in place:
 | `alut.dll` | the proxy the game loads in place of its own (the original is kept as `alut_real.dll`) |
 | `tpf2_pluginhost.dll` | the plugin host the proxy loads |
 | `plugins\tpf2_bigmap.dll` | this plugin |
-| `plugins\tpf2_bigmap.cfg` | its settings — the size ladder, `octree`, `street_raster`. Never overwritten once present, so edits survive upgrades |
+| `plugins\tpf2_bigmap.cfg` | its settings — the size ladder, `octree`, `street_raster`. Replaced on install, upgrade and repair with the release settings |
 
 At game start the plugin also adds the density levels to the game's own
 `res\config\base_mod.lua`, keeping the stock file beside it as
@@ -610,3 +610,9 @@ and limitations.
 ## Licence
 
 MIT. See `LICENSE`.
+
+## 0.3.1 configuration reset
+
+The MSI replaces existing `plugins/tpf2_bigmap.cfg`, including user edits, with the tuned release config on install, upgrade and repair. It restores depth 13, a 2048-tile edge cap, 50 placement attempts, material-index acceleration, fast saving, loading diagnostics, and lossless terrain compression at 1 m spacing. Hot/warm cache budgets remain 1024/4096 MiB and the maximum ratio remains 1:20. The discontinued 2 m cache is not enabled.
+
+The config uses the package version in the MSI File table so an existing unversioned, modified config is replaced. `tools/test_config_msi.py --wix <wix.exe>` verifies upgrade and repair with an isolated per-user fixture.
