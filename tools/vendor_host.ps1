@@ -214,5 +214,13 @@ public static class VendorMsiBinary {
     Set-Content (Join-Path $Vendor "VENDORED.md") ($lines -join "`n") -Encoding utf8
     Say "wrote vendor\VENDORED.md ($(($provenance | Select-Object -Skip 1 -First 1).Trim()))" "Green"
 } finally {
-    if ($stage -and (Test-Path $stage)) { Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue }
+    if ($stage -and (Test-Path $stage)) {
+        $resolvedStage = (Resolve-Path -LiteralPath $stage).Path
+        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolvedStage.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            (Split-Path -Leaf $resolvedStage) -notlike 'tpf2bigmap-vendor-*') {
+            throw "Refusing cleanup outside the vendor temporary directory: $resolvedStage"
+        }
+        Remove-Item -LiteralPath $resolvedStage -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

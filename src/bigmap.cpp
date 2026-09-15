@@ -142,12 +142,14 @@ static const uint8_t EXPECTED_RASTER[STEAL_RASTER] = {
 // 21 duplicate-node positions, all with max(|x|,|y|) in [34,175 .. 40,082],
 // not one inside 32,768. Towns in that band never get streets (zero pop).
 //
-// Fix: widen the >128 tier to +-65,536 m, depth 11. Depth 11 is a HARD cap --
+// Default fix: widen the >128 tier to +-65,536 m, depth 11. Depth 11 caps the
+// STOCK ID scheme; octree_depth12.h supplies an experimental replacement for
+// level-11/12 IDs, allowing actual depth 12/13 with the same 128 m leaves.
 // node indices are int32 linear (child = 8*parent + 1 + octant) and the
 // renderer's skip-manager decoder overflows at level 11+. The leaf stays 128 m
 // so query granularity is unchanged; the cost is one extra level per occupied
-// path. Ceiling with this patch: 512 tiles (131 km). Past that the leaf would
-// have to grow, which is a different patch.
+// path. Default ceiling: 512 tiles (131 km). See docs/octree-depth12.md for
+// the opt-in 1024/2048-tile modes and their offline-only validation status.
 //
 // Site: RVA 0x2304f8, the sole caller of Octree::Resize for the >128 tier
 // (reached from InitNewGame, CGame::Load, GameState::Load AND
@@ -186,6 +188,14 @@ static const uint8_t PATCH_OCTREE[13] = {
 static const int OCTREE_STOCK_TILES  = 256;    // what the shipped box holds
 static const int OCTREE_PATCH_TILES  = 512;    // what the patched box holds
 static bool g_octreeOn = true;
+
+#include "octree_depth12.h"
+#include "placement_distance.h"
+#include "world_entry.h"
+#include "material_index.h"
+#include "terrain_cache.h"
+#include "terrain_compression.h"
+#include "save_fast.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
 static RasterCtorFn g_origRaster = nullptr;
@@ -234,7 +244,9 @@ static int g_formatIndex = 0;     // 0 = 1:1
 // is still being established, and until then the honest thing is to keep the
 // mapping in one visible place.
 struct Claim { int size, format, tx, ty; };
-static const int MAX_CLAIMS = 95;      // up to 19 sizes x 5 formats (7 stock + up to 12 added rows)
+static const int MAX_RATIOS = 20;
+static int g_maxRatio = MAX_RATIOS;
+static const int MAX_CLAIMS = 19 * MAX_RATIOS;
 static Claim g_claims[MAX_CLAIMS];
 
 // ---------------------------------------------------------------------------
@@ -405,12 +417,15 @@ static int g_logEvery    = 1;
 // The real per-axis ceiling is the OCTREE root box, not a square-derived
 // scalar: an entity past the box stacks duplicate nodes (see the octree
 // notes above). Stock holds +-32,768 m = 256 tiles; octree=1 widens it to
-// +-65,536 m = 512 tiles. A rectangle's long axis may use all of it -- its
+// +-65,536 m = 512 tiles (depth 12: 1024; depth 13: 2048).
+// A rectangle's long axis may use all of it -- its
 // area (the street-raster product, handled by the raster hook / warned
 // below) is a separate limit. max_tiles stays an explicit lower cap.
 static int EffectiveMaxTiles()
 {
-    int octCap = g_octreeOn ? OCTREE_PATCH_TILES : OCTREE_STOCK_TILES;
+    int octCap = g_octreeOn ? (g_octreeDepth == 13 ? 2048 :
+                              g_octreeDepth == 12 ? 1024 : OCTREE_PATCH_TILES)
+                            : OCTREE_STOCK_TILES;
     return (g_maxTiles > 0 && g_maxTiles < octCap) ? g_maxTiles : octCap;
 }
 
@@ -425,6 +440,32 @@ static int Sanitise(int tiles)
     if (tiles > cap) tiles = cap;
     if (tiles & 1) tiles -= 1;
     return tiles;
+}
+
+static bool HeightmapFits(int tx, int ty)
+{
+    return (int64_t(tx) * 64 + 1) * (int64_t(ty) * 64 + 1) <= 2147483647LL;
+}
+
+// The new edge cap permits rectangles whose heightmap exceeds INT_MAX.
+// Keep explicit cells even and reduce the longer axis until the product fits.
+static void BoundHeightmap(int* tx, int* ty)
+{
+    while (!HeightmapFits(*tx, *ty)) {
+        if (*tx >= *ty) *tx -= 2;
+        else *ty -= 2;
+    }
+}
+
+extern "C" __declspec(dllexport)
+void BigmapTestOctreeSize(int depth, int maxTiles, int enabled, int* tx, int* ty)
+{
+    int oldDepth = g_octreeDepth, oldMax = g_maxTiles;
+    bool oldOn = g_octreeOn;
+    g_octreeDepth = depth; g_maxTiles = maxTiles; g_octreeOn = enabled != 0;
+    *tx = Sanitise(*tx); *ty = Sanitise(*ty);
+    BoundHeightmap(tx, ty);
+    g_octreeDepth = oldDepth; g_maxTiles = oldMax; g_octreeOn = oldOn;
 }
 
 // A std::string holding `s` in its inline buffer (SSO: at most 15 chars).
@@ -506,13 +547,21 @@ static int FindClaimExact(int size, int format)
 // the exact ratio kept, so the biggest rows' narrow shapes come out smaller.
 static void DeriveShape(int side, int format, int cap, int* tx, int* ty)
 {
-    const int k = (format < 0 ? 0 : format) + 1;
+    // Bound even malformed/stale menu indices before arithmetic. Tiny custom
+    // caps cannot fit a two-tile-wide strip at every ratio.
+    if(cap<2)cap=2;
+    int k = (format < 0 ? 0 : format >= MAX_RATIOS ? MAX_RATIOS-1 : format) + 1;
+    if(k>cap/2)k=cap/2;
     int x = 2 * (int)std::floor(side / std::sqrt((double)k) / 2.0 + 0.5);
     if (x < 2) x = 2;
     if (x * k > cap) x = 2 * ((cap / k) / 2);
     if (x < 2) x = 2;
     *tx = x;
     *ty = x * k;
+    while (x > 2 && !HeightmapFits(*tx, *ty)) {
+        x -= 2;
+        *tx = x; *ty = x * k;
+    }
 }
 
 // Offline test entry (tools/test_newgame_menu.py).
@@ -545,6 +594,8 @@ static bool RowShape(int size, int format, int* tx, int* ty)
 // ---------------------------------------------------------------------------
 static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
 {
+    if(sizeIndex<0)sizeIndex=0;
+    if(formatIndex<0 || formatIndex>=MAX_RATIOS)formatIndex=0;
     // An ADDED size row first. Its raw index is past the stock rows the combo
     // was built with (4 with experimental map sizes off, 7 with it on), and with
     // the flag off that overlaps what the ladder calls size 4..6 -- so it has to
@@ -597,10 +648,28 @@ static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
                formatIndex, tx, ty, ci >= 0 ? "" : ", no claim: DEFAULT");
         return ((uint64_t)(uint32_t)ty << 32) | (uint32_t)tx;
     }
+    // Stock rows also support added ratios. Query only their legal square
+    // preset, retaining the engine's experimental-size index translation.
+    // Explicit world-dimension overrides retain the stock override behavior.
+    if(formatIndex>=5) {
+        if(FindClaim(sizeIndex,0)>=0) {
+            int tx,ty;RowShape(sizeIndex,formatIndex,&tx,&ty);
+            return (uint64_t(uint32_t(ty))<<32)|uint32_t(tx);
+        }
+        uint64_t square=g_orig(sizeIndex,0,cfg);
+        if(cfg && *reinterpret_cast<const int32_t*>(static_cast<const uint8_t*>(cfg)+0x28)>0 &&
+                  *reinterpret_cast<const int32_t*>(static_cast<const uint8_t*>(cfg)+0x2c)>0)return square;
+        int sx=int(uint32_t(square)),sy=int(uint32_t(square>>32));
+        int side=int(std::sqrt(double(sx)*sy));
+        int tx,ty;DeriveShape(side,formatIndex,EffectiveMaxTiles(),&tx,&ty);
+        return (uint64_t(uint32_t(ty))<<32)|uint32_t(tx);
+    }
     // Not ours: the stock size, computed by the game's own code. Every preset
     // keeps working, including the ones we did not claim.
     return g_orig(sizeIndex, formatIndex, cfg);
 }
+
+#include "map_ratios.h"
 
 // Number of cells the ctor will produce for a given cell size, using the
 // engine's own rounding: n = floor(extent / cell) + 1 per axis.
@@ -1134,9 +1203,25 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_sizeIndex   = H->cfgInt ("tpf2_bigmap", "size_index",   6);
     g_formatIndex = H->cfgInt ("tpf2_bigmap", "format_index", 0);
     g_maxTiles    = H->cfgInt ("tpf2_bigmap", "max_tiles",    224);
+    g_maxRatio = H->cfgInt("tpf2_bigmap", "max_ratio", MAX_RATIOS);
+    if(g_maxRatio<5 || g_maxRatio>MAX_RATIOS)g_maxRatio=MAX_RATIOS;
     g_logEvery    = H->cfgBool("tpf2_bigmap", "log",          1);
     g_rasterOn    = H->cfgBool("tpf2_bigmap", "street_raster", 1);
     g_octreeOn    = H->cfgBool("tpf2_bigmap", "octree",        1);
+    g_octreeDepth = H->cfgInt ("tpf2_bigmap", "octree_depth", 11);
+    g_placementAttempts = H->cfgInt("tpf2_bigmap", "placement_attempts", 200);
+    g_worldEntryTimings = H->cfgBool("tpf2_bigmap", "world_entry_timings", 0) != 0;
+    g_materialIndexFast = H->cfgBool("tpf2_bigmap", "material_index_fast", 0) != 0;
+    g_terrainCacheSpacing = H->cfgInt("tpf2_bigmap", "terrain_cache_spacing_m", 0);
+    g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
+    g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 1024);
+    g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", 4096);
+    g_worldEntryTrackBusy = g_terrainCompress==1 && g_terrainWarmMB>g_terrainHotMB;
+    g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
+    if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
+        H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
+        return TPF2MP_ERR_FAILED;
+    }
     {
         int budgetM = H->cfgInt("tpf2_bigmap", "cell_budget_millions", 1500);
         if (budgetM > 0) g_cellBudget = (double)budgetM * 1e6;
@@ -1147,7 +1232,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     // settings.lua worldDimensionsOverride reaches sizes that overflow too).
     // Read the ladder: one key per (size, format) cell we claim.
     for (int s = 0; s < 19; ++s) {   // 0..6 stock + 7..18 for added rows
-        for (int f = 0; f < 5; ++f) {
+        for (int f = 0; f < MAX_RATIOS; ++f) {
             char key[32];
             _snprintf_s(key, sizeof(key), _TRUNCATE, "size%d_format%d", s, f);
             const char* v = H->cfgStr("tpf2_bigmap", key, nullptr);
@@ -1158,8 +1243,9 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                 continue;
             }
             int sx = Sanitise(tx), sy = Sanitise(ty);
+            BoundHeightmap(&sx, &sy);
             if (sx != tx || sy != ty) {
-                H->log("%s: %dx%d adjusted to %dx%d (even, 2..%d)",
+                H->log("%s: %dx%d adjusted to %dx%d (even, 2..%d; heightmap <= INT_MAX)",
                        key, tx, ty, sx, sy, EffectiveMaxTiles());
             }
             if (g_numClaims < MAX_CLAIMS) {
@@ -1227,6 +1313,16 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     // ---- New Game page: density levels (independent of the size config) ----
     installed += InstallDensityLevels();
 
+    // RandomLocationFactory serves preview town/industry placement. This is
+    // independent of the runtime octree, and overflows at ~185 km separation.
+    installed += InstallPlacementSpacing();
+    installed += InstallFastPlacement();
+    installed += InstallWorldEntryTimings();
+    installed += InstallMaterialIndexFast();
+    installed += InstallTerrainCache();
+    installed += InstallTerrainCompression();
+    installed += InstallSaveFast();
+
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {
         uintptr_t rva = g_gog ? RVA_RASTER_GOG : RVA_RASTER;
@@ -1262,11 +1358,21 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
         // An added row's narrow ratios run longer than its square (128 at 1:5 is
         // 58 x 290), so they count too.
         for (int r = 0; r < g_numExtraSizeRows; ++r) {
-            for (int f = 0; f < 5; ++f) {
+            for (int f = 0; f < g_maxRatio; ++f) {
                 int tx = 0, ty = 0;
                 RowShape(g_extraSizeRows[r].size, f, &tx, &ty);
                 if (tx > biggest) biggest = tx;
                 if (ty > biggest) biggest = ty;
+            }
+        }
+        // Extended formats also apply to stock rows and explicit square
+        // claims, even when no added size rows are configured.
+        if(g_maxRatio>5)for(int f=5;f<g_maxRatio;++f) {
+            int tx,ty;DeriveShape(96,f,EffectiveMaxTiles(),&tx,&ty);
+            if(ty>biggest)biggest=ty;
+            for(int size=0;size<19;++size)if(FindClaim(size,0)>=0) {
+                RowShape(size,f,&tx,&ty);
+                if(tx>biggest)biggest=tx;if(ty>biggest)biggest=ty;
             }
         }
         uintptr_t rva = g_gog ? RVA_OCTREE_GOG : RVA_OCTREE;
@@ -1274,6 +1380,14 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
         if (!g_octreeOn) {
             H->log("octree: disabled (octree=0); maps over %d tiles will grow "
                    "duplicate street nodes past +-32,768 m", OCTREE_STOCK_TILES);
+        } else if (g_octreeDepth >= 12) {
+            // Explicit opt-in also applies on load, even with a small menu
+            // ladder: saved worlds do not pass through GetNumTilesNew.
+            if (!InstallOctDepth12(rva, exp)) {
+                H->log("octree depth %d: installation failed; large-map menu refused", g_octreeDepth);
+                return TPF2MP_ERR_FAILED;
+            }
+            installed++;
         } else if (biggest <= OCTREE_STOCK_TILES) {
             H->log("octree: not needed (largest configured size %d <= %d tiles), "
                    "shipped +-32,768 m root left alone", biggest, OCTREE_STOCK_TILES);
@@ -1308,7 +1422,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                    g_claims[i].tx * 64 + 1, g_claims[i].ty * 64 + 1);
         }
     }
-    if (g_numClaims == 0 && (g_tilesX <= 0 || g_tilesY <= 0)) {
+    if (g_numClaims == 0 && (g_tilesX <= 0 || g_tilesY <= 0) && g_maxRatio<=5) {
         H->log("no map size configured -- set size<S>_format<F> = <w>x<h> "
                "(or tiles_x/tiles_y) in [tpf2_bigmap] of tpf2mp.cfg");
         return installed ? TPF2MP_OK : TPF2MP_ERR_DISABLED;
@@ -1316,11 +1430,12 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
 
     int wantX = Sanitise(g_tilesX > 0 ? g_tilesX : 2);
     int wantY = Sanitise(g_tilesY > 0 ? g_tilesY : 2);
+    BoundHeightmap(&wantX, &wantY);
     if (g_tilesX > 0 && g_tilesY > 0 && (wantX != g_tilesX || wantY != g_tilesY)) {
-        H->log("requested %d x %d adjusted to %d x %d (must be even, 2..%d)",
+        H->log("requested %d x %d adjusted to %d x %d (even, 2..%d; heightmap <= INT_MAX)",
                g_tilesX, g_tilesY, wantX, wantY, EffectiveMaxTiles());
     }
-    g_tilesX = wantX; g_tilesY = wantY;
+    if(g_tilesX>0 && g_tilesY>0){g_tilesX = wantX; g_tilesY = wantY;}
 
     // The stock 1 m street raster is a vector<bool> sized by a 32-bit multiply
     // over the map's metre bbox, so it overflows when (tx*256+1)*(ty*256+1) >
@@ -1362,6 +1477,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
 
     // ---- New Game page: size rows (need the detour above) -----------------
     installed += InstallSizeRows();
+    installed += InstallMapRatios();
 
     H->log("hooked GetNumTilesNew at %p (tramp %p)", (void*)target, tramp);
     H->log("size index %d, ratio index %d -> %d x %d tiles = %.1f x %.1f km "

@@ -10,7 +10,7 @@
   What goes where (INSTALLFOLDER = the Transport Fever 2 game folder):
     alut.dll, tpf2_pluginhost.dll        SHARED with TpF2 Multiplayer - PluginHost.wxs
     plugins\tpf2_bigmap.dll              the plugin
-    plugins\tpf2_bigmap.cfg              its settings (never overwritten once present)
+    plugins\tpf2_bigmap.cfg              its settings (replaced with this release's tuned config)
     res\config\base_mod.lua              NOT installed: the plugin patches it at game start
                                          for the New Game density levels, and a full
                                          uninstall puts the stock file back
@@ -141,10 +141,10 @@
       <Component Id="BigmapDll">
         <File Id="tpf2_bigmap.dll" Name="tpf2_bigmap.dll" Source="$(BigmapDll)" KeyPath="yes" />
       </Component>
-      <!-- NeverOverwrite: a player's edited ladder survives upgrades. The
-           plugin host merges this over tpf2mp.cfg (if any) by name. -->
-      <Component Id="BigmapCfg" NeverOverwrite="yes">
-        <File Id="tpf2_bigmap.cfg" Name="tpf2_bigmap.cfg" Source="$(BigmapCfg)" KeyPath="yes" />
+      <!-- Treat the shipped config as versioned so modified/unversioned copies
+           are replaced on install, upgrade and repair. -->
+      <Component Id="BigmapCfg">
+        <File Id="tpf2_bigmap.cfg" Name="tpf2_bigmap.cfg" Source="$(BigmapCfg)" DefaultVersion="$(ProductVersion)" KeyPath="yes" />
       </Component>
       <Component Id="RememberInstallFolder" Guid="5E747B2F-6385-4BC6-8FF1-F6312E24407E" Directory="INSTALLFOLDER">
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Big Maps" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
@@ -195,9 +195,11 @@
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
 
+      <?ifndef Wix5BrowseDialog ?>
       <Publish Dialog="BrowseDlg" Control="OK" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
       <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+      <?endif?>
 
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1" Condition="NOT Installed" />
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
