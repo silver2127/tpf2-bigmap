@@ -11,3 +11,7 @@ out/
 
 # installer build output (the MSI is published as a GitHub release asset)
 installer/out/
+
+# Python test caches
+__pycache__/
+*.pyc
