@@ -1,0 +1,103 @@
+"""Native game-vector ownership and Steam hook guards; no live game writes."""
+import ctypes as C
+from pathlib import Path
+import pefile
+import capstone
+from test_world_entry import Host, logtype, basetype, verifytype, hooktype
+
+ROOT=Path(__file__).resolve().parents[1]
+N=257*257
+class Vec(C.Structure):
+    _fields_=[('first',C.c_void_p),('last',C.c_void_p),('end',C.c_void_p)]
+class Control(C.Structure):
+    _fields_=[('vtable',C.c_void_p),('strong',C.c_uint32),('weak',C.c_uint32),('v',Vec)]
+Resize=C.CFUNCTYPE(None,C.POINTER(Vec),C.c_size_t)
+Copy=C.CFUNCTYPE(C.c_void_p,C.POINTER(Vec),C.POINTER(Vec))
+Destroy=C.CFUNCTYPE(None,C.c_void_p)
+
+def main():
+    dll=C.CDLL(str(ROOT/'out/tpf2_bigmap.dll'))
+    budget=dll.BigmapTestTerrainBudget;budget.argtypes=[C.c_int]*4+[C.c_uint64]
+    for busy,bulk,available,warm,want in [(0,0,16<<30,4096,1024),(1,0,16<<30,4096,4096),
+            (0,1,16<<30,4096,4096),(1,1,(8<<30)-1,4096,1024),
+            (1,1,0,4096,1024),(1,0,16<<30,0,1024),(1,0,16<<30,512,1024)]:
+        assert budget(1024,warm,busy,bulk,available)==want
+    assert dll.BigmapTestCompressionInit()
+    resize=dll.BigmapTestCompressionResize;resize.argtypes=[C.POINTER(Vec),C.c_size_t,C.c_int,Resize]
+    copy=dll.BigmapTestCompressionCopy;copy.argtypes=[C.POINTER(Vec),C.POINTER(Vec),C.c_int,Copy];copy.restype=C.c_void_p
+    destroy=dll.BigmapTestCompressionDestroy;destroy.argtypes=[C.c_void_p,Destroy]
+    evict=dll.BigmapTestCompressionEvict;evict.argtypes=[C.c_void_p]
+    calls=[];backings=[]
+    @Resize
+    def stock_resize(v,n):
+        calls.append(('resize',n));b=C.create_string_buffer(n*2);backings.append(b)
+        v[0]=Vec(C.addressof(b),C.addressof(b)+n*2,C.addressof(b)+n*2)
+    @Copy
+    def stock_copy(dst,src):calls.append(('copy',));dst[0]=src[0];return C.addressof(dst.contents)
+    @Destroy
+    def stock_destroy(control):calls.append(('destroy',))
+    c=Control(None,2,1,Vec());resize(C.byref(c.v),N,1,stock_resize)
+    assert not calls and c.v.last-c.v.first==N*2
+    initial=c.v.first
+    source=(C.c_uint16*N)(*(i*7%65536 for i in range(N)))
+    C.memmove(initial,source,N*2);assert evict(initial)
+    c2=Control(None,1,1,Vec())
+    assert copy(C.byref(c2.v),C.byref(c.v),1,stock_copy)==C.addressof(c2.v)
+    assert c2.v.first!=initial and C.string_at(c2.v.first,N*2)==bytes(source)
+    C.c_uint16.from_address(c2.v.first).value=123
+    assert C.c_uint16.from_address(initial).value==source[0]
+    # Destruction of a compressed COW version leaves the shared original intact.
+    assert evict(c2.v.first);destroy(C.byref(c2),stock_destroy)
+    assert not c2.v.first and not calls and c.strong==2 and c.weak==1
+    resize(C.byref(c.v),3,1,stock_resize)
+    resize(C.byref(c.v),N,1,stock_resize)
+    assert c.v.first==initial and C.string_at(initial+6,N*2-6)==bytes(N*2-6)
+    assert evict(initial)
+    # Unexpected growth must migrate back to the engine allocator, with bytes
+    # preserved, before generic vector deallocation can encounter our mapping.
+    resize(C.byref(c.v),N+100,1,stock_resize)
+    assert c.v.first!=initial and calls==[('resize',N+100)]
+    assert C.string_at(c.v.first,6)==bytes(source)[:6]
+    destroy(C.byref(c),stock_destroy);assert calls[-1]==('destroy',)
+    for n,eligible in [(N,0),(12,1),(0,1)]:
+        v=Vec();before=len(calls);resize(C.byref(v),n,eligible,stock_resize)
+        assert len(calls)==before+1
+    v=Vec();copy(C.byref(v),C.byref(c.v),0,stock_copy);assert calls[-1]==('copy',)
+
+    pe=pefile.PE(r'C:\tools\bin\TransportFever2.exe',fast_load=True)
+    dis=capstone.Cs(capstone.CS_ARCH_X86,capstone.CS_MODE_64);dis.detail=True
+    events=[];errors=[];failure=None
+    @logtype
+    def log(fmt):pass
+    @basetype
+    def base():return 0x140000000
+    @verifytype
+    def verify(rva,p,n):
+        events.append(('verify',rva));code=C.string_at(p,n)
+        if code!=pe.get_data(rva,n):errors.append(('bytes',hex(rva)))
+        ins=list(dis.disasm(code,0x140000000+rva))
+        if sum(i.size for i in ins)!=n:errors.append(('boundary',hex(rva)))
+        if rva in (0x1d5c50,0x1dedd0,0x33de30):
+            for i in ins:
+                if i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL):errors.append('branch')
+                if any(o.type==capstone.x86.X86_OP_MEM and o.mem.base==capstone.x86.X86_REG_RIP for o in i.operands):errors.append('rip')
+        return failure!=('verify',rva)
+    @hooktype
+    def hook(target,detour,n,out):
+        events.append(('hook',target-0x140000000));out[0]=0x1234
+        return failure!=('hook',target-0x140000000)
+    host=Host(C.sizeof(Host),1,log,None,None,None,base,None,verify,hook,None,None)
+    install=dll.BigmapTestInstallCompression;install.argtypes=[C.POINTER(Host),C.c_int,C.c_int,C.c_int,C.c_int]
+    for args in [(1,1,1,1024),(0,2,1,1024),(0,0,1,1024),(0,1,0,1024),(0,1,1,127),(0,1,1,8193)]:
+        events.clear();assert not install(C.byref(host),*args);assert not events
+    for stage,rv in [('verify',0x1d5c50),('verify',0x1dedd0),('verify',0x33de30),
+                     ('verify',0x33cca5),('verify',0x33dd8c),('hook',0x33de30),
+                     ('hook',0x1dedd0),('hook',0x1d5c50)]:
+        failure=(stage,rv);events.clear();assert not install(C.byref(host),0,1,1,1024)
+        hooks=[v for s,v in events if s=='hook']
+        if stage=='verify':assert not hooks
+        else:assert hooks==[0x33de30,0x1dedd0,0x1d5c50][:len(hooks)]
+    assert not errors,errors
+    print('PASS: native ownership, COW isolation, compressed destruction, resize migration, guards and Steam byte boundaries')
+
+if __name__=='__main__':main()

@@ -1,18 +1,12 @@
-﻿# Vendored shared binaries
+# Vendored shared binaries
 
-These three files are built in the tpf2-multiplayer repository and copied here
-unchanged. Both packages ship them under the SAME component GUIDs (see
-PluginHost.wxs), so they must be the same bytes. Regenerate with
-`tools\vendor_host.ps1`; never edit or rebuild them here.
+source repo: https://github.com/silver2127/tpf2-multiplayer
+source release: v0.5.0
+source commit: dcf7eaa
 
-source repo:    https://github.com/silver2127/tpf2-multiplayer
-source release: v0.4.18 (TpF2Multiplayer-0.4.18.msi, sha256 66b2367747fe2c092e011e2a49f60d9fb17052727e57ca6a1e28b12bcbaed3fe)
-source commit:  5351b5824ae4e5c192ef6182c73617a1d3ce6130 (the tag)
-extracted:      alut.dll and tpf2_pluginhost.dll from an administrative image, tpf2ca.dll from the Binary table
-vendored on:    2026-09-12 20:11
+Proxy and host copied from the verified 0.5.0 MSI administrative image.
+Custom-action DLL copied from the exact input used to build that MSI.
 
-| file | bytes | sha256 |
-| --- | --- | --- |
-| alut.dll | 177664 | c1a7c8e01eb10b3f478d50012b5b8f39105740785d7ff028fde8b2ef84387965 |
-| tpf2_pluginhost.dll | 218624 | cde64c6542e89d3bf931c0677d9d5f248ac0a08b3107da451da69074144f5fa4 |
-| tpf2ca.dll | 216064 | fb97fb38851a7e5d87a8479ae19535947bc80b83b92f063eda21501b51aa60e4 |
+alut.dll: SHA256 f44ef7b53cec2af12a189161473f018722909ebca462c1c72424e8cbe75951cb
+tpf2_pluginhost.dll: SHA256 c857c61ab6108fce87502cc412632a346af2938809aaac1816c16c3976044455
+tpf2ca.dll: SHA256 14faf647f73062d54d8781110797bb8bec130d25f4aaf5fbf93d2d9aee47f8ee
