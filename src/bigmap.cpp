@@ -193,9 +193,14 @@ static bool g_octreeOn = true;
 #include "placement_distance.h"
 #include "world_entry.h"
 #include "material_index.h"
+#include "terrain_minmax.h"
+#include "terrain_refine.h"
+#include "terrain_align_fast.h"
 #include "terrain_cache.h"
 #include "terrain_compression.h"
+#include "material_compression.h"
 #include "save_fast.h"
+#include "instance_shrink.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
 static RasterCtorFn g_origRaster = nullptr;
@@ -1212,12 +1217,23 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_placementAttempts = H->cfgInt("tpf2_bigmap", "placement_attempts", 200);
     g_worldEntryTimings = H->cfgBool("tpf2_bigmap", "world_entry_timings", 0) != 0;
     g_materialIndexFast = H->cfgBool("tpf2_bigmap", "material_index_fast", 0) != 0;
+    g_terrainRefineFast = H->cfgBool("tpf2_bigmap", "terrain_refine_fast", 0) != 0;
+    g_terrainMinMaxFast = H->cfgBool("tpf2_bigmap", "terrain_minmax_fast", 0) != 0;
+    g_terrainAlignFast = H->cfgBool("tpf2_bigmap", "terrain_align_fast", 0) != 0;
     g_terrainCacheSpacing = H->cfgInt("tpf2_bigmap", "terrain_cache_spacing_m", 0);
     g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
-    g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 1024);
-    g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", 4096);
-    g_worldEntryTrackBusy = g_terrainCompress==1 && g_terrainWarmMB>g_terrainHotMB;
+    g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
+    g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
+    g_terrainCowShare = H->cfgBool("tpf2_bigmap", "terrain_cow_share", 0) != 0;
+    g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
+    g_materialHotMB = H->cfgInt("tpf2_bigmap", "material_cache_hot_mb", 0);
+    g_materialWarmMB = H->cfgInt("tpf2_bigmap", "material_cache_warm_mb", -1);
+    // Auto budgets (hot 0, warm -1) are resolved at install; both imply a warm
+    // allowance, so world-entry tracking must be on for them too.
+    g_worldEntryTrackBusy = (g_terrainCompress==1 && (g_terrainWarmMB<0 || g_terrainWarmMB>g_terrainHotMB)) ||
+                            (g_materialCompress==1 && (g_materialWarmMB<0 || g_materialWarmMB>g_materialHotMB));
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
+    g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;
@@ -1319,9 +1335,14 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallFastPlacement();
     installed += InstallWorldEntryTimings();
     installed += InstallMaterialIndexFast();
+    installed += InstallTerrainRefineFast();
+    installed += InstallTerrainMinMaxFast();
+    installed += InstallTerrainAlignFast();
     installed += InstallTerrainCache();
     installed += InstallTerrainCompression();
+    installed += InstallMaterialCompression();
     installed += InstallSaveFast();
+    installed += InstallInstanceShrink();
 
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {

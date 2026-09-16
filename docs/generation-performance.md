@@ -28,22 +28,28 @@ The installer preflights all three files and refuses manual edits conflicting
 with a backup. It does not overwrite a differing existing helper module.
 
 `mod/generation/bigmap_memory.lua` examines the completed Lua operation list.
-It aliases temporary buffers whose entire named lifetimes do not overlap,
-and only when the later buffer's first operation is a distinct-input MAP
-that overwrites its full contents. It leaves all other operation parameters,
-seeds, order and aliases within an operation unchanged. Names referenced by
-output metadata are pinned. Unknown schemas are skipped. The native
-ScriptGenerator (`0x399050`) builds dependencies from buffer accesses;
-sharing a name adds ordering between otherwise independent branches.
+It splits temporary names into values at writes that the native code
+overwrites completely. Values whose lifetimes do not overlap then share a
+name, and an op verified to work element by element may write its output over
+an input that dies there. The op semantics, their RVAs and the allocation
+behaviour are in `docs/generation-op-semantics.md`. The pass leaves
+operation order, parameters, seeds and stock aliases unchanged. It pins names
+referenced outside the layer name fields, keeps non-temporary names and values
+read before their first full write, and skips unknown layer or op types. The
+native ScriptGenerator (`0x399050`) orders layers per buffer name, so sharing
+a name serialises otherwise independent branches.
 
-This deliberately avoids broader assumptions about feature operations that
-may accumulate into their existing output or depend on zero initialization.
-The current tested Desert pipelines use 16 named buffers instead of 18.
-At 228 x 1140 tiles, each buffer has 14593 x 72961 floats; two buffers total
-8,517,758,984 bytes (7.93 GiB). This is an expected reduction in named terrain
-storage, not a measured reduction of the entire process peak. Additional
-scratch allocations and scheduling affect that peak. Tested Temperate and
-Tropical pipelines remain at 10 buffers; the pass is a no-op for them.
+The tested pipelines use these named buffers:
+
+* Desert: 18 -> 15.
+* Temperate: 10 -> 9.
+* Tropical: 10 -> 10 (the pass is a no-op).
+
+Each result equals the lower bound for these semantics. At 228 x 1140 tiles,
+each buffer has 14593 x 72961 floats, so three buffers total 12,776,638,476
+bytes (11.90 GiB). This is an expected reduction in named terrain storage,
+not a measured reduction of the entire process peak. Additional scratch
+allocations and scheduling affect that peak.
 
 ## Checks and remaining validation
 
@@ -53,14 +59,20 @@ argument changes and that the remaining native call arguments survive.
 
 `tools/test_generation_memory.py` runs 18 actual shipped Lua pipeline
 combinations across Desert, Temperate and Tropical, three water settings and
-two seeds (one Desert case uses the 292 km dimensions). It checks unchanged
-metadata and parameters, no overlapping aliased lifetimes, identical aliases
-inside operations, and symbolic input/output provenance. Installer backup,
+two seeds (one Desert case uses the 292 km dimensions). It checks:
+
+* unchanged metadata, parameters and pinned names
+* stock aliases kept, and new aliases only for in-place-safe ops
+* symbolic provenance of every input, and of the old output of every op that
+  reads it, using the verified semantics
+
+It also reports before/after counts against a lower bound, and runs guard
+cases for unknown schemas, pinned metadata and fresh buffers. Installer backup,
 restore, idempotence and conflict refusal are tested in a temporary directory.
 
 These are offline checks, not a native rendered-heightmap comparison or a
 live timing/memory benchmark. Measure the same seed and settings after a
 restart. Look for the fast-placement startup message and the Lua
-`terrain memory: 18 -> 16 named buffers` message, then compare peak private
+`terrain memory: 18 -> 15 named buffers` message, then compare peak private
 memory, stage times and resulting town/industry counts. Restore the modes
 individually if investigating a difference in results.

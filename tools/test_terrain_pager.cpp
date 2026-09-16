@@ -7,6 +7,7 @@
 #include <atomic>
 #include <random>
 #include <cassert>
+#include <string>
 
 int main(int argc,char** argv) {
     using namespace TerrainPager;
@@ -43,7 +44,18 @@ int main(int argc,char** argv) {
     for(auto& t:policy){t=Allocate();assert(t);}
     Tick();assert(Snapshot().resident==16);
     {Guard g;for(auto t:policy)slots[Index(t)].touched=GetTickCount64()-6000;}
-    Tick();assert(Snapshot().resident==4);
+    // Over three times the budget, encode directly down to three times the
+    // budget; the rest of the excess only becomes inaccessible (second chance)
+    // and is encoded once it has stayed untouched for SoftDelayMs.
+    Tick();assert(Snapshot().resident==12 && Snapshot().softBlocked==8);
+    {Guard g;auto now=GetTickCount64();for(auto t:policy){auto& sl=slots[Index(t)];if(sl.soft)sl.blockedAt=now-SoftDelayMs;}}
+    Tick();assert(Snapshot().resident==4 && Snapshot().softBlocked==0);
+    // Loading burst: slots only 1.5 s old are evicted directly, down to budget.
+    {Guard g;auto now=GetTickCount64();stats.lastBulkAllocation=now;for(auto t:policy)slots[Index(t)].touched=now-1500;}
+    for(auto t:policy)assert(t[0]==0);
+    {Guard g;auto now=GetTickCount64();stats.lastBulkAllocation=now;for(auto t:policy)slots[Index(t)].touched=now-1500;}
+    Tick();assert(Snapshot().resident==4 && Snapshot().softBlocked==0);
+    {Guard g;stats.lastBulkAllocation=0;}
     for(auto t:policy)assert(t[Samples-1]==0);
     for(auto t:policy)assert(Release(t));
 
@@ -122,6 +134,159 @@ int main(int argc,char** argv) {
             count,double(compressed)/total,GetTickCount64()-elapsed,
             double(compressed)/total*64980*Bytes/(1024.*1024*1024),
             double(committed)/total*64980*Bytes/(1024.*1024*1024));
+    }
+    // Second chance: without pressure the excess is only made inaccessible; an
+    // access restores it by protection alone, and only untouched slots encode.
+    {
+        std::vector<uint16_t> pat(Samples);
+        for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(30000+(k%257)+(k/257));
+        std::vector<uint16_t*> soft(16);
+        for(auto& t:soft){t=Allocate();assert(t);memcpy(t,pat.data(),Bytes);}
+        SetBudget(12*SlotBytes);
+        // Earlier sections allocate in bursts; this checks the steady-state policy.
+        {Guard g;stats.lastBulkAllocation=0;for(auto t:soft)slots[Index(t)].touched=GetTickCount64()-6000;}
+        auto s0=Snapshot();Tick();auto s1=Snapshot();
+        assert(s1.resident==s0.resident && s1.softBlocked==4 && s1.encodes==s0.encodes);
+        uint16_t* rescued=nullptr;
+        {Guard g;for(auto t:soft)if(slots[Index(t)].soft){rescued=t;break;}}
+        assert(rescued && rescued[123]==pat[123]);
+        auto s2=Snapshot();
+        assert(s2.softRescues==s1.softRescues+1 && s2.softBlocked==3 && s2.encodes==s1.encodes && s2.resident==s1.resident);
+        Tick();assert(Snapshot().softBlocked==4);
+        {Guard g;auto now=GetTickCount64();for(auto t:soft){auto& sl=slots[Index(t)];if(sl.soft){sl.touched=now-6000;sl.blockedAt=now-SoftDelayMs;}}}
+        Tick();auto s3=Snapshot();
+        assert(s3.resident==s0.resident-4 && s3.softBlocked==0 && s3.encodes==s2.encodes+4);
+        for(auto t:soft){assert(memcmp(t,pat.data(),Bytes)==0);assert(Release(t));}
+        SetBudget(4*SlotBytes);
+    }
+    // Many threads restoring cold slots at once (unlocked decodes) while an
+    // evictor keeps re-evicting them: every read sees exact data.
+    {
+        constexpr unsigned Readers=16,Cold=64;
+        std::vector<uint16_t> pat(Samples);for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k*31+7);
+        std::vector<uint16_t*> cold(Cold);
+        for(auto& t:cold){t=Allocate();assert(t);memcpy(t,pat.data(),Bytes);assert(Evict(Index(t),true));}
+        std::atomic<bool> go{false},stop{false};
+        std::thread ev([&]{while(!go)SwitchToThread();while(!stop)for(auto t:cold)Evict(Index(t),true);});
+        std::vector<std::thread> readers;
+        std::atomic<unsigned> bad{0};
+        for(unsigned n=0;n<Readers;++n)readers.emplace_back([&,n]{
+            while(!go)SwitchToThread();std::mt19937 r(n+1);
+            for(unsigned k=0;k<4000;++k){auto t=cold[r()%Cold];size_t at=r()%Samples;if(t[at]!=pat[at])++bad;}
+        });
+        go=true;for(auto& x:readers)x.join();stop=true;ev.join();
+        assert(bad==0);
+        for(auto t:cold){assert(memcmp(t,pat.data(),Bytes)==0);assert(Release(t));}
+    }
+    // Slot churn racing four unlocked encoders: a release or reuse during an
+    // encode must discard its result (generation) without failures or leaks.
+    {
+        std::atomic<bool> stop{false};std::vector<std::thread> evictors;
+        for(unsigned n=0;n<4;++n)evictors.emplace_back([&,n]{
+            std::mt19937 r(100+n);
+            while(!stop){unsigned a;{Guard g;a=allocated;}if(a)Evict(r()%a,true);}
+        });
+        std::vector<uint16_t> pat(Samples);for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k^0x5a5a);
+        for(unsigned k=0;k<3000;++k) {
+            auto t=Allocate();assert(t);memcpy(t,pat.data(),Bytes);
+            if(k%2)SwitchToThread();
+            assert(memcmp(t,pat.data(),Bytes)==0);assert(Release(t));
+        }
+        stop=true;for(auto& x:evictors)x.join();
+        auto sc=Snapshot();assert(sc.live==0 && sc.failures==0 && sc.softBlocked==0);
+        printf("unlocked eviction: cancelled=%llu encodes=%llu\n",sc.cancelledEvictions,sc.encodes);
+    }
+    // Copy-on-write sharing (docs/terrain-cow-sharing.md, measurement stage): a
+    // second version maps the SAME section at its own address instead of copying
+    // 132 KiB. Both views are read-only; the first write to either one takes a
+    // private copy and must leave every other sharer byte-identical.
+    {
+        std::vector<uint16_t> pat(Samples);
+        for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k*7+3);
+        DWORD h0=0,h1=0;GetProcessHandleCount(GetCurrentProcess(),&h0);
+        auto base=Snapshot();
+        auto a=Allocate();assert(a);memcpy(a,pat.data(),Bytes);
+        auto afterAlloc=Snapshot();
+        // Baseline the handle count here, not before Allocate: the slot's own
+        // section is one handle, and sharing must add exactly one more.
+        DWORD hAlloc=0;GetProcessHandleCount(GetCurrentProcess(),&hAlloc);
+        auto b=Share(a);assert(b && b!=a);
+        auto sh=Snapshot();
+        // Free: no second section, no encode, no extra resident backing. Exactly
+        // one new handle (the sharer's duplicate) and one new live slot.
+        assert(sh.resident==afterAlloc.resident && sh.encodes==afterAlloc.encodes);
+        assert(sh.sharedViews==base.sharedViews+1 && sh.sharedSlots==2);
+        assert(sh.live==afterAlloc.live+1);
+        GetProcessHandleCount(GetCurrentProcess(),&h1);assert(h1==hAlloc+1);
+        assert(memcmp(a,pat.data(),Bytes)==0 && memcmp(b,pat.data(),Bytes)==0);
+        // A shared backing is never an eviction candidate, not even forced.
+        assert(!Evict(Index(a),true) && !Evict(Index(b),true));
+        assert(Snapshot().encodes==afterAlloc.encodes);
+        // Writing through b privatizes b alone.
+        std::vector<uint16_t> expectB(pat);expectB[5]=0x1234;
+        b[5]=0x1234;
+        auto pv=Snapshot();
+        assert(pv.privatizations==base.privatizations+1);
+        assert(pv.resident==afterAlloc.resident+1);   // a second real section now
+        assert(pv.sharedSlots==0);                    // the two-member ring collapsed
+        assert(memcmp(a,pat.data(),Bytes)==0 && memcmp(b,expectB.data(),Bytes)==0);
+        // Unshared again, so both behave like ordinary slots.
+        assert(Evict(Index(a),true));assert(memcmp(a,pat.data(),Bytes)==0);
+        assert(Evict(Index(b),true));assert(memcmp(b,expectB.data(),Bytes)==0);
+        assert(Release(a));assert(Release(b));
+
+        // The other direction: writing the SOURCE must not disturb the sharer.
+        auto c=Allocate();assert(c);memcpy(c,pat.data(),Bytes);
+        auto d=Share(c);assert(d);
+        c[9]=0x4321;
+        assert(c[9]==0x4321 && memcmp(d,pat.data(),Bytes)==0);
+        assert(Release(c));assert(memcmp(d,pat.data(),Bytes)==0);assert(Release(d));
+
+        // A ring of three: releasing members keeps the survivors sharing, and
+        // the last one standing is no longer shared, so it can be evicted again.
+        auto r0=Snapshot().resident;
+        auto e=Allocate();assert(e);memcpy(e,pat.data(),Bytes);
+        auto f=Share(e);assert(f);
+        auto k3=Share(e);assert(k3);
+        assert(Snapshot().sharedSlots==3 && Snapshot().resident==r0+1);
+        assert(Release(f));
+        assert(Snapshot().sharedSlots==2 && Snapshot().resident==r0+1);
+        assert(memcmp(e,pat.data(),Bytes)==0 && memcmp(k3,pat.data(),Bytes)==0);
+        assert(Release(k3));
+        assert(Snapshot().sharedSlots==0 && Snapshot().resident==r0+1);
+        assert(Evict(Index(e),true));assert(memcmp(e,pat.data(),Bytes)==0);
+        assert(Release(e));assert(Snapshot().resident==r0);
+
+        // Sharing, privatizing writes and releases racing a forced evictor.
+        auto src=Allocate();assert(src);memcpy(src,pat.data(),Bytes);
+        std::atomic<bool> go{false},stop{false};std::atomic<unsigned> bad{0},shares{0};
+        // The evictor must leave the shared SOURCE resident, or it is compressed
+        // almost immediately, every Share correctly refuses a packed source, and
+        // the race silently exercises nothing (measured: shares fell 2399 -> 0).
+        unsigned keep=Index(src);
+        std::thread ev([&]{while(!go)SwitchToThread();
+            while(!stop){unsigned n;{Guard gg;n=allocated;}for(unsigned i=0;i<n;++i)if(i!=keep)Evict(i,true);}});
+        std::vector<std::thread> ws;
+        for(unsigned n=0;n<8;++n)ws.emplace_back([&,n]{
+            while(!go)SwitchToThread();
+            for(unsigned k=0;k<300;++k) {
+                auto t=Share(src);
+                if(t)++shares; else {t=Allocate();if(!t)continue;memcpy(t,pat.data(),Bytes);}
+                if(memcmp(t,pat.data(),Bytes)!=0)++bad;
+                t[n]=uint16_t(k);                      // privatizes while shared
+                if(t[n]!=uint16_t(k))++bad;
+                Release(t);
+            }
+        });
+        go=true;for(auto& w:ws)w.join();stop=true;ev.join();
+        assert(bad==0);
+        assert(shares>0);   // the race must actually share, not just allocate
+        assert(memcmp(src,pat.data(),Bytes)==0);assert(Release(src));
+        auto sc=Snapshot();
+        assert(sc.live==0 && sc.sharedSlots==0 && sc.failures==base.failures);
+        GetProcessHandleCount(GetCurrentProcess(),&h1);assert(h1==h0);
+        printf("cow sharing: shares=%u privatized=%llu failures=%llu\n",
+               shares.load(),sc.privatizations,sc.failures);
     }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.

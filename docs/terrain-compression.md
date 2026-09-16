@@ -7,6 +7,82 @@ both rail segments intact. Extended gameplay remains untested.
 This is separate from the discontinued 2 m experiment. Source heightmaps,
 derived 257x257 samples, physical tile dimensions and octree depth are unchanged.
 
+## Format 3 and pager capacity (September 15, built and tested offline, NOT deployed)
+
+Three changes, all in `src/terrain_codec.h` and `src/terrain_pager.h`:
+
+- **Codec.** Planar prediction (left + up - upper-left), zigzag residuals and a
+  static per-tile rANS coder with four neighbour contexts, plus a 64-bit content
+  hash checked after every decode. Heights are stored in 5 cm steps, so 99.3% of
+  planar residuals are 0 or +-1; an entropy coder beats LZ4 on nibble planes.
+  On the 1,024-tile CHONKYIe sample (`%TEMP%\tpf2-cache-visual\terrain-1m-samples.bin`):
+
+  | | format 2 (LZ4 nibbles) | format 3 |
+  |---|---|---|
+  | payload ratio | 18.06% | 6.95% |
+  | cold commit, projected for 64,980 tiles | 1.577 GiB | 0.558 GiB |
+  | encode per tile | 160 us | 264 us |
+  | decode per tile | 121 us | 184 us |
+
+  Decode speed was bounded by cache latency, not by the rANS state chain: at
+  12-bit precision the 64 KiB decode table missed L1 (~2.3 ns/sample), so
+  precision is 10 bits (16 KiB table, ratio cost 0.01 points). Other measured
+  steps: two interleaved states, 16-bit renormalisation in a [2^15, 2^31) window
+  (the division-free encoder update is exact only below 2^31), packed 32-bit
+  decode entries, four context candidates loaded before selection, sentinel
+  entries for unused contexts and one bounds check per row.
+  `tools/decode_experiments.cpp` and `tools/profile_codec_decode.cpp` hold the
+  measurements. Decode is ~60 us slower per restored tile than format 2.
+- **Blob storage.** Compressed blobs come from a private Win32 heap instead of
+  one `VirtualAlloc` each. At ~9 KiB per blob, the 4 KiB commit round-up and
+  64 KiB reservation per allocation were ~20% overhead. The fault path's
+  `HeapFree` runs under the pool lock, and only this file uses that heap.
+- **Capacity.** `MaxSlots` was 131,072. A 256x256 map already reached exactly
+  131,072 live versions while two terrain versions coexisted after entry
+  (`tpf2mp_host.log`, September 15), and every allocation past the limit silently
+  fell back to an uncompressed stock vector. Any map above ~181x181 tiles, and
+  every 320..512-tile preset, overflowed. It is now 2^20 (twice the 524,176-tile
+  heightmap cap): 129 GiB of placeholder address space and a 32 MiB demand-zero
+  slot table. The eviction sweep visits max(256, allocated/128) slots per tick,
+  capped at ~40 ms of work.
+
+Checks: `build.bat -codec-test` then `out\test_terrain_codec.exe <samples>`
+(degenerate/extreme tiles, every escape boundary, 2,000 random walks, noise
+refusal within the cap, no write past the cap, truncation/trailing-byte
+rejection, 5,000 single-byte corruptions with none silently accepted, exact
+round trip of all real samples); `build.bat -pager-test` (all existing pager
+tests, including 4,000,000 concurrent writes racing eviction, on format 3);
+all Python tool tests except the MSI test passed against the rebuilt DLL.
+Still needed: an in-game load, construction, save and reload with format 3.
+
+### In-game result and the eviction rework (September 15)
+
+Format 3 plus material paging, loaded 256x256 save (PID 59828): settled at
+10.5 GB working set / 13.2 GiB private (the same map was ~18 GB working set on
+0.3.1); all counters failures=0, slot_overflows=0. Two problems remained and
+drove a rework of the shared pager body (`src/pager_impl.inl`, used by both
+pagers):
+
+- **Load peak 38.2 GB working set.** While a save load created both terrain
+  versions, one eviction thread encoding under the pool lock left up to 110,378
+  tiles (14.2 GiB) resident. Encoding now runs outside the lock on the policy
+  worker plus up to 3 helper threads; a fault during an encode cancels it, and a
+  per-slot generation number discards results for released or reused slots.
+- **Camera stutter.** After load the engine re-read ~2,250 evicted terrain tiles
+  per second (faults 755k -> 890k over 60 s), each decoded while holding the
+  pool lock, so render threads faulting on different tiles queued behind each
+  other. Cold restores now decode outside the lock with per-thread scratch
+  (other faults on the same slot wait; Release waits for a restore), and a
+  second-chance stage first only protects aged excess slots: a touch within 3 s
+  costs one VirtualProtect instead of a decode. Over twice the budget, or
+  within 15 s of bulk allocation, slots are encoded directly.
+
+New log counters: `soft_blocked`, `soft_rescues`, `cancelled`. Tests: existing
+pager tests plus the second-chance sequence, 16 threads restoring 64 cold tiles
+while an evictor re-evicts them, and 3,000 allocate/fill/release cycles racing
+four unlocked encoders (1,888 cancellations, 0 failures). Not yet measured in
+game: peak, stutter and fault rates with this build.
+
 Runtime check, PID 83640 on September 13: the user reported 16 GB after loading;
 read-only process inspection measured 16.30 GiB working set and 18.46 GiB private
 commit. Logs confirm 1 m restoration, compression enabled and 64,980 live tile
@@ -195,3 +271,25 @@ The mapping protocol uses Microsoft's documented
 and [placeholder-preserving unmap](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-unmapviewoffile2).
 These require Windows 10 version 1803 or later; dynamically resolved APIs make
 unsupported systems refuse this feature before allocating any game tiles.
+
+### Save-load profile and the loading budget (September 15)
+
+Profile of an in-process reload of the 256x256 save (`tools/re/profile_load.py`
+in tpf2-multiplayer, 20 ms RIP sampling, PID 60744): "Loading from file" at
+18:34:41, "Initial material index generation" at 18:35:50 (~70 s). During the
+load the engine's loading threads spent 62-73% of their samples inside
+tpf2_bigmap.dll plus `ZwUnmapViewOfSectionEx`/`ZwProtectVirtualMemory`, next to
+`33cd10` (tile publication) and `30a55c`; afterwards `334c60` (render data for
+every tile) ran at 80% on one thread. Terrain faults rose by ~290,000 during the
+reload (~53 CPU-seconds of decoding at 184 us). The 1 s loading minimum age
+kept the peak down but made the loader decode what had just been evicted.
+
+The reload also validated material teardown in game: `releases=65536`,
+`migrations=0`, `late_releases=0`, `failures=0`.
+
+Policy change: while loading (generation, bulk allocation or the loading
+tail) the resident target covers every live allocation, capped at available
+RAM minus 12 GiB and never below the configured warm allowance
+(`TerrainBudgetMB`, both pagers). Compression then happens after loading on the
+below-normal eviction threads. Tested offline (`test_terrain_compression.py`
+budget cases); load time with this policy not yet measured.
