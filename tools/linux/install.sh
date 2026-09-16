@@ -26,6 +26,7 @@ if [ ! -e "$root/tpf2_pluginhost.so" ]; then
   install -m 0755 "$package/runtime/tpf2_pluginhost.so" "$root/tpf2_pluginhost.so.new"
   mv "$root/tpf2_pluginhost.so.new" "$root/tpf2_pluginhost.so"
 fi
+install -m 0755 "$package/bigmap-density-restore" "$root/bigmap-density-restore"
 install -m 0755 "$package/tpf2-bigmap-launch" "$root/tpf2-bigmap-launch"
 if [ -x "$root/tpf2mp-launch" ]; then
   echo "Installed. Keep your existing multiplayer Steam launch options."

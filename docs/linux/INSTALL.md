@@ -4,7 +4,7 @@ For Steam Transport Fever 2 Linux build 35924. This is a native `.so` plugin,
 not a Wine/Proton DLL. The package includes the shared native plugin host;
 multiplayer is not required.
 
-1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.1.tar.gz`.
+1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.2.tar.gz`.
 2. In the extracted directory, run `bash install.sh` without sudo.
 3. Use the Steam launch-options line printed by the installer. If multiplayer
    is installed, keep its existing launch options: it loads this plugin too.
@@ -26,6 +26,7 @@ generation time. This port does not include Windows terrain/material paging.
 ## Supported scope
 
 - Added size rows, stock presets, extended ratios and explicit size cells.
+- Six sparse density presets in Towns, Industries and Industry density target.
 - Adaptive street occupancy cells to avoid signed 32-bit overflow.
 - Depth-11 octree with a 512-tile edge cap and unchanged 128 m leaves.
   The largest square is 510 tiles; the preview distance calculation imposes
@@ -33,9 +34,33 @@ generation time. This port does not include Windows terrain/material paging.
 - Byte/build guards and a shared host that coexists with native multiplayer.
 
 Depth 12/13 (1024/2048-tile edges), Windows fault-driven RAM compression,
-generation density extensions and the Windows engine speed optimizations are
+the Windows engine speed optimizations are
 not ported in this build. Do not use the Windows configuration: its depth-13
 setting is rejected explicitly. See PORT.md for evidence and validation limits.
+
+## Sparse density presets
+
+After **Very high**, all three density dropdowns offer Reduced (0.50), Sparse
+(0.30), Megalomaniac count at 56 km (0.18), Minimal (0.10), and Megalomaniac
+count at 112 km (0.046) / 160 km (0.022). Values are fractions of **Medium**
+density, not fixed object counts. Map area and generator constraints affect
+actual counts. Stock Low through Very high keep their original values.
+
+The feature is on by default (`newgame_density=1`, including upgrades with an
+older config). Restart the game after installing. Select Towns and Industries
+on the first New Game page; the later Industry density target controls future
+industry spawning. Existing towns/industries are not removed by these settings.
+
+The plugin patches the installed game's `res/config/base_mod.lua` and keeps
+`base_mod.lua.bigmap-linux.bak`. Missing or changed anchors stop initialization;
+no extra labels are exposed without the matching native town hook. Steam file
+verification is handled by patching the restored stock file on the next launch.
+The uninstaller restores the backup only when the patched file is unchanged;
+it preserves later manual edits and reports a failure instead of deleting them.
+
+Keep density support enabled when loading saves made with the extra industry
+presets: their stored indices need the added Lua multipliers. The big-map plugin
+must also be present on other machines loading those saves.
 
 ## Remove
 

@@ -25,8 +25,16 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){config.clear();config["newgame_density"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+extern "C" float TestTown(void*,int);
 int main(){
+    auto* townPage=static_cast<uint8_t*>(mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    assert(townPage!=MAP_FAILED);townPage[2048]=0xc3;
+    auto* townEntry=TownStub(townPage,uintptr_t(townPage+2048));
+    assert(mprotect(townPage,4096,PROT_READ|PROT_EXEC)==0);
+    for(int i=3;i<10;++i)assert(std::fabs(TestTown(townEntry,i)-(i==3?.5f:float(.3*density::scales[i-4])))<1e-7);
+    assert(TestTown(townEntry,10)==1.f && TestTown(townEntry,-1)==1.f);
+    munmap(townPage,4096);
     Tpf2mpPluginInfo info{};
     assert(Tpf2mpPluginInit(nullptr,&info)==TPF2MP_ERR_ABI);
     Reset();build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
