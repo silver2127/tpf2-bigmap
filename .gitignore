@@ -15,3 +15,7 @@ installer/out/
 # Python test caches
 __pycache__/
 *.pyc
+
+# Linux build and packages
+linux/out*/
+dist/

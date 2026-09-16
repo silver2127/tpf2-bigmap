@@ -2,6 +2,11 @@
 
 Maps larger than Transport Fever 2's New Game menu will build.
 
+**Native Linux:** an experimental port is available under `linux/`. See
+[Linux installation](docs/linux/INSTALL.md) and [port scope and evidence](docs/linux/PORT.md).
+It currently supports large-map controls through 512 tiles per edge; Windows
+RAM optimizations and depth 12/13 are not included.
+
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
 reuse without changing map resolution or octree depth.
