@@ -9,6 +9,7 @@
 #include <cstring>
 #include <climits>
 #include <sys/mman.h>
+#include "density.h"
 
 namespace {
 const Tpf2mpHost* H;
@@ -132,10 +133,27 @@ void* Near(uintptr_t anchor) {
     }
     return nullptr;
 }
-struct Patch { uintptr_t rva; uint8_t before[18]{},after[18]{}; uint32_t len; };
-Patch patches[12];int patchCount=0;
+uint8_t* TownStub(uint8_t* page,uintptr_t ret) {
+    uint8_t code[]={0x50,0x48,0xba,0,0,0,0,0,0,0,0, // push rax; movabs rdx,table (rdx saved below)
+      0x83,0xf8,0x09,0x76,0x05,0xb8,0x0a,0,0,0,
+      0xf3,0x0f,0x10,0x1c,0x82,0x58,0x5a,
+      0xf3,0x0f,0x11,0x9d,0x44,0xfe,0xff,0xff,
+      0xff,0x25,0,0,0,0,0,0,0,0,0,0,0,0};
+    // Entry pushes rdx then rax; unsigned range check also covers negative indices.
+    uint8_t* entry=page+512;*entry=0x52;
+    const uintptr_t table=uintptr_t(page+3000);
+    std::memcpy(code+3,&table,8);std::memcpy(code+42,&ret,8);
+    std::memcpy(entry+1,code,sizeof(code));
+    float values[11]={.2f,.3f,.4f,.5f};
+    for(int i=0;i<6;++i)values[4+i]=float(.3*density::scales[i]);
+    values[10]=1.f;
+    std::memcpy(page+3000,values,sizeof(values));
+    return entry;
+}
+struct Patch { uintptr_t rva; uint8_t before[32]{},after[32]{}; uint32_t len; };
+Patch patches[16];int patchCount=0;
 bool Plan(uintptr_t rva,const uint8_t* before,const uint8_t* after,uint32_t len) {
-    if(patchCount>=12 || len>18 || !H->verifyBytes(rva,before,len))return false;
+    if(patchCount>=16 || len>32 || !H->verifyBytes(rva,before,len))return false;
     auto& p=patches[patchCount++];p.rva=rva;p.len=len;
     std::memcpy(p.before,before,len);std::memcpy(p.after,after,len);return true;
 }
@@ -150,9 +168,17 @@ bool PlanCall(uintptr_t rva,uintptr_t callee,void* target,uint8_t*& stub) {
 extern "C" __attribute__((visibility("default")))
 int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!host || !info || host->abiMajor!=TPF2MP_ABI_MAJOR || host->size<sizeof(Tpf2mpHost))return TPF2MP_ERR_ABI;
-    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.1","Native Linux large-map sizes, ratios and street raster"};
+    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.2","Native Linux large maps and sparse town/industry density"};
+    const auto baseMod=density::GamePath();
+    std::string densityWhy;
+    // Remove our prior labels before validating hooks, so a failed initialization
+    // cannot expose unsupported town indices on this run.
+    const bool restored=density::Sync(baseMod,false,densityWhy);
     if(!H->buildOk() || !H->moduleBase())return TPF2MP_ERR_BUILD;
-    if(!H->cfgBool(Section,"enabled",1))return TPF2MP_ERR_DISABLED;
+    const bool enabled=H->cfgBool(Section,"enabled",1);
+    const bool sparse=enabled && H->cfgBool(Section,"newgame_density",1);
+    if(sparse && !restored){H->log("density restore failed: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;}
+    if(!enabled)return TPF2MP_ERR_DISABLED;
     const int depth=H->cfgInt(Section,"octree_depth",11);
     if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
     cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;
@@ -198,15 +224,33 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         if(!PlanCall(RatioCall,RatioRva,reinterpret_cast<void*>(RatioText),stub) ||
            !Plan(0x1149bf4,RatioLoop,loop,3) || !Plan(0x1149c01,RatioGate,gate,3))return TPF2MP_ERR_BUILD;
     }
+    if(sparse) {
+        // eax is the selected Towns index; cases 0..2 have already branched.
+        // Preserve every register except xmm3, which the stock default writes.
+        const uint8_t head[]={0x48,0x8b,0x43,0x18,0x8b,0x80,0x60,0x04,0,0};
+        if(!H->verifyBytes(0x112e2ef,head,sizeof(head)))return TPF2MP_ERR_BUILD;
+        constexpr uintptr_t site=0x112e313, back=0x112e32c;
+        const uint8_t before[]={0xf3,0x0f,0x10,0x1d,0xad,0xda,0xd5,0x02,0xf3,0x0f,0x11,0x9d,0x44,0xfe,0xff,0xff,0x83,0xf8,0x03,0x0f,0x84,0x74,0x04,0,0};
+        uint8_t* entry=TownStub(page,H->moduleBase()+back);
+        uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(entry));
+        if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
+    }
     if(mprotect(page,4096,PROT_READ|PROT_EXEC))return TPF2MP_ERR_FAILED;
+    if(sparse && (!density::Write(std::string(H->dataDir())+"/bigmap-base-mod.path",baseMod+"\n") || !density::Sync(baseMod,true,densityWhy))) {
+        H->log("density levels refused: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;
+    }
     void* trampoline=nullptr;
-    if(!H->installHook(H->moduleBase()+SizeRva,reinterpret_cast<void*>(Size),sizeof(SizeBytes),&trampoline))return TPF2MP_ERR_FAILED;
+    if(!H->installHook(H->moduleBase()+SizeRva,reinterpret_cast<void*>(Size),sizeof(SizeBytes),&trampoline)){if(sparse)density::Sync(baseMod,false,densityWhy);return TPF2MP_ERR_FAILED;}
     originalSize=reinterpret_cast<SizeFn>(trampoline);
     for(int i=0;i<patchCount;++i)if(!H->patchBytes(patches[i].rva,patches[i].after,patches[i].len)) {
         // Keep code and original trampoline mapped even after rollback.
         for(int j=i;j>=0;--j)H->patchBytes(patches[j].rva,patches[j].before,patches[j].len);
         H->patchBytes(SizeRva,SizeBytes,sizeof(SizeBytes));
+        if(sparse)density::Sync(baseMod,false,densityWhy);
         H->log("patch failed; attempted rollback, restart before using big maps");return TPF2MP_ERR_FAILED;
+    }
+    if(sparse){
+        H->log("density levels active: six sparse presets for towns, industries and industry target");
     }
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
     H->log("Experimental port: Windows memory compression and depth 12/13 are not enabled");

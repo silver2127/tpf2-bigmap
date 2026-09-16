@@ -47,10 +47,10 @@ installer preserves an existing host and multiplayer launcher.
 
 Unit checks cover stock/additional rows, every extended ratio, bounds, malformed
 config, float raster sizing, unsupported builds/depths, and patch rollback.
-The read-only ELF check covers all ten patched sites. Runtime host loading and
+The read-only ELF check covers all twelve guarded sites. Runtime host loading and
 byte verification have succeeded in the isolated native multiplayer lab.
 
-This initial port deliberately covers large-map creation through depth 11.
+The Linux port covers large-map creation through depth 11 and sparse density presets.
 It is not full Windows 0.4.0 feature parity. Windows placeholder mappings and
 vectored exception handlers in the terrain/material pagers need a separate
 Linux memory-management design and stress tests. The optional generation,
@@ -66,3 +66,32 @@ The saved world reloaded successfully and simulation continued afterward.
 The lab retained its multiplayer Lua mod, while
 only the native shared plugin host was preloaded; this was not a two-peer
 synchronization test.
+
+
+## Linux sparse density port (dev.2)
+
+The town selection is loaded from `[rbx+0x18]->+0x460` at 0x112e2ef.
+Cases 0/1/2 branch to 0.2/0.3/0.4 stores at 0x112e720, 0x112e770 and
+0x112e788. The 25-byte default/case-3 tail at 0x112e313 is redirected to
+a private RX stub; it stores xmm3 at `[rbp-0x1bc]` and resumes at 0x112e32c.
+The stub preserves rax/rdx, keeps case 3 at 0.5, handles indices 4..9 with
+0.3 times the six Windows scales, and keeps the unknown-index default at 1.0.
+An assembly harness executes the actual emitted stub for every new index.
+
+Industries use the same six scales times the stock Medium multiplier 0.6.
+Anchored edits extend all three lists and `industryFreq` in base_mod.lua.
+The industry start index is zero-based; the target includes Disabled first,
+so runFn reads `industryFreq[start+1]` and `industryFreq[target]` respectively.
+Atomic file replacement and an exact-patch comparison protect backups and
+subsequent user edits. Unit tests cover repeat application, restoration,
+changed anchors, and Steam replacing the game file. The restoration helper
+is bundled with the installer and called before uninstalling the plugin.
+
+Live dev.2 checks: all three menus show the six new entries. On the same Small
+map and seed, Medium previewed 4 towns/32 industries; Minimal previewed
+2 towns/5 industries (the generator's minimum counts apply). A 128x128-tile
+Minimal map previewed 6 towns/52 industries and completed world generation.
+The generation log confirmed saved industry start/target indices 7/8 and
+multipliers 0.06/0.06. Saving and reloading succeeded, retaining those
+multipliers and continuing simulation. Stock Medium is 0.6. This test does not measure long-term
+industry spawning or multiplayer synchronization.

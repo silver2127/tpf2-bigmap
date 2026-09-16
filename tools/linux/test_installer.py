@@ -20,7 +20,19 @@ with tempfile.TemporaryDirectory(prefix='bigmap-install-') as tmp:
     assert shared.read_bytes()==before and 'enabled=0' in cfg.read_text()
     assert cfg.with_suffix('.cfg.example').exists()
     assert run(root/'tpf2-bigmap-launch','/usr/bin/true').stdout=='coexist-ok'
+    if len(sys.argv)>3:
+        base=Path(tmp)/'base_mod.lua'
+        original=Path(sys.argv[2]).read_bytes();patched=Path(sys.argv[3]).read_bytes()
+        base.write_bytes(patched)
+        base.with_name(base.name+'.bigmap-linux.bak').write_bytes(original)
+        (root/'data/bigmap-base-mod.path').write_text(str(base)+'\n')
+        # A user edit must stop uninstall before removing the native hook.
+        base.write_bytes(patched+b'-- local edit\n')
+        result=subprocess.run(['bash',str(package/'uninstall.sh'),'--prefix',str(root)],capture_output=True)
+        assert result.returncode!=0 and plugin.exists()
+        base.write_bytes(patched)
     run('bash',package/'uninstall.sh','--prefix',root)
+    if len(sys.argv)>3: assert base.read_bytes()==original
     assert not plugin.exists() and cfg.exists() and saves.read_bytes()==b'user save'
     assert shared.read_bytes()==before and mp.exists()
 print('PASS: checksums, standalone host launch, config-preserving upgrade, multiplayer coexistence, uninstall/save preservation')

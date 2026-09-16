@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-version=0.4.0-linux-dev.1
+version=0.4.0-linux-dev.2
 runtime=${1:?Usage: package.sh PATH_TO_NATIVE_PLUGINHOST}
 [ -f "$runtime" ]
 "$repo/tools/linux/build.sh"
@@ -10,6 +10,7 @@ mkdir -p "$stage/plugins" "$stage/runtime"
 cp "$repo/linux/out-soldier/tpf2_bigmap.so" "$repo/linux/tpf2_bigmap.cfg" "$stage/plugins/"
 cp "$runtime" "$stage/runtime/tpf2_pluginhost.so"
 cp "$repo/tools/linux/install.sh" "$repo/tools/linux/uninstall.sh" "$repo/tools/linux/tpf2-bigmap-launch" "$stage/"
+cp "$repo/linux/out-soldier/bigmap-density-restore" "$stage/"
 cp "$repo/LICENSE" "$stage/"
 cp "$repo/docs/linux/INSTALL.md" "$repo/docs/linux/PORT.md" "$stage/"
 {
