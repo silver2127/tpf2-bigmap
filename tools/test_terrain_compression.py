@@ -19,9 +19,32 @@ def main():
     dll=C.CDLL(str(ROOT/'out/tpf2_bigmap.dll'))
     budget=dll.BigmapTestTerrainBudget;budget.argtypes=[C.c_int]*4+[C.c_uint64]
     for busy,bulk,available,warm,want in [(0,0,16<<30,4096,1024),(1,0,16<<30,4096,4096),
-            (0,1,16<<30,4096,4096),(1,1,(8<<30)-1,4096,1024),
+            (0,1,16<<30,4096,4096),(1,1,(8<<30)-1,4096,4096),
+            (1,1,(4<<30)-1,4096,1024),  # below the 4 GiB gate
             (1,1,0,4096,1024),(1,0,16<<30,0,1024),(1,0,16<<30,512,1024)]:
-        assert budget(1024,warm,busy,bulk,available)==want
+        assert budget(1024,warm,busy,bulk,available)==want,(busy,bulk,available,warm,budget(1024,warm,busy,bulk,available),want)
+    # Budgets sized from installed RAM (hot 0 / warm -1 in the cfg).
+    autoT=dll.BigmapTestAutoTerrainBudgets;autoT.argtypes=[C.c_uint64,C.POINTER(C.c_int),C.POINTER(C.c_int)]
+    autoM=dll.BigmapTestAutoMaterialBudgets;autoM.argtypes=[C.c_uint64,C.POINTER(C.c_int),C.POINTER(C.c_int)]
+    for gib,(th,tw),(mh,mw) in [(4,(256,341),(96,96)),(8,(273,682),(96,170)),
+                                (16,(546,1365),(96,341)),(32,(1092,2730),(182,682)),
+                                (96,(3276,8192),(546,2048)),(512,(4096,8192),(1024,4096))]:
+        h,w=C.c_int(),C.c_int();autoT(gib<<30,C.byref(h),C.byref(w));assert (h.value,w.value)==(th,tw),(gib,h.value,w.value,th,tw)
+        h,w=C.c_int(),C.c_int();autoM(gib<<30,C.byref(h),C.byref(w));assert (h.value,w.value)==(mh,mw),(gib,h.value,w.value,mh,mw)
+    live=dll.BigmapTestTerrainBudgetLive;live.argtypes=[C.c_int]*4+[C.c_uint64,C.c_uint64]
+    G=1<<30
+    for args,want in [((1024,4096,1,0,64*G,8000),8000),        # loading: cover every live tile
+                      ((1024,4096,0,1,16*G,8000),8000),        # 16 GiB free: a quarter reserved, 12 GiB usable
+                      ((1024,4096,1,0,30*G,30000),23040),      # capped at available minus a quarter
+                      ((1024,4096,1,0,200*G,100000),65536),    # absolute clamp
+                      ((1024,4096,1,0,64*G,2000),4096),        # never below warm while loading
+                      ((1024,4096,1,0,5*G,20000),4096),        # small machine: 2 GiB floor reserve, warm is the floor
+                      ((1024,4096,0,0,64*G,8000),1024),        # not loading: hot
+                      ((1024,0,1,0,64*G,8000),1024),           # warm disabled stays disabled
+                      ((1024,4096,1,1,7*G,8000),5120),         # 7 GiB free: 2 GiB reserve
+                      ((1024,4096,1,1,(4*G)-1,8000),1024),     # below the gate: hot
+                      ((3072,4096,1,0,64*G,0),4096)]:          # no live size: warm only
+        assert live(*args)==want,(args,live(*args),want)
     assert dll.BigmapTestCompressionInit()
     resize=dll.BigmapTestCompressionResize;resize.argtypes=[C.POINTER(Vec),C.c_size_t,C.c_int,Resize]
     copy=dll.BigmapTestCompressionCopy;copy.argtypes=[C.POINTER(Vec),C.POINTER(Vec),C.c_int,Copy];copy.restype=C.c_void_p
