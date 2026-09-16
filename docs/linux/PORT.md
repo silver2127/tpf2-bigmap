@@ -171,3 +171,53 @@ Windows block-copy optimization is not part of this change.
 - Testing used the isolated native lab with the multiplayer Lua mod retained,
   but no second peer. Multiplayer synchronization and long-session stability
   remain untested for these additions.
+
+## Minimap integration cdfee2a (partial)
+
+Windows source integrated: `cdfee2a12511b05a2a7f67bc67ca3a818e140feb`
+(2026-09-16). The Windows implementation, Lua GUI, embedding tool and tests
+merge unchanged. **The native Linux minimap is not implemented.** Linux does
+not install the GUI script or intercept its image tokens. `minimap=0` remains
+the default; `minimap=1` logs an explicit unsupported-feature diagnostic and
+leaves the existing large-map features available. No new game patches are
+installed, and the existing twenty-site verification manifest is unchanged.
+
+### Static investigation
+
+The Linux signature/xref exports and actual build 35924 ELF were examined with
+Capstone. All following addresses are investigation evidence, not enabled hook
+sites. They must not be treated as a completed port or substituted into the
+Windows implementation.
+
+| Linux RVA | Established evidence |
+| --- | --- |
+| `0xcf5f20` | Signature identifies `CTerrain::BaseGetVertices(CVec2i) const`. `rdi` is terrain, `rsi` packs x/y. At `0xcf5f38`, `48 8b 57 18` loads terrain+0x18. Instructions at `0xcf5f4b..0xcf5f6e` subtract header x/y at +0/+4, multiply by header width +8, load cells at +0x10, use a 40-byte cell stride and check entity -1. |
+| `0x1046540` | Signature identifies `CGameUI::CreateConstructionMenu`; SysV this is rdi. Entry bytes `f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55`. At `0x10465dc`, `48 8b 87 50 04 00 00` loads UI+0x450. This alone does not establish the accessor's vtable or the returned state layout. |
+| `0x30b26c0` | Signature identifies raw `ImageView::SetImage(int,int,int,const vector<unsigned char>&,bool)`. Prologue saves channels from esi, width from edx, height from ecx, vector from r8 and bool from r9d. It loads the vector's begin pointer and passes it to `0x34c65a0` at `0x30b281e`. Texture upload/copy lifetime has not been established through that callee. |
+| `0x30b2ab0` | Nearby candidate examined for the image-path overload. It saves this from rdi, argument pointer from rsi and flag from edx. However, at `0x30b2b6e..0x30b2bb2` it reads string data/length at argument+0/+8 **and** +0x20/+0x28, then a field at +0x40. Thus it is not proven to accept the single-string argument used by the Windows detour. Do not hook it with a libstdc++ string-only prototype. |
+
+The adjacent raw-image constructor at `0x30b2950` calls `0x30b26c0`.
+Terrain code near `0xcf6474..0xcf6495` reads levels at +0x28 and resolution
+at +0x2c/+0x30, consistent with part of the Windows sampling layout, but this
+is insufficient to certify the entire terrain sampler. Searching TerrainPtr
+signatures also led to the ImportHeightmap callback at `0x10a1190`; its
+0x450 field is a widget double, not evidence for CGameUI's terrain accessor.
+
+### Not ported / evidence still required
+
+- Resolve the Lua `ImageView:setImage` binding to the actual Linux string
+  overload and prove its argument ownership and delegation to the image
+  resource overload. The candidate above failed the single-string check.
+- Trace UI+0x450 through the Linux accessor and current game state to terrain;
+  prove the virtual slot and terrain offset instead of importing Windows
+  vtable slot 1/state+0x20. Check replacement across loading another world.
+- Complete the terrain origin/height-scale/water-field evidence and raw texture
+  upload lifetime before calling the sampler or freeing uploaded pixel data.
+- Then implement Linux guarded hooks, script synchronization and native renderer
+  integration, with synthetic ABI/render tests. The merged Windows renderer
+  and Windows ctypes/DLL tests are not a native Linux implementation.
+
+Validation for this partial integration: `tools/linux/build.sh` and
+`python3 tools/linux/verify_game.py GAME_ELF`. The native config test checks
+that requesting the unsupported minimap logs a warning and writes only the same existing patch sites and lengths as the default configuration. No live game
+validation was attempted, as required by this job.
