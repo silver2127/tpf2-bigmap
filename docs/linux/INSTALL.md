@@ -4,7 +4,7 @@ For Steam Transport Fever 2 Linux build 35924. This is a native `.so` plugin,
 not a Wine/Proton DLL. The package includes the shared native plugin host;
 multiplayer is not required.
 
-1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.2.tar.gz`.
+1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.3.tar.gz`.
 2. In the extracted directory, run `bash install.sh` without sudo.
 3. Use the Steam launch-options line printed by the installer. If multiplayer
    is installed, keep its existing launch options: it loads this plugin too.
@@ -21,7 +21,8 @@ Linux defaults are placed in `.cfg.example`.
 
 Use the plugin when loading worlds that need its expanded octree. Back up
 important saves before testing. Larger maps need substantially more RAM and
-generation time. This port does not include Windows terrain/material paging.
+generation time. Optional terrain compression reduces settled RAM use, but does
+not eliminate the peak memory needed while loading or generating a world.
 
 ## Supported scope
 
@@ -31,11 +32,13 @@ generation time. This port does not include Windows terrain/material paging.
 - Depth-11 octree with a 512-tile edge cap and unchanged 128 m leaves.
   The largest square is 510 tiles; the preview distance calculation imposes
   a separate diagonal bound until its Linux overflow fix is ported.
+- Exact SSE2 terrain min/max scan and faster zstd saves, enabled by default.
+- Experimental lossless terrain compression using Linux userfaultfd, opt-in.
 - Byte/build guards and a shared host that coexists with native multiplayer.
 
-Depth 12/13 (1024/2048-tile edges), Windows fault-driven RAM compression,
-the Windows engine speed optimizations are
-not ported in this build. Do not use the Windows configuration: its depth-13
+Depth 12/13 (1024/2048-tile edges), material compression, terrain copy sharing,
+generation buffer reuse and the remaining renderer optimizations are not ported
+in this build. Do not use the Windows configuration: its depth-13
 setting is rejected explicitly. See PORT.md for evidence and validation limits.
 
 ## Sparse density presets
@@ -61,6 +64,40 @@ it preserves later manual edits and reports a failure instead of deleting them.
 Keep density support enabled when loading saves made with the extra industry
 presets: their stored indices need the added Lua multipliers. The big-map plugin
 must also be present on other machines loading those saves.
+
+## Memory and performance (dev.3)
+
+`save_fast=1` selects zstd level 1 and a 64 KiB stream buffer. The save format is
+unchanged; files can be larger. `terrain_minmax_fast=1` uses an exact SSE2 scan
+for terrain height bounds. Both default to on even with an older config.
+Set either to 0 and restart to disable it.
+
+To try terrain RAM compression, add or change these keys under `[tpf2_bigmap]`
+in your installed config and restart:
+
+```ini
+terrain_cache_compress=1
+terrain_cache_hot_mb=1024
+```
+
+This keeps the original 1 m terrain samples and restores identical bytes on
+access. The budget is a soft limit for uncompressed terrain, not total game RAM.
+The plugin reserves a large virtual address range; use resident memory (RSS),
+not virtual size (VIRT), when comparing RAM use. Compressed data and other game
+allocations still need RAM. More cache space can reduce decompression activity.
+
+Compression is **off by default**. It requires a Linux kernel that permits
+user-mode userfaultfd with missing-page and write-protection support. Unsupported
+systems log `terrain compression unavailable` and continue without compression;
+no root permissions or kernel setting changes are required by the installer.
+The backend handles userspace faults only: a kernel operation directly accessing
+an evicted terrain page is outside its supported path. The tested game paths are
+loading, rendering, simulation, track construction and save/reload; other mods,
+GPU drivers and long sessions need further testing. See PORT.md for details.
+
+One 128x128-tile save settled at 4.98 GiB RSS versus 7.78 GiB with dev.2, using a
+1 GiB terrain budget. Loading peaks were about 9.8 GiB in both runs. This is a
+single-machine comparison, not a guaranteed saving or a frame-rate benchmark.
 
 ## Remove
 

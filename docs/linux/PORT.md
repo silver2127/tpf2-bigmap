@@ -47,14 +47,14 @@ installer preserves an existing host and multiplayer launcher.
 
 Unit checks cover stock/additional rows, every extended ratio, bounds, malformed
 config, float raster sizing, unsupported builds/depths, and patch rollback.
-The read-only ELF check covers all twelve guarded sites. Runtime host loading and
+The read-only ELF check covers all twenty guarded sites. Runtime host loading and
 byte verification have succeeded in the isolated native multiplayer lab.
 
-The Linux port covers large-map creation through depth 11 and sparse density presets.
-It is not full Windows 0.4.0 feature parity. Windows placeholder mappings and
-vectored exception handlers in the terrain/material pagers need a separate
-Linux memory-management design and stress tests. The optional generation,
-renderer, save-speed and depth-12/13 hooks also require independent Linux RE.
+The Linux port covers large-map creation through depth 11, sparse density presets,
+lossless terrain compression, faster saves and a SIMD terrain min/max scan.
+It is not full Windows 0.4.0 feature parity. Material paging, terrain copy sharing,
+generation buffer reuse, placement budgets, material-index/refinement/alignment
+optimizations and depth-12/13 hooks still need independent Linux work.
 The configured maximum has not been stress-tested; this is an experimental build.
 
 The isolated native game reached New Game with the shared host alone. The
@@ -95,3 +95,79 @@ The generation log confirmed saved industry start/target indices 7/8 and
 multipliers 0.06/0.06. Saving and reloading succeeded, retaining those
 multipliers and continuing simulation. Stock Medium is 0.6. This test does not measure long-term
 industry spawning or multiplayer synchronization.
+
+## Linux memory/performance port (dev.3)
+
+### Terrain cache
+
+The Windows `TerrainCodec` format 3 is reused unchanged. It encodes all 66,049
+uint16 samples losslessly; decoding verifies the stored hash. Linux uses a
+new `userfaultfd` backend rather than Windows placeholder mappings or exception
+handlers. A 135,168-byte page-aligned slot holds one 132,098-byte terrain vector.
+The pool reserves 1,048,576 slots virtually; unallocated slots consume no terrain
+pages. Slot metadata is separate (about 80 MiB).
+
+Allocation is intercepted only at CTerrain::AddTile's vector append call
+`0xcf7696 -> 0xadb7e0` and detached-copy allocation call
+`0xcf7783 -> 0x6dbce0`. The shared-vector control block's dispose function at
+`0xcf7bb0` owns release (vector begins at control+16). The control block's own
+allocator/destructor remains unchanged. Vectors outside the pool retain the
+stock allocator/free path. Growth beyond a tile migrates to a stock vector.
+
+A policy thread write-protects candidate tiles, compresses their stable contents,
+then discards their original pages. The fault thread restores and verifies the
+whole tile, removes protection and wakes blocked users at the original address.
+The soft hot budget defaults to 1024 MiB, with a two-second grace period and a
+bounded round-robin scan. It is not an LRU cache: ordinary reads of resident
+pages do not refresh their age. Compression can cost CPU and introduce latency;
+no frame-rate gain is claimed. Poorly compressible tiles stay resident.
+
+No allocation hooks are enabled if userfaultfd setup fails. The backend uses
+`UFFD_USER_MODE_ONLY`, requiring no sysctl changes on the tested system. This
+mode cannot service kernel-origin faults: kernel access to a missing terrain
+page can produce SIGBUS. See the [Linux userfaultfd documentation](https://docs.kernel.org/admin-guide/mm/userfaultfd.html).
+The game paths tested here perform terrain reads/writes in userspace; this is
+not proof for every graphics driver, mod or engine path. Compression therefore
+remains opt-in. Material grids, copy-on-write sharing and multi-worker restores
+are not implemented in this backend. Terrain resolution remains 1 m; the
+abandoned 2 m Windows cache mode is not ported.
+
+### Save stream and terrain scan
+
+Linux save compression setup is `0xc7b4d0`, called by SaveGame at `0xc7f22c`.
+The load of level 3 at `0xc7b524` becomes a local immediate level 1. Buffer
+comparison `0xc7b6b1`, allocation `0xc7c3a0`, and size store `0xc7c3aa` change
+128 bytes to 64 KiB together. No shared constant is changed and the zstd/save
+format stays compatible. Larger compressed files are a possible tradeoff.
+
+The scalar uint16 min/max loop at `0xcf5852..0xcf588c` is replaced by an SSE2
+scan. At entry rbx/r14 delimit the samples; at exit eax/edx hold min/max and
+rbx is the end. The bridge preserves surrounding live registers and xmm2's
+scale. Stock empty-vector handling and float conversion remain intact. XORing
+the sign bit permits exact unsigned ordering with SSE2 signed min/max. The
+Windows block-copy optimization is not part of this change.
+
+### Validation
+
+- Soldier SDK build passes all four CTest suites: hook/config/assembly bridge,
+  density, userfaultfd pager, and shared terrain codec.
+- Pager tests verify actual page eviction with mincore, concurrent exact
+  restores, writes racing eviction, release/reuse and zero initialization.
+  Unsupported kernels skip this test explicitly rather than reporting a pass.
+- Native ELF build-id and all twenty guarded sites match build 35924.
+- Live test: load the existing 128x128-tile sparse world (6 towns, 52 industries),
+  render and simulate, construct two joined tracks, save as `Linux pager rail
+  test`, then reload and visually verify the track and terrain. Pager restores
+  remained hash-checked throughout. A fresh process then reloaded the same save
+  with all three new optimizations disabled, confirming the stock paths still
+  read it and retain the constructed tracks. The save log reported 879 ms; this is not a
+  before/after save-speed benchmark.
+- Separate fresh processes loaded the same original save with dev.2 and the
+  dev.3 features. One RSS sample per second; median of seconds 60..120 was
+  7.781 GiB vs 4.980 GiB. Sampled peaks were 9.851 GiB vs 9.770 GiB. Neither run
+  used swap. This single-run comparison is evidence of settled memory savings,
+  not reduced loading peaks or a repeatable performance benchmark. The pager
+  later held 16,384 live tiles at roughly 1,024 MiB resident plus 106 MiB packed.
+- Testing used the isolated native lab with the multiplayer Lua mod retained,
+  but no second peer. Multiplayer synchronization and long-session stability
+  remain untested for these additions.

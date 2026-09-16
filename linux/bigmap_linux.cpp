@@ -10,7 +10,10 @@
 #include <climits>
 #include <sys/mman.h>
 #include "density.h"
+#include "terrain_pager.h"
 
+extern "C" void TerrainMinMaxBridge();
+extern "C" void* bigmap_minmax_return;
 namespace {
 const Tpf2mpHost* H;
 constexpr const char* Section = "tpf2_bigmap";
@@ -150,10 +153,35 @@ uint8_t* TownStub(uint8_t* page,uintptr_t ret) {
     std::memcpy(page+3000,values,sizeof(values));
     return entry;
 }
-struct Patch { uintptr_t rva; uint8_t before[32]{},after[32]{}; uint32_t len; };
-Patch patches[16];int patchCount=0;
+linux_pager::TerrainPager* terrainPager=nullptr;
+struct TerrainVector {uint16_t *begin,*end,*capacity;};
+void TerrainAppend(TerrainVector* v,size_t n) {
+    using Append=void(*)(TerrainVector*,size_t);
+    const auto original=reinterpret_cast<Append>(H->moduleBase()+0xadb7e0);
+    if(terrainPager->Contains(v->begin)) {
+        const size_t size=v->end-v->begin;
+        if(n<=TerrainCodec::Samples-size){std::memset(v->end,0,n*2);v->end+=n;return;}
+        TerrainVector replacement{};original(&replacement,size+n);
+        std::memcpy(replacement.begin,v->begin,size*2);terrainPager->Release(v->begin);*v=replacement;return;
+    }
+    if(!v->begin && !v->end && !v->capacity && n==TerrainCodec::Samples) {
+        if(auto p=terrainPager->Allocate()){*v={p,p+n,p+n};return;}
+    }
+    original(v,n);
+}
+void* TerrainCopyAllocate(size_t bytes) {
+    if(bytes==TerrainCodec::RawBytes)if(auto p=terrainPager->Allocate())return p;
+    return reinterpret_cast<void*(*)(size_t)>(H->moduleBase()+0x6dbce0)(bytes);
+}
+void TerrainDispose(void* control) {
+    auto* v=reinterpret_cast<TerrainVector*>(static_cast<uint8_t*>(control)+16);
+    if(terrainPager->Release(v->begin)){*v={};return;}
+    if(v->begin)reinterpret_cast<void(*)(void*)>(H->moduleBase()+0x6dbcd0)(v->begin);
+}
+struct Patch { uintptr_t rva; uint8_t before[128]{},after[128]{}; uint32_t len; };
+Patch patches[32];int patchCount=0;
 bool Plan(uintptr_t rva,const uint8_t* before,const uint8_t* after,uint32_t len) {
-    if(patchCount>=16 || len>32 || !H->verifyBytes(rva,before,len))return false;
+    if(patchCount>=32 || len>128 || !H->verifyBytes(rva,before,len))return false;
     auto& p=patches[patchCount++];p.rva=rva;p.len=len;
     std::memcpy(p.before,before,len);std::memcpy(p.after,after,len);return true;
 }
@@ -168,7 +196,7 @@ bool PlanCall(uintptr_t rva,uintptr_t callee,void* target,uint8_t*& stub) {
 extern "C" __attribute__((visibility("default")))
 int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!host || !info || host->abiMajor!=TPF2MP_ABI_MAJOR || host->size<sizeof(Tpf2mpHost))return TPF2MP_ERR_ABI;
-    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.2","Native Linux large maps and sparse town/industry density"};
+    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.3","Native Linux large maps, sparse density and lossless terrain paging"};
     const auto baseMod=density::GamePath();
     std::string densityWhy;
     // Remove our prior labels before validating hooks, so a failed initialization
@@ -235,6 +263,38 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(entry));
         if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
+    const bool minMax=H->cfgBool(Section,"terrain_minmax_fast",1);
+    if(minMax) {
+        const uint8_t before[]={0xf,0xb7,0x13,0x48,0x83,0xc3,0x2,0xf,0xb7,0xc2,0x41,0x89,0xd5,0xeb,0x16,0xf,0x1f,0x80,0x0,0x0,0x0,0x0,0x44,0xf,0xb7,0x3b,0x41,0x89,0xc5,0x48,0x83,0xc3,0x2,0x41,0xf,0xb7,0xc7,0x66,0x44,0x39,0xe8,0x72,0xa,0x66,0x39,0xc2,0xf,0x42,0xd0,0x41,0xf,0xb7,0xc5,0x49,0x39,0xde,0x75,0xdc};
+        uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(TerrainMinMaxBridge));
+        bigmap_minmax_return=reinterpret_cast<void*>(H->moduleBase()+0xcf588c);
+        if(!Plan(0xcf5852,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
+    }
+    const bool fastSave=H->cfgBool(Section,"save_fast",1);
+    if(fastSave) {
+        const uint8_t levelBefore[]={0x8b,0x05,0x9e,0x27,0x3c,0x04},levelAfter[]={0xb8,1,0,0,0,0x90};
+        const uint8_t cmpBefore[]={0x49,0x81,0x7c,0x24,0x70,0x80,0,0,0},cmpAfter[]={0x49,0x81,0x7c,0x24,0x70,0,0,1,0};
+        const uint8_t allocBefore[]={0xbf,0x80,0,0,0},allocAfter[]={0xbf,0,0,1,0};
+        const uint8_t sizeBefore[]={0x49,0xc7,0x44,0x24,0x70,0x80,0,0,0},sizeAfter[]={0x49,0xc7,0x44,0x24,0x70,0,0,1,0};
+        if(!Plan(0xc7b524,levelBefore,levelAfter,6) || !Plan(0xc7b6b1,cmpBefore,cmpAfter,9) ||
+           !Plan(0xc7c3a0,allocBefore,allocAfter,5) || !Plan(0xc7c3aa,sizeBefore,sizeAfter,9))return TPF2MP_ERR_BUILD;
+    }
+    if(H->cfgBool(Section,"terrain_cache_compress",0)) {
+        // Scope allocation changes to CTerrain's append and detached-copy calls.
+        // Dispose is the shared-vector control block's exact native free path.
+        auto* candidate=new linux_pager::TerrainPager;
+        const int hot=std::clamp(H->cfgInt(Section,"terrain_cache_hot_mb",1024),128,16384);
+        if(!candidate->Start(1u<<20,size_t(hot)<<20)) {
+            delete candidate;H->log("terrain compression unavailable: userfaultfd missing/write-protect support required");
+        } else {
+            terrainPager=candidate;
+            const uint8_t before[]={0xf3,0x0f,0x1e,0xfa,0x48,0x8b,0x7f,0x10,0x48,0x85,0xff,0x74,0x0b,0xe9,0x0e,0x41,0x9e,0xff};
+            uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(TerrainDispose));
+            if(!Plan(0xcf7bb0,before,after,sizeof(before)) ||
+               !PlanCall(0xcf7696,0xadb7e0,reinterpret_cast<void*>(TerrainAppend),stub) ||
+               !PlanCall(0xcf7783,0x6dbce0,reinterpret_cast<void*>(TerrainCopyAllocate),stub))return TPF2MP_ERR_BUILD;
+        }
+    }
     if(mprotect(page,4096,PROT_READ|PROT_EXEC))return TPF2MP_ERR_FAILED;
     if(sparse && (!density::Write(std::string(H->dataDir())+"/bigmap-base-mod.path",baseMod+"\n") || !density::Sync(baseMod,true,densityWhy))) {
         H->log("density levels refused: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;
@@ -252,7 +312,13 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(sparse){
         H->log("density levels active: six sparse presets for towns, industries and industry target");
     }
+    if(minMax)H->log("terrain min/max: exact SSE2 scan enabled");
+    if(fastSave)H->log("fast saves: zstd level 1, 64 KiB input buffer; save files may be larger");
+    if(terrainPager){
+        H->log("terrain compression: Linux userfaultfd, lossless 1 m codec, enabled");
+        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto s=terrainPager->Get();H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu",(unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,(unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals);}}).detach();
+    }
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
-    H->log("Experimental port: Windows memory compression and depth 12/13 are not enabled");
+    H->log("Experimental port: depth 12/13 and material compression are not enabled");
     return TPF2MP_OK;
 }

@@ -25,9 +25,15 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();config["newgame_density"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
+extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
+extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
 int main(){
+    std::vector<uint16_t> heights(66049);
+    uint32_t rng=1;for(auto& h:heights){rng=rng*1664525+1013904223;h=uint16_t(rng>>16);}
+    for(size_t n:{1u,7u,8u,9u,257u,66049u}) {auto lo=*std::min_element(heights.begin(),heights.begin()+n),hi=*std::max_element(heights.begin(),heights.begin()+n);assert(BigmapMinMax(heights.data(),heights.data()+n)==(uint32_t(lo)|(uint32_t(hi)<<16)));assert(TestMinMaxBridge(heights.data(),heights.data()+n)==(uint32_t(lo)|(uint32_t(hi)<<16)));}
+
     auto* townPage=static_cast<uint8_t*>(mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
     assert(townPage!=MAP_FAILED);townPage[2048]=0xc3;
     auto* townEntry=TownStub(townPage,uintptr_t(townPage+2048));
@@ -63,5 +69,10 @@ int main(){
     Reset();failWrite=4;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED);
     assert(memory[SizeRva]==std::vector<uint8_t>(SizeBytes,SizeBytes+sizeof(SizeBytes)));
     assert(memory[OctreeSite]==std::vector<uint8_t>(OctreeBytes,OctreeBytes+sizeof(OctreeBytes)));
+    Reset();config["save_fast"]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
+    assert(memory[0xc7b524]==std::vector<uint8_t>({0xb8,1,0,0,0,0x90}));
+    uint32_t buffer;std::memcpy(&buffer,memory[0xc7c3a0].data()+1,4);assert(buffer==65536);
+    std::memcpy(&buffer,memory[0xc7c3aa].data()+5,4);assert(buffer==65536);
+    std::memcpy(&buffer,memory[0xc7b6b1].data()+5,4);assert(buffer==65536);
     puts("PASS: map sizing, ratios, raster overflow, guards, safe caps and rollback");
 }
