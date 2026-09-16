@@ -67,16 +67,36 @@ cd /d "%~dp0"
 if not exist out mkdir out
 
 if /i "%1"=="-pager-test" (
-    cl /nologo /O2 /MT /W3 /EHsc tools\test_terrain_pager.cpp /Fo:out\test_terrain_pager.obj /Fe:out\test_terrain_pager.exe
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_terrain_pager.cpp /Fo:out\test_terrain_pager.obj /Fe:out\test_terrain_pager.exe || exit /b 1
+    exit /b
+)
+if /i "%1"=="-codec-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_terrain_codec.cpp /Fo:out\test_terrain_codec.obj /Fe:out\test_terrain_codec.exe || exit /b 1
+    exit /b
+)
+if /i "%1"=="-codec-profile" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\profile_codec_decode.cpp /Fo:out\profile_codec_decode.obj /Fe:out\profile_codec_decode.exe || exit /b 1
+    exit /b
+)
+if /i "%1"=="-decode-exp" (
+    cl /nologo /O2 /MT /W3 /EHsc /FAs /Faout\decode_experiments.asm tools\decode_experiments.cpp /Fo:out\decode_experiments.obj /Fe:out\decode_experiments.exe || exit /b 1
+    exit /b
+)
+if /i "%1"=="-matpager-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_material_pager.cpp /Fo:out\test_material_pager.obj /Fe:out\test_material_pager.exe || exit /b 1
+    exit /b
+)
+if /i "%1"=="-matcodec-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_material_codec.cpp /Fo:out\test_material_codec.obj /Fe:out\test_material_codec.exe || exit /b 1
     exit /b
 )
 if /i "%1"=="-codec-bench" (
-    cl /nologo /O2 /MT /W3 /EHsc tools\benchmark_terrain_codec.cpp /Fo:out\benchmark_terrain_codec.obj /Fe:out\benchmark_terrain_codec.exe
+    cl /nologo /O2 /MT /W3 /EHsc tools\benchmark_terrain_codec.cpp /Fo:out\benchmark_terrain_codec.obj /Fe:out\benchmark_terrain_codec.exe || exit /b 1
     exit /b
 )
 
 cl /nologo /O2 /MT /W3 /EHsc /c src\bigmap.cpp /Fo:out\bigmap.obj || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_bigmap.dll out\bigmap.obj          || exit /b 1
+link /nologo /DLL /MAP:out\tpf2_bigmap.map /OUT:out\tpf2_bigmap.dll out\bigmap.obj          || exit /b 1
 echo BUILD BIGMAP OK
 
 if /i "%1"=="-deploy" (

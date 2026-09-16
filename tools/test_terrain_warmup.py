@@ -31,7 +31,8 @@ def main():
     assert step(2200000,bulk=2199999)
     budget=dll.BigmapTestTerrainBudget
     budget.argtypes=[C.c_int]*4+[C.c_uint64]
-    assert budget(1024,4096,0,1,7<<30)==1024  # pressure overrides pending tail
+    assert budget(1024,4096,0,1,3<<30)==1024  # below the 4 GiB gate: pressure overrides the tail
+    assert budget(1024,4096,0,1,7<<30)==4096  # 7 GiB free: 2 GiB reserve leaves room for warm
     assert budget(1024,4096,0,1,8<<30)==4096
     assert budget(1024,0,0,1,16<<30)==1024
     print('PASS: generation, late load, paused-ready frame, stale heartbeat, repeat load, fallback, cancellation, memory pressure')
