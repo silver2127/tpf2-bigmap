@@ -868,6 +868,10 @@ static bool WriteWholeFile(const wchar_t* path, const char* data, size_t len)
     return ok;
 }
 
+// The in-game minimap: native terrain texture behind a Lua ImageView. Uses
+// ReadWholeFile / WriteWholeFile above for its game script.
+#include "minimap.h"
+
 // The stock text with the inserts, malloc'd; nullptr (and `why`) when an anchor
 // is missing, repeated or out of order.
 static char* PatchBaseModText(const char* stock, size_t len, size_t* outLen, char* why, size_t whyLen)
@@ -1033,6 +1037,9 @@ void WINAPI BigmapRestoreStockBaseMod(HWND, HINSTANCE, LPSTR, int)
     if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\res\\config\\base_mod.lua", self) < 0) return;
     char why[320];
     SyncBaseMod(path, false, why, sizeof why);
+    // The minimap game script goes too (only if it is ours).
+    wchar_t script[MAX_PATH];
+    if (MinimapScriptPathIn(self, script, MAX_PATH)) SyncMinimapScript(script, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,6 +1241,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                             (g_materialCompress==1 && (g_materialWarmMB<0 || g_materialWarmMB>g_materialHotMB));
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
+    g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 0) != 0;
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;
@@ -1320,6 +1328,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                    "binary -- every RVA here was measured on those two, so "
                    "refusing to patch (re-run the recon if the game updated)");
             SyncGameBaseMod(false);   // no density levels on an unknown build: stock file back
+            SyncGameMinimapScript(false);   // nor a minimap button whose hooks cannot install
             return TPF2MP_ERR_BUILD;
         }
     }
@@ -1343,6 +1352,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallMaterialCompression();
     installed += InstallSaveFast();
     installed += InstallInstanceShrink();
+    installed += InstallMinimap();
 
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {
