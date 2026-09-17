@@ -541,6 +541,83 @@ static bool Evict(unsigned i,bool force=false,uint64_t minAge=MinAgeMs) {
 }
 static Stats Snapshot(){Guard g;return stats;}
 static void SetBudget(size_t bytes){Guard g;budget=bytes;}
+// Content probe (docs/terrain-cow-sharing.md, "where the 8.25 GiB actually is"):
+// hash every live allocation and count how many carry the same bytes as another.
+// A measurement, not a mechanism: it decides whether content dedup between the
+// two CTerrain versions is worth building. A slot with a packed blob (cold, or
+// resident read-only and unwritten since its restore) contributes the hash the
+// blob already carries; a writable resident slot is hashed through a private
+// alias, so a blocked public view is never touched and nothing faults. Slots in
+// the middle of an encode or decode are skipped. Untouched allocations are all
+// zero, so the size of that group is reported on its own: during a load it is
+// tiles not yet filled, not evidence of duplication.
+struct ProbeResult {
+    uint64_t live, hashedResident, hashedPacked, skipped;
+    uint64_t distinct, duplicated;   // duplicated = hashed - distinct: freeable by dedup
+    uint64_t zero;                   // members of the all-zero group
+    uint64_t pairs;                  // hash groups of exactly two members
+    uint64_t largestGroup;
+    uint64_t ms;
+};
+// Both codecs write the version byte and then the raw hash, little-endian.
+static uint64_t StoredHash(const Packed* p) {
+    if(p->bytes<9)return 0;
+    uint64_t h=0;for(int i=0;i<8;++i)h|=uint64_t(p->data[1+i])<<(8*i);
+    return h;
+}
+// 0: not a live allocation, 1: resident bytes hashed, 2: stored hash of the
+// packed blob, 3: live but busy (encode or decode in flight), skipped.
+static int ProbeSlot(unsigned i,uint64_t* out) {
+    uint8_t* alias=nullptr;
+    {
+        Guard g;
+        if(i>=allocated||!slots[i].active)return 0;
+        auto& s=slots[i];
+        if(s.packed){*out=StoredHash(s.packed);return 2;}
+        if(!s.section||s.evicting||s.restoring||s.viewMissing)return 3;
+        alias=static_cast<uint8_t*>(MapViewOfFile(s.section,FILE_MAP_READ,0,0,SlotBytes));
+        if(!alias)return 3;
+    }
+    *out=PAGER_CODEC::Hash(reinterpret_cast<const Element*>(alias+Offset));
+    UnmapViewOfFile(alias);
+    return 1;
+}
+static bool Probe(ProbeResult* r,void(*yield)()=nullptr) {
+    *r={};
+    LARGE_INTEGER f{},t0{},t1{};QueryPerformanceFrequency(&f);QueryPerformanceCounter(&t0);
+    unsigned n;{Guard g;n=allocated;r->live=stats.live;}
+    if(!n)return true;
+    struct Entry{uint64_t hash;uint32_t count;};
+    size_t cap=1;while(cap<size_t(n)*2)cap<<=1;
+    auto table=static_cast<Entry*>(VirtualAlloc(nullptr,cap*sizeof(Entry),MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    auto zeroTile=static_cast<Element*>(VirtualAlloc(nullptr,Bytes,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    if(!table||!zeroTile){if(table)VirtualFree(table,0,MEM_RELEASE);if(zeroTile)VirtualFree(zeroTile,0,MEM_RELEASE);return false;}
+    uint64_t zeroHash=PAGER_CODEC::Hash(zeroTile);
+    VirtualFree(zeroTile,0,MEM_RELEASE);
+    for(unsigned i=0;i<n;++i) {
+        uint64_t h=0;int kind=ProbeSlot(i,&h);
+        if(!kind)continue;
+        if(kind==3){++r->skipped;continue;}
+        if(kind==1)++r->hashedResident;else ++r->hashedPacked;
+        if(h==zeroHash)++r->zero;
+        if(!h)h=1;   // 0 marks an empty entry
+        for(size_t k=size_t(h^(h>>29))&(cap-1);;k=(k+1)&(cap-1)) {
+            if(!table[k].hash){table[k].hash=h;table[k].count=1;++r->distinct;break;}
+            if(table[k].hash==h){++table[k].count;break;}
+        }
+        if(yield&&(i&63)==63)yield();
+    }
+    for(size_t k=0;k<cap;++k) {
+        if(!table[k].hash)continue;
+        if(table[k].count==2)++r->pairs;
+        if(table[k].count>r->largestGroup)r->largestGroup=table[k].count;
+    }
+    r->duplicated=r->hashedResident+r->hashedPacked-r->distinct;
+    VirtualFree(table,0,MEM_RELEASE);
+    QueryPerformanceCounter(&t1);
+    r->ms=f.QuadPart?uint64_t((t1.QuadPart-t0.QuadPart)*1000/f.QuadPart):0;
+    return true;
+}
 // attempts=0: the worker's policy, safe to run from several threads at once.
 // Visit at least 256 slots, or 1/128 of the allocated range on huge maps, but
 // stop after ~40 ms of work. While allocations are bursting (loading), encode

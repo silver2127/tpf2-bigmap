@@ -12,6 +12,16 @@ static int g_terrainCowShare=0;
 // Is the COW copy hook even reached during a load? The first measured run shared
 // nothing, and `1dedd0` only runs when the detach at `33dd20` finds refs > 1.
 static volatile LONG64 g_cowCopyCalls=0, g_cowCopyUnmanaged=0;
+// Content-dedup probe (measurement only): hash every live tile and log how many
+// are byte-identical to another. Every 10 s while loading, every 2 min otherwise.
+static int g_terrainDedupProbe=0;
+static void ProbeYield(){TerrainPager::Tick();}
+static void LogDedupProbe() {
+    TerrainPager::ProbeResult r{};
+    if(!TerrainPager::Probe(&r,ProbeYield)){H->log("terrain dedup probe: table allocation failed");return;}
+    H->log("terrain dedup probe: live=%llu hashed=%llu (resident=%llu cold=%llu) skipped=%llu distinct=%llu duplicates=%llu zero_tiles=%llu pairs=%llu largest_group=%llu ms=%llu",
+           r.live,r.hashedResident+r.hashedPacked,r.hashedResident,r.hashedPacked,r.skipped,r.distinct,r.duplicated,r.zero,r.pairs,r.largestGroup,r.ms);
+}
 static volatile LONG g_terrainCompressActive=0;
 struct TerrainOwnedVector {uint16_t *first,*last,*end;};
 using TerrainResizeFn=void(__fastcall*)(TerrainOwnedVector*,size_t);
@@ -129,6 +139,7 @@ static DWORD WINAPI TerrainEvictionHelper(void*) {
 }
 static DWORD WINAPI TerrainCompressionWorker(void*) {
     uint64_t lastLog=GetTickCount64(),lastPolicy=0;int effectiveMB=g_terrainHotMB;
+    uint64_t lastProbe=0;bool probeFast=false;
     TerrainWarmup warmup;
     using UiTickFn=uint64_t(*)();UiTickFn uiTick=nullptr;
     for(;;) {
@@ -162,8 +173,13 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             TerrainPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_terrainHotMB||effectiveMB==g_terrainHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("terrain compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d loading_tail=%d ui_signal=%d commit_tight=%d)",effectiveMB,next,int(busy),int(bulk),int(loading),int(uiTick!=nullptr),int(commitTight));
             effectiveMB=next;
+            probeFast=busy||bulk||loading;
         }
         TerrainPager::Tick();
+        if(g_terrainDedupProbe && now-lastProbe>=(probeFast?10000ull:120000ull)) {
+            lastProbe=now;
+            if(TerrainPager::Snapshot().live)LogDedupProbe();
+        }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
             if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f",
@@ -219,7 +235,7 @@ static bool InstallTerrainCompression() {
     for(unsigned n=PagerHelperThreads();n--;)
         if(HANDLE helperThread=CreateThread(nullptr,0,TerrainEvictionHelper,nullptr,0,nullptr)){SetThreadPriority(helperThread,THREAD_PRIORITY_BELOW_NORMAL);CloseHandle(helperThread);}
     InterlockedExchange(&g_terrainCompressActive,1);
-    H->log("terrain compression: lossless 1 m cache enabled, %d MiB resident target, cow_share=%d; restart to disable",g_terrainHotMB,g_terrainCowShare);
+    H->log("terrain compression: lossless 1 m cache enabled, %d MiB resident target, cow_share=%d dedup_probe=%d; restart to disable",g_terrainHotMB,g_terrainCowShare,g_terrainDedupProbe);
     return true;
 }
 
