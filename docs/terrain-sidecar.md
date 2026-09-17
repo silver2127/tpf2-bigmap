@@ -24,8 +24,22 @@ Not yet integrated (needs the pass, which `src/alignment_batch.h` owns):
 1. **Fingerprint.** Key the file to the save by a 64-bit hash of the `.sav`
    bytes, captured in a `SaveGame` (`0x2e97c0`) post-hook and recomputed in a
    `LoadGame` (`0x2e5ec0`) pre-hook. Same bytes => same aligned terrain, so a
-   match is exact; any mismatch (edited save, plugin-less save, different save)
-   makes `Apply` a no-op and the pass runs.
+   match is exact; any mismatch (edited save, plugin-less save, or a *different
+   save of the same map* — same base heightmap, different roads) makes `Apply`
+   a no-op and the pass runs. A content hash of the base heightmap alone is
+   NOT enough: it would false-accept a different save of the same map and serve
+   the wrong cuts, so the key must be tied to the save's identity.
+
+   The save's resolved path is reachable exactly as the multiplayer menu DLL's
+   `AutoLoadCall` does it (native/src/menu_hook.cpp ~2219): the argument is a
+   `SaveGameId { std::wstring path@0x00, name@0x20, namespace@0x40 }` (SSO);
+   `app = APP_ACCESSOR()`, `mgr = *(app + 200)` is the save manager, and
+   `SAVEINFO_GET(info, mgr, id)` fills a 0x110-byte save-info struct that
+   carries the absolute `.sav` path. `LoadGame` (`0x2e5ec0`) receives that
+   SaveGameId directly; `SaveGame` (`0x2e97c0`) has it too. Hash the resolved
+   `.sav` file and place/read `<path>.terr` beside it. Store the hash in
+   `static uint64_t TerrainSidecar::g_saveFingerprint`, which `Write` and
+   `BeginApply` already take as their `fingerprint` argument.
 2. **Write trigger.** After a save completes, walk `g_alignmentTerrain`
    (exposed by the batch detour, `CTerrain` from `self+8`) and write the file.
 3. **Read trigger and short-circuit.** The pass CREATES the tiles (`AddTile`,
