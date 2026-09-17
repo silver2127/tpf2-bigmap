@@ -59,6 +59,17 @@ def main():
     buf=C.create_string_buffer(64)
     free(C.addressof(buf),stock_free)       # a heap pointer goes to the CRT
     assert freed==[C.addressof(buf)]
+    # A small-pager span: touched, then freed by data pointer and by raw base.
+    assert dll.BigmapTestSmallInit()
+    salloc=dll.BigmapTestSmallAllocate;salloc.argtypes=[C.c_size_t];salloc.restype=C.c_void_p
+    freed.clear()
+    for by_base in (False,True):
+        q=salloc(8000);assert q and q%32==0
+        C.memset(q,0x11,16000)              # first touch commits the span
+        assert C.string_at(q-8,8)==(q-32).to_bytes(8,'little')   # aligned-alloc header
+        free(q-32 if by_base else q,stock_free)
+        assert not freed,'small span reached the CRT'
+    stats(out);assert out[1]>=4 and out[2]==1
     print('PASS: stock ctor and call-site bytes, free import identity, ctor fall-through, arena frees routed to the pager (data and base pointer), stray drop, heap pass-through')
 
 if __name__=='__main__':main()

@@ -1,28 +1,27 @@
-// Steam 35924: the per-tile work blocks of the terrain alignment pass go
-// through the terrain pager instead of the heap.
+// Steam 35924: the terrain alignment pass's per-tile and per-region vectors
+// go through the plugin's pagers instead of the heap.
 //
-// MEASURED 2026-09-17 (ETW VirtualAllocation trace of a 103,680-tile save
-// load that ended in the game's "Out of memory" assert, tools/re/etl_alloc.py):
-// at the peak the process had 31.6 GiB live, of which 19.2 GiB were 99,230
-// blocks of 132,098 bytes, one per tile, every one of them alive at once.
-// The stack is operator new <- std::vector<uint16_t>(n) (0x310230, the
-// aligned value-initialising constructor) <- terrain_util::GetBlock
-// (0x3c4a20, return address 0x3c4ba7) <- terrain_util::BaseGetHeightmapRefined
-// <- ecs::TerrainAlignmentSystem::UpdateSubterrains. The load computes a
-// 257x257 block for every tile, keeps all of them until the publication
-// pass copies each into its tile's height cache, and frees them afterwards.
+// MEASURED 2026-09-17 with an ETW VirtualAllocation trace (LONGMAPSAVE) and
+// in-process counters (LONGBOI), both 207,360-tile loads:
+//   - the pass computes a work block per region through terrain_util::GetBlock
+//     (0x3c4a20), whose vector<uint16_t>(n) constructor call at 0x3c4ba2
+//     (return 0x3c4ba7) was hit ~10 million times on LONGBOI, ~99,000 times
+//     with whole-tile blocks on LONGMAPSAVE;
+//   - and resizes an alignment result vector per region at 0xaac4d9 inside
+//     ecs::TerrainAlignmentSystem::UpdateSubterrains: 3.3 million times.
+// All of them stay alive until the publication pass has copied each into its
+// tile: the game's own 34 GiB private peak, written once and read once.
 //
-// Here the constructor is detoured: when it is called from GetBlock for a
-// block of exactly one tile (66,049 samples) and the pager is live, the
-// vector gets a pager slot (a lazy zero one when that is on: no section until
-// the first write). The blocks then compress and evict under commit pressure
-// like tiles do, and the fill/publish sequence faults them back as needed.
+// Routing: both allocation sites go to SmallPager (any size up to the codec's
+// maximum): reserved pages, committed on first touch, compressed and
+// decommitted when the pool is over budget, restored on the next access.
 // Their release comes through the CRT: the aligned delete reads the raw
-// pointer at [-8] (the pager stores the slot base there, as MSVC does) and
+// pointer at [-8] (the pagers store the span base there, as MSVC does) and
 // calls free. free is imported (api-ms-win-crt-heap-l1-1-0!free), so its IAT
 // slot (0x2f0b5b8) is pointed at a detour that returns arena pointers to the
-// pager and passes everything else on unchanged.
+// owning pager and passes everything else on unchanged.
 #pragma once
+#include "small_pager.h"
 struct BlockVector { uint16_t *first, *last, *end; };
 using BlockCtorFn = void(__fastcall*)(BlockVector*, size_t);
 using FreeFn = void(__cdecl*)(void*);
@@ -39,32 +38,27 @@ static const uint8_t kBlockCtorBytes[19] = {
 static void __fastcall BlockCtorDetour(BlockVector* v, size_t n) {
     auto ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
     InterlockedIncrement64(&g_blockCalls);
-    if (n == TerrainPager::Samples) {
+    if (ret == g_blockBase + kBlockCtorReturn && n && n <= SmallPager::MaxSamples &&
+        InterlockedCompareExchange(&g_smallPagerActive, 0, 0)) {
         InterlockedIncrement64(&g_blockSized);
-        // Record up to eight distinct callers of one-tile-sized constructions.
-        LONG64 rva = LONG64(ret - g_blockBase);
-        for (int k = 0; k < 8; ++k) {
-            LONG64 seen = InterlockedCompareExchange64(&g_blockCallers[k], rva, 0);
-            if (seen == 0) { if (H) H->log("terrain blocks: one-tile block constructed from exe+%llx", (unsigned long long)rva); break; }
-            if (seen == rva) break;
-        }
-    }
-    if (n == TerrainPager::Samples && InterlockedCompareExchange(&g_terrainCompressActive, 0, 0) &&
-        ret == g_blockBase + kBlockCtorReturn) {
-        if (auto p = TerrainPager::Allocate()) {
+        if (auto p = SmallPager::Allocate(n)) {
             *v = {p, p + n, p + n};
-            if (InterlockedIncrement64(&g_blockAllocations) == 1) H->log("terrain blocks: first alignment block routed to the pager");
+            if (InterlockedIncrement64(&g_blockAllocations) == 1 && H) H->log("terrain blocks: first alignment work block routed to the small pager (%llu samples)", (unsigned long long)n);
             return;
         }
     }
     g_originalBlockCtor(v, n);
 }
 static void __cdecl FreeDetour(void* p) {
-    if (p && TerrainPager::Contains(p)) {
-        if (TerrainPager::ReleaseAny(p)) { InterlockedIncrement64(&g_blockReleases); return; }
-        // An arena address that is not a live slot: never hand it to the CRT.
-        InterlockedIncrement64(&g_blockStray);
-        return;
+    if (p) {
+        if (TerrainPager::Contains(p)) {
+            if (TerrainPager::ReleaseAny(p)) { InterlockedIncrement64(&g_blockReleases); return; }
+            InterlockedIncrement64(&g_blockStray); return;   // an arena address that is not a live slot: never hand it to the CRT
+        }
+        if (SmallPager::Contains(p)) {
+            if (SmallPager::Release(p)) { InterlockedIncrement64(&g_blockReleases); return; }
+            InterlockedIncrement64(&g_blockStray); return;
+        }
     }
     g_originalFree(p);
 }
@@ -75,6 +69,9 @@ static bool InstallTerrainBlocks() {
     }
     if (!H->verifyBytes(kBlockCtorRva, kBlockCtorBytes, sizeof kBlockCtorBytes)) {
         H->log("terrain blocks: Steam byte mismatch at the block vector constructor; OFF"); return false;
+    }
+    if (!SmallPager::Init(size_t(g_smallHotMB) * 1024 * 1024)) {
+        H->log("terrain blocks: small pager initialization failed; OFF"); return false;
     }
     g_blockBase = H->moduleBase();
     // The IAT slot must hold the CRT's free before it is replaced.
@@ -95,9 +92,12 @@ static bool InstallTerrainBlocks() {
         uint8_t back[8]; memcpy(back, &crtFree, 8); H->patchBytes(kFreeIatRva, back, 8);
         H->log("terrain blocks: constructor hook failed; free import restored; OFF"); return false;
     }
-    H->log("terrain blocks: alignment work blocks (257x257 from terrain_util::GetBlock) go through the terrain pager; free import routed");
+    InterlockedExchange(&g_smallPagerActive, 1);
+    H->log("terrain blocks: alignment work blocks (terrain_util::GetBlock) and result vectors (UpdateSubterrains) go through the small pager, %d MiB resident target; free import routed", g_smallHotMB);
     return true;
 }
 extern "C" __declspec(dllexport) void BigmapTestBlockCtor(BlockVector* v, size_t n, BlockCtorFn original) { g_originalBlockCtor = original; BlockCtorDetour(v, n); }
 extern "C" __declspec(dllexport) void BigmapTestFree(void* p, FreeFn original) { g_originalFree = original; FreeDetour(p); }
 extern "C" __declspec(dllexport) void BigmapTestBlockStats(uint64_t* out) { out[0] = g_blockAllocations; out[1] = g_blockReleases; out[2] = g_blockStray; }
+extern "C" __declspec(dllexport) int BigmapTestSmallInit() { if (!SmallPager::Init(1 << 20)) return 0; InterlockedExchange(&g_smallPagerActive, 1); return 1; }
+extern "C" __declspec(dllexport) void* BigmapTestSmallAllocate(size_t n) { return SmallPager::Allocate(n); }
