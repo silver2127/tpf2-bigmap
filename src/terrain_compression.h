@@ -32,11 +32,16 @@ static int g_terrainEvictPerSec=4000, g_materialEvictPerSec=4000;
 //   seen in the last second (UiStallMeter, from the menu DLL's last-frame
 //   stamp; absent without the multiplayer DLL). A stall halves the rate; after
 //   five stall-free seconds it grows by a quarter per second back to the cap.
-struct EvictRateState {unsigned rate,quiet;};
+// `cost` is a running average of the measured cost (three parts old, one
+// new), kept across seconds with no evictions: MEASURED 2026-09-17, without
+// it every quiet second let the rate climb to the ceiling and the next busy
+// second started with a burst at 4,000/s against a measured 1,250/s cap.
+struct EvictRateState {unsigned rate,quiet;uint64_t cost;};
 static unsigned EvictRateStep(EvictRateState* st,uint64_t avgMicros,unsigned stalls,bool uiSignal,unsigned ceiling) {
     if(!ceiling)return 0;
     if(!st->rate)st->rate=ceiling<1000?ceiling:1000;
-    unsigned costCap=avgMicros?unsigned(250000ull/avgMicros):ceiling;
+    if(avgMicros)st->cost=st->cost?(st->cost*3+avgMicros)/4:avgMicros;
+    unsigned costCap=st->cost?unsigned(250000ull/st->cost):ceiling;
     if(costCap<100)costCap=100;
     unsigned cap=costCap<ceiling?costCap:ceiling;
     if(uiSignal && stalls){st->rate=st->rate/2>100?st->rate/2:100;st->quiet=0;}
@@ -359,8 +364,8 @@ extern "C" __declspec(dllexport) void BigmapTestCompressionStats(uint64_t* out) 
 }
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudget(int hot,int warm,int busy,int bulk,uint64_t available){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available);}
 extern "C" __declspec(dllexport) void BigmapTestAutoTerrainBudgets(uint64_t totalBytes,int* hot,int* warm){AutoTerrainBudgets(totalBytes,hot,warm);}
-extern "C" __declspec(dllexport) unsigned BigmapTestEvictRateStep(unsigned* rate,unsigned* quiet,uint64_t avgMicros,unsigned stalls,int uiSignal,unsigned ceiling) {
-    EvictRateState st{*rate,*quiet};unsigned r=EvictRateStep(&st,avgMicros,stalls,uiSignal!=0,ceiling);*rate=st.rate;*quiet=st.quiet;return r;
+extern "C" __declspec(dllexport) unsigned BigmapTestEvictRateStep(unsigned* rate,unsigned* quiet,uint64_t* cost,uint64_t avgMicros,unsigned stalls,int uiSignal,unsigned ceiling) {
+    EvictRateState st{*rate,*quiet,*cost};unsigned r=EvictRateStep(&st,avgMicros,stalls,uiSignal!=0,ceiling);*rate=st.rate;*quiet=st.quiet;*cost=st.cost;return r;
 }
 extern "C" __declspec(dllexport) unsigned BigmapTestUiStalls(const uint64_t* stamps,int n) {
     UiStallMeter m;for(int i=0;i<n;++i)m.Sample(stamps[i]);return m.Take();
