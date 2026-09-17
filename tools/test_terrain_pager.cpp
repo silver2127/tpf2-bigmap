@@ -314,6 +314,71 @@ int main(int argc,char** argv) {
         for(auto t:{a1,a2,a3,b1,b2,z1,z2,u})assert(Release(t));
         printf("content probe: distinct=%llu duplicated=%llu zero=%llu ms=%llu\n",r.distinct,r.duplicated,r.zero,r.ms);
     }
+    // Content dedup: the second eviction of identical bytes shares the first
+    // blob (no encode, no extra compressed bytes); a write to one twin gives it
+    // private bytes and leaves the other on the blob; the blob leaves the index
+    // with its last owner, so the same bytes encode afresh afterwards.
+    {
+        assert(EnableDedup());
+        std::vector<uint16_t> pat(Samples);
+        for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k*5+7);
+        auto base=Snapshot();
+        auto a=Allocate(),b=Allocate();assert(a&&b);
+        memcpy(a,pat.data(),Bytes);memcpy(b,pat.data(),Bytes);
+        assert(Evict(Index(a),true));
+        auto s1=Snapshot();assert(s1.encodes==base.encodes+1 && s1.dedupHits==base.dedupHits);
+        assert(Evict(Index(b),true));
+        auto s2=Snapshot();
+        assert(s2.encodes==s1.encodes && s2.dedupHits==base.dedupHits+1);
+        assert(s2.compressedBytes==s1.compressedBytes && s2.resident==s1.resident-1);
+        {Guard g;assert(slots[Index(a)].packed==slots[Index(b)].packed && slots[Index(a)].packed->refs==2);}
+        assert(memcmp(a,pat.data(),Bytes)==0 && memcmp(b,pat.data(),Bytes)==0);   // reads restore, still shared
+        b[3]=0x5555;                                                              // a write privatizes b
+        {Guard g;assert(!slots[Index(b)].packed && slots[Index(a)].packed && slots[Index(a)].packed->refs==1);}
+        assert(a[3]==pat[3]);
+        // a is resident, read-only and packed: its re-eviction reuses the blob.
+        assert(Evict(Index(a),true));assert(Snapshot().reusedEvictions==s2.reusedEvictions+1);
+        // b's bytes now differ: a fresh encode.
+        assert(Evict(Index(b),true));assert(Snapshot().dedupHits==s2.dedupHits && Snapshot().encodes==s2.encodes+1);
+        // A third tile with a's bytes hits a's blob.
+        auto c=Allocate();assert(c);memcpy(c,pat.data(),Bytes);
+        assert(Evict(Index(c),true));assert(Snapshot().dedupHits==s2.dedupHits+1);
+        assert(memcmp(c,pat.data(),Bytes)==0);
+        assert(Release(a));assert(Release(b));assert(Release(c));
+        // The blob went with its last owner: the same bytes encode again.
+        auto d=Allocate();assert(d);memcpy(d,pat.data(),Bytes);
+        auto s3=Snapshot();assert(Evict(Index(d),true));
+        assert(Snapshot().dedupHits==s3.dedupHits && Snapshot().encodes==s3.encodes+1);
+        assert(memcmp(d,pat.data(),Bytes)==0);assert(Release(d));
+        // A rebuild indexes every stored blob exactly once, shared ones included.
+        auto e=Allocate(),f=Allocate();assert(e&&f);memcpy(e,pat.data(),Bytes);memcpy(f,pat.data(),Bytes);
+        assert(Evict(Index(e),true) && Evict(Index(f),true));
+        {Guard g;size_t used=dedupUsed;assert(used==1);DedupRebuild();assert(dedupUsed==used && dedupTombstones==0);}
+        assert(memcmp(e,pat.data(),Bytes)==0 && memcmp(f,pat.data(),Bytes)==0);
+        assert(Release(e));assert(Release(f));
+        // Eight writers allocating twins, evicting, reading, writing and
+        // releasing, against a forced evictor: every read sees its own bytes.
+        std::atomic<bool> go{false},stop{false};std::atomic<unsigned> bad{0};
+        std::thread ev([&]{while(!go)SwitchToThread();
+            while(!stop){unsigned n;{Guard gg;n=allocated;}for(unsigned i=0;i<n;++i)Evict(i,true);}});
+        std::vector<std::thread> ws;
+        for(unsigned n=0;n<8;++n)ws.emplace_back([&,n]{
+            while(!go)SwitchToThread();
+            for(unsigned k=0;k<300;++k) {
+                auto t=Allocate();if(!t)continue;
+                memcpy(t,pat.data(),Bytes);
+                Evict(Index(t),true);
+                if(memcmp(t,pat.data(),Bytes)!=0)++bad;
+                t[n]=uint16_t(k);if(t[n]!=uint16_t(k))++bad;
+                if(k&1){Evict(Index(t),true);if(t[n]!=uint16_t(k))++bad;}
+                Release(t);
+            }
+        });
+        go=true;for(auto& w:ws)w.join();stop=true;ev.join();
+        assert(bad==0);
+        auto sd=Snapshot();assert(sd.live==0 && sd.compressedBytes==0 && sd.failures==base.failures);
+        printf("content dedup: hits=%llu encodes=%llu rebuilds=%llu\n",sd.dedupHits-base.dedupHits,sd.encodes-base.encodes,sd.dedupRebuilds);
+    }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
     DWORD beforeHandles=0,afterHandles=0;

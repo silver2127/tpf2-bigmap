@@ -15,12 +15,16 @@ static volatile LONG64 g_cowCopyCalls=0, g_cowCopyUnmanaged=0;
 // Content-dedup probe (measurement only): hash every live tile and log how many
 // are byte-identical to another. Every 10 s while loading, every 2 min otherwise.
 static int g_terrainDedupProbe=0;
+// Content dedup: an eviction whose bytes match a stored blob shares it instead
+// of encoding (see pager_impl.inl). Measured need: the two CTerrain versions of
+// a save load are byte-identical tile for tile.
+static int g_terrainDedup=0;
 static void ProbeYield(){TerrainPager::Tick();}
 static void LogDedupProbe() {
     TerrainPager::ProbeResult r{};
     if(!TerrainPager::Probe(&r,ProbeYield)){H->log("terrain dedup probe: table allocation failed");return;}
-    H->log("terrain dedup probe: live=%llu hashed=%llu (resident=%llu cold=%llu) skipped=%llu distinct=%llu duplicates=%llu zero_tiles=%llu pairs=%llu largest_group=%llu ms=%llu",
-           r.live,r.hashedResident+r.hashedPacked,r.hashedResident,r.hashedPacked,r.skipped,r.distinct,r.duplicated,r.zero,r.pairs,r.largestGroup,r.ms);
+    H->log("terrain dedup probe: live=%llu hashed=%llu (resident=%llu cold=%llu) skipped=%llu distinct=%llu duplicates=%llu zero_tiles=%llu pairs=%llu largest_group=%llu low_half=%llu ms=%llu",
+           r.live,r.hashedResident+r.hashedPacked,r.hashedResident,r.hashedPacked,r.skipped,r.distinct,r.duplicated,r.zero,r.pairs,r.largestGroup,r.lowHalf,r.ms);
 }
 static volatile LONG g_terrainCompressActive=0;
 struct TerrainOwnedVector {uint16_t *first,*last,*end;};
@@ -182,11 +186,11 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f",
+            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
                 s.encodes,s.reusedEvictions,s.writeFaults,s.sharedClones,s.overflows,s.softBlocked,s.softRescues,s.cancelledEvictions,
-                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024));
+                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds);
             if(g_terrainCowShare)H->log("terrain cow: copy_hook_calls=%lld unmanaged_src=%lld shared=%llu refused_not_slot=%llu refused_cold=%llu refused_packed=%llu refused_busy=%llu",
                 g_cowCopyCalls,g_cowCopyUnmanaged,s.sharedViews,
                 s.shareRefusedNotSlot,s.shareRefusedCold,s.shareRefusedPacked,s.shareRefusedBusy);
@@ -221,6 +225,7 @@ static bool InstallTerrainCompression() {
     if(!TerrainPager::Init(size_t(g_terrainHotMB)*1024*1024)) {
         H->log("terrain compression: placeholder/handler initialization failed; OFF");return false;
     }
+    if(g_terrainDedup && !TerrainPager::EnableDedup()){H->log("terrain compression: dedup index allocation failed; dedup OFF");g_terrainDedup=0;}
     g_terrainCompressionBase=H->moduleBase();
     // Destruction first; allocation remains disabled until EVERY hook and the
     // worker succeed. Partial installation cannot create managed allocations.
@@ -235,7 +240,7 @@ static bool InstallTerrainCompression() {
     for(unsigned n=PagerHelperThreads();n--;)
         if(HANDLE helperThread=CreateThread(nullptr,0,TerrainEvictionHelper,nullptr,0,nullptr)){SetThreadPriority(helperThread,THREAD_PRIORITY_BELOW_NORMAL);CloseHandle(helperThread);}
     InterlockedExchange(&g_terrainCompressActive,1);
-    H->log("terrain compression: lossless 1 m cache enabled, %d MiB resident target, cow_share=%d dedup_probe=%d; restart to disable",g_terrainHotMB,g_terrainCowShare,g_terrainDedupProbe);
+    H->log("terrain compression: lossless 1 m cache enabled, %d MiB resident target, cow_share=%d dedup=%d dedup_probe=%d; restart to disable",g_terrainHotMB,g_terrainCowShare,g_terrainDedup,g_terrainDedupProbe);
     return true;
 }
 
