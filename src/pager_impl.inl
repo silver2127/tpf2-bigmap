@@ -42,7 +42,9 @@ constexpr size_t PackLimit=Bytes*95/100;
 // evicted for 5 s (31.5 GB peak working set).
 constexpr uint64_t MinAgeMs=5000, LoadingMinAgeMs=1000, SoftDelayMs=3000;
 using Element=PAGER_ELEMENT;
-struct Packed {unsigned refs,bytes;size_t commit;uint8_t data[1];};
+// h1/h2: two independent 64-bit hashes of the raw allocation, the key of the
+// content-dedup index (see Evict). Set once at creation, immutable afterwards.
+struct Packed {unsigned refs,bytes;size_t commit;uint64_t h1,h2;uint8_t data[1];};
 struct Slot {
     HANDLE section;
     Packed* packed;
@@ -85,6 +87,9 @@ struct Stats {
     // Why a share was refused. A first 256x256 load measured cow_shared=0, so
     // these separate "the hook is never reached" from "the source was busy".
     uint64_t shareRefusedNotSlot, shareRefusedCold, shareRefusedPacked, shareRefusedBusy;
+    // Content dedup: evictions that found an identical blob already stored and
+    // shared it instead of encoding (hits), and index rebuilds (tombstone sweeps).
+    uint64_t dedupHits, dedupRebuilds;
 };
 using Alloc2=void*(WINAPI*)(HANDLE,void*,SIZE_T,ULONG,ULONG,void*,ULONG);
 using Map3=void*(WINAPI*)(HANDLE,HANDLE,void*,ULONG64,SIZE_T,ULONG,ULONG,void*,ULONG);
@@ -127,13 +132,82 @@ static size_t Committed(size_t n){return (n+4095)&~size_t(4095);}
 static size_t PackedSize(unsigned bytes){return offsetof(Packed,data)+bytes;}
 // Caller holds lock.
 static void ClearSoft(Slot& s){if(s.soft){s.soft=false;--stats.softBlocked;}}
+// Content dedup (docs/terrain-cow-sharing.md, "where the 8.25 GiB actually
+// is"; MEASURED 2026-09-17 with the probe below: during a 256x256 save load
+// every one of the 131,072 live tiles has exactly one byte-identical twin in
+// the other CTerrain version). An eviction hashes the bytes before encoding and
+// looks the pair of hashes up in this index of stored blobs; a hit shares the
+// existing blob (the Clone mechanism: one immutable blob, refs counted, dropped
+// on the first write) and skips the encode. Two independent 64-bit hashes are
+// required to match, so a false share needs a 128-bit collision.
+//
+// The index is open addressing over Packed pointers, sized for MaxSlots blobs at
+// <= 50% load, with tombstones on removal and a rebuild from the slot table
+// once tombstones and entries together reach that load. Every function here
+// runs under `lock`; the table is allocated only by EnableDedup.
+static Packed** dedupTable=nullptr;
+static size_t dedupUsed=0,dedupTombstones=0;
+constexpr size_t DedupCap=size_t(MaxSlots)*2;
+static Packed* const DedupTombstone=reinterpret_cast<Packed*>(uintptr_t(1));
+static size_t DedupHome(uint64_t h1){return size_t(h1^(h1>>31))&(DedupCap-1);}
+static Packed* DedupFind(uint64_t h1,uint64_t h2) {
+    if(!dedupTable)return nullptr;
+    for(size_t k=DedupHome(h1);;k=(k+1)&(DedupCap-1)) {
+        Packed* p=dedupTable[k];
+        if(!p)return nullptr;
+        if(p!=DedupTombstone && p->h1==h1 && p->h2==h2)return p;
+    }
+}
+static void DedupInsertRaw(Packed* p) {
+    for(size_t k=DedupHome(p->h1);;k=(k+1)&(DedupCap-1)) {
+        if(dedupTable[k]==DedupTombstone){dedupTable[k]=p;--dedupTombstones;++dedupUsed;return;}
+        if(!dedupTable[k]){dedupTable[k]=p;++dedupUsed;return;}
+    }
+}
+static void DedupRebuild() {
+    memset(dedupTable,0,DedupCap*sizeof(Packed*));
+    dedupUsed=dedupTombstones=0;++stats.dedupRebuilds;
+    for(unsigned i=0;i<allocated;++i) {
+        Packed* p=slots[i].packed;
+        if(p && (p->h1|p->h2) && !DedupFind(p->h1,p->h2))DedupInsertRaw(p);
+    }
+}
+static void DedupInsert(Packed* p) {
+    if(!dedupTable)return;
+    if(dedupUsed+dedupTombstones>=DedupCap/2)DedupRebuild();
+    if(dedupUsed+dedupTombstones>=DedupCap/2)return;   // full of live blobs: index nothing more
+    DedupInsertRaw(p);
+}
+static void DedupRemove(Packed* p) {
+    if(!dedupTable)return;
+    for(size_t k=DedupHome(p->h1);;k=(k+1)&(DedupCap-1)) {
+        Packed* q=dedupTable[k];
+        if(!q)return;
+        if(q==p){dedupTable[k]=DedupTombstone;--dedupUsed;++dedupTombstones;return;}
+    }
+}
+// Second, independent hash over the raw bytes (different constants and mixing
+// from the codec's own; the codec's hash is h1).
+static uint64_t Hash2(const void* data) {
+    constexpr uint64_t K3=0xD6E8FEB86659FD93ull,K4=0xA0761D6478BD642Full;
+    const uint8_t* b=static_cast<const uint8_t*>(data);
+    uint64_t h=0x8A5CD789635D2DFFull;size_t i=0;
+    for(;i+8<=Bytes;i+=8){uint64_t w;memcpy(&w,b+i,8);h=(h^(w*K3));h=(h<<23|h>>41)*K4;}
+    for(;i<Bytes;++i){h^=b[i];h=(h<<23|h>>41)*K4;}
+    h^=h>>31;h*=K3;h^=h>>29;
+    return h;
+}
+// The last reference to a blob frees it and drops it from the dedup index.
+static void ReleasePacked(Packed* p) {
+    if(--p->refs)return;
+    DedupRemove(p);
+    stats.compressedBytes-=p->bytes;stats.compressedCommit-=p->commit;
+    HeapFree(packHeap,0,p);
+}
 static void DropPacked(Slot& s) {
     if(!s.packed)return;
     auto p=s.packed;s.packed=nullptr;
-    if(--p->refs==0) {
-        stats.compressedBytes-=p->bytes;stats.compressedCommit-=p->commit;
-        HeapFree(packHeap,0,p);
-    }
+    ReleasePacked(p);
 }
 // Caller holds lock. Unlink slot i from its sharer ring; a ring left with one
 // member is no longer shared (and becomes an eviction candidate again).
@@ -255,7 +329,7 @@ static bool RestoreUnlocked(unsigned i,Packed* source,bool writing) {
         }
     }
     // Drop the reference taken for the unlocked decode.
-    if(--source->refs==0){stats.compressedBytes-=source->bytes;stats.compressedCommit-=source->commit;HeapFree(packHeap,0,source);}
+    ReleasePacked(source);
     if(alias)UnmapViewOfFile(alias);
     if(!ok){if(section)CloseHandle(section);++stats.failures;}
     return ok;
@@ -494,21 +568,32 @@ static bool Evict(unsigned i,bool force=false,uint64_t minAge=MinAgeMs) {
     }
     // Unlocked: no engine thread can read or write this slot now (every access
     // faults and cancels), and a concurrent Release only bumps the generation.
-    size_t count=PAGER_CODEC::Encode(reinterpret_cast<const Element*>(alias+Offset),threadPackedScratch,PackLimit,*threadEncodeScratch);
-    Packed* compressed=nullptr;
-    if(count) {
-        compressed=static_cast<Packed*>(HeapAlloc(packHeap,0,PackedSize(unsigned(count))));
-        if(compressed) {
-            compressed->refs=1;compressed->bytes=unsigned(count);
-            // Usable block size plus the heap's per-block header, so the logged
-            // commit reflects allocator granularity rather than payload alone.
-            SIZE_T usable=HeapSize(packHeap,0,compressed);
-            compressed->commit=(usable==SIZE_T(-1)?PackedSize(unsigned(count)):usable)+16;
-            memcpy(compressed->data,threadPackedScratch,count);
+    // Dedup first: an identical blob already stored is shared instead of
+    // encoded. The reference taken here keeps it alive across the unlocked
+    // window; the commit below either hands it to the slot or gives it back.
+    uint64_t h1=0,h2=0;Packed* twin=nullptr;
+    if(dedupTable) {
+        h1=PAGER_CODEC::Hash(reinterpret_cast<const Element*>(alias+Offset));
+        h2=Hash2(alias+Offset);
+        Guard g;twin=DedupFind(h1,h2);if(twin)++twin->refs;
+    }
+    size_t count=0;Packed* compressed=twin;
+    if(!twin) {
+        count=PAGER_CODEC::Encode(reinterpret_cast<const Element*>(alias+Offset),threadPackedScratch,PackLimit,*threadEncodeScratch);
+        if(count) {
+            compressed=static_cast<Packed*>(HeapAlloc(packHeap,0,PackedSize(unsigned(count))));
+            if(compressed) {
+                compressed->refs=1;compressed->bytes=unsigned(count);compressed->h1=h1;compressed->h2=h2;
+                // Usable block size plus the heap's per-block header, so the logged
+                // commit reflects allocator granularity rather than payload alone.
+                SIZE_T usable=HeapSize(packHeap,0,compressed);
+                compressed->commit=(usable==SIZE_T(-1)?PackedSize(unsigned(count)):usable)+16;
+                memcpy(compressed->data,threadPackedScratch,count);
+            }
         }
     }
     Guard g;
-    ++stats.encodes;
+    if(twin)++stats.dedupHits;else ++stats.encodes;
     if(count&&!compressed)++stats.failures;
     auto& s=slots[i];
     bool current=s.generation==generation && s.active;
@@ -517,19 +602,25 @@ static bool Evict(unsigned i,bool force=false,uint64_t minAge=MinAgeMs) {
         // Released and possibly reused, or accessed while encoding: the
         // snapshot may be stale. Nothing of this slot's state is touched unless
         // it is still the same allocation (Restore already made it accessible).
-        if(compressed)HeapFree(packHeap,0,compressed);
+        if(twin)ReleasePacked(twin);else if(compressed)HeapFree(packHeap,0,compressed);
         UnmapViewOfFile(alias);
         if(current)s.cancel=false;
         return false;
     }
+    if(!twin && compressed && dedupTable) {
+        // Another thread stored the same bytes while this encode ran: share its
+        // blob rather than keep two.
+        if(Packed* t=DedupFind(h1,h2)){HeapFree(packHeap,0,compressed);compressed=twin=t;++t->refs;++stats.dedupHits;}
+    }
     bool ok=compressed && unmap2(GetCurrentProcess(),Base(i),MEM_PRESERVE_PLACEHOLDER);
     if(ok) {
         UnmapViewOfFile(alias);CloseHandle(s.section);s.section=nullptr;
-        s.packed=compressed;stats.compressedBytes+=count;stats.compressedCommit+=compressed->commit;
+        s.packed=compressed;
+        if(!twin){stats.compressedBytes+=count;stats.compressedCommit+=compressed->commit;DedupInsert(compressed);}
         --stats.resident;++stats.evictions;
         return true;
     }
-    if(compressed){HeapFree(packHeap,0,compressed);++stats.failures;}
+    if(compressed){if(twin)ReleasePacked(twin);else HeapFree(packHeap,0,compressed);++stats.failures;}
     DWORD ignored;
     if(!VirtualProtect(Base(i),SlotBytes,PAGE_READWRITE,&ignored)) {
         // Inaccessible but intact resident backing: Fault must retry the
@@ -541,6 +632,18 @@ static bool Evict(unsigned i,bool force=false,uint64_t minAge=MinAgeMs) {
 }
 static Stats Snapshot(){Guard g;return stats;}
 static void SetBudget(size_t bytes){Guard g;budget=bytes;}
+// Turn content dedup on (before or after allocations; blobs stored earlier are
+// indexed by the next rebuild). 32 MiB of demand-zero address space.
+static bool EnableDedup() {
+    Guard g;
+    if(dedupTable)return true;
+    dedupTable=static_cast<Packed**>(VirtualAlloc(nullptr,DedupCap*sizeof(Packed*),MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    if(!dedupTable)return false;
+    dedupUsed=dedupTombstones=0;
+    // Blobs stored while dedup was off carry no hashes (0,0) and stay unindexed.
+    for(unsigned i=0;i<allocated;++i){Packed* p=slots[i].packed;if(p && (p->h1|p->h2) && !DedupFind(p->h1,p->h2))DedupInsertRaw(p);}
+    return true;
+}
 // Content probe (docs/terrain-cow-sharing.md, "where the 8.25 GiB actually is"):
 // hash every live allocation and count how many carry the same bytes as another.
 // A measurement, not a mechanism: it decides whether content dedup between the
@@ -557,6 +660,7 @@ struct ProbeResult {
     uint64_t zero;                   // members of the all-zero group
     uint64_t pairs;                  // hash groups of exactly two members
     uint64_t largestGroup;
+    uint64_t lowHalf;                // live slots in the lower half of the allocated range
     uint64_t ms;
 };
 // Both codecs write the version byte and then the raw hash, little-endian.
@@ -597,6 +701,7 @@ static bool Probe(ProbeResult* r,void(*yield)()=nullptr) {
     for(unsigned i=0;i<n;++i) {
         uint64_t h=0;int kind=ProbeSlot(i,&h);
         if(!kind)continue;
+        if(i<n/2)++r->lowHalf;
         if(kind==3){++r->skipped;continue;}
         if(kind==1)++r->hashedResident;else ++r->hashedPacked;
         if(h==zeroHash)++r->zero;
