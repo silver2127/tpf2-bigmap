@@ -126,7 +126,7 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // 114.6 GB commit limit while tiles were held uncompressed).
             bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
-            bool commitTight=haveStatus && m.ullAvailPageFile<6ull*1024*1024*1024;
+            bool commitTight=haveStatus && m.ullAvailPageFile<10ull*1024*1024*1024;
             bool busy=InterlockedCompareExchange(&g_worldEntryActive,0,0)!=0;
             // Initial generation, edit boxes and a full repaint allocate or
             // restore cells in bursts; keep the warm allowance for 15 s after.

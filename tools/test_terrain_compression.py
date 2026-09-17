@@ -35,13 +35,13 @@ def main():
     G=1<<30
     for args,want in [((1024,4096,1,0,64*G,8000),8000),        # loading: cover every live tile
                       ((1024,4096,0,1,16*G,8000),8000),        # 16 GiB free: a quarter reserved, 12 GiB usable
-                      ((1024,4096,1,0,30*G,30000),23040),      # capped at available minus a quarter
+                      ((1024,4096,1,0,30*G,30000),15360),      # capped at half of available
                       ((1024,4096,1,0,200*G,100000),65536),    # absolute clamp
                       ((1024,4096,1,0,64*G,2000),4096),        # never below warm while loading
                       ((1024,4096,1,0,5*G,20000),4096),        # small machine: 2 GiB floor reserve, warm is the floor
                       ((1024,4096,0,0,64*G,8000),1024),        # not loading: hot
                       ((1024,0,1,0,64*G,8000),1024),           # warm disabled stays disabled
-                      ((1024,4096,1,1,7*G,8000),5120),         # 7 GiB free: 2 GiB reserve
+                      ((1024,4096,1,1,7*G,8000),4096),         # 7 GiB free: inside the 8 GiB reserve, warm is the floor
                       ((1024,4096,1,1,(4*G)-1,8000),1024),     # below the gate: hot
                       ((3072,4096,1,0,64*G,0),4096)]:          # no live size: warm only
         assert live(*args)==want,(args,live(*args),want)
@@ -53,8 +53,10 @@ def main():
                       ((8000,3195,3195,150,64*G),8000),     # 100..299 cold restores/s: hold
                       ((8000,3195,3195,500,64*G),9000),     # >= 300/s: grow by 1/8
                       ((600,3195,3195,500,64*G),3195),      # never below the floor
-                      ((8000,3195,3195,500,8*G),6267),      # 8 GiB free: 2 GiB reserve, half of 6 GiB on top of hot
-                      ((8000,3195,3195,0,8*G),6267),        # the ceiling also pulls a quiet ramp down faster
+                      ((8000,3195,3195,500,8*G),3195),      # 8 GiB free: all reserve, the ceiling is the floor
+                      ((9000,3195,3195,500,24*G),9339),     # 24 GiB free: 12 reserved, half of 12 on top of hot
+                      ((8000,3195,3195,0,24*G),7500),       # a quiet ramp under the ceiling
+                      ((12000,3195,3195,0,24*G),9339),      # the ceiling also pulls a quiet ramp down faster
                       ((65000,3195,3195,500,400*G),65536),  # absolute clamp
                       ((3195,3195,3195,500,64*G),3594),     # from the floor: +1/8, at least 128
                       ((500,400,400,500,64*G),628)]:        # small budgets grow by the 128 MiB minimum

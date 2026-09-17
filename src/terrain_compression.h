@@ -123,9 +123,15 @@ static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t availab
     // the loading threads (the loader re-reads what was just evicted). The
     // target never exceeds available RAM minus 12 GiB, so it shrinks by itself
     // as memory fills, and never drops below the configured warm allowance.
-    // Keep a quarter of what is free, at least 2 GiB, for everything else. A
-    // flat 12 GiB reserve left 16 and 32 GiB machines with no allowance at all.
-    uint64_t reserve=available/4>2*GiB?available/4:2*GiB;
+    // Keep half of what is free, at least 8 GiB, for everything else. A quarter
+    // (2 GiB floor) was MEASURED insufficient on 2026-09-17: on a 94 GiB machine
+    // with no page file (commit limit = RAM) and ~44 GiB committed elsewhere,
+    // a 103,680-tile load held ~20 GiB of sections and the engine's own
+    // allocations then failed with the game's "Out of memory" assert, twice.
+    // Sections commit in full at creation and cannot be freed faster than
+    // they encode, so the room has to be left before the engine's burst.
+    // (A flat 12 GiB reserve left 16 and 32 GiB machines with no allowance.)
+    uint64_t reserve=available/2>8*GiB?available/2:8*GiB;
     uint64_t capMB=available>reserve?(available-reserve)>>20:0;
     uint64_t want=liveMB>uint64_t(warm)?liveMB:uint64_t(warm);
     uint64_t floor=capMB>uint64_t(warm)?capMB:uint64_t(warm);
@@ -144,12 +150,13 @@ static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t availab
 // - Stutter feedback: `decodesPerSec` is the number of cold restores in the
 //   last second. At >= 300 the engine is re-reading what was just evicted:
 //   grow by 1/8 (>= 128 MiB). At >= 100 hold. Below that, drift down.
-// - Ceiling: the hot budget plus half of what is free above a quarter reserve
+// - Ceiling: the hot budget plus half of what is free above the same reserve
+//   as the loading allowance (half of free, at least 8 GiB)
 //   (`available` = min(free RAM, free commit)), never above 65536 MiB.
 // The result never goes below `next`, so the configured budget stays a floor.
 static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available) {
     constexpr uint64_t GiB=1024ull*1024*1024;
-    uint64_t reserve=available/4>2*GiB?available/4:2*GiB;
+    uint64_t reserve=available/2>8*GiB?available/2:8*GiB;
     uint64_t spareMB=available>reserve?(available-reserve)>>21:0;   // half of the spare
     uint64_t ceil=uint64_t(hot)+spareMB;if(ceil>65536)ceil=65536;
     int ceiling=int(ceil);
@@ -190,7 +197,9 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // 114.6 GB commit limit while tiles were held uncompressed).
             bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
-            bool commitTight=haveStatus && m.ullAvailPageFile<6ull*1024*1024*1024;
+            // 10 GiB: at 6 GiB the back-off came too late (the engine asserted
+            // "Out of memory" before the evictions could return the commit).
+            bool commitTight=haveStatus && m.ullAvailPageFile<10ull*1024*1024*1024;
             bool busy=InterlockedCompareExchange(&g_worldEntryActive,0,0)!=0;
             bool bulk=s.lastBulkAllocation && now-s.lastBulkAllocation<15000;
             if(!uiTick) {
