@@ -668,7 +668,14 @@ static void SetBudget(size_t bytes){Guard g;budget=bytes;}
 // protection change each and become evictions a few seconds later.
 static unsigned evictPerSecond=0;
 static uint64_t rateWindow=0;static unsigned rateCount=0;
+// Set by the worker while the commit charge is tight: the only case that lifts
+// the rate limit. Being over three times the budget is not enough on its own:
+// MEASURED 2026-09-17, the material pager's allowance is small next to what a
+// load allocates, so that test was true from the first second after the load
+// and the cap never applied (57,288 cells evicted in 30 s).
+static bool urgent=false;
 static void SetEvictRate(unsigned perSecond){Guard g;evictPerSecond=perSecond;}
+static void SetUrgent(bool on){Guard g;urgent=on;}
 // Turn content dedup on (before or after allocations; blobs stored earlier are
 // indexed by the next rebuild). 32 MiB of demand-zero address space.
 static bool EnableDedup() {
@@ -785,7 +792,7 @@ static void Tick(unsigned attempts=0) {
             loading=stats.lastBulkAllocation && tick-stats.lastBulkAllocation<15000;
             pressure=stats.resident>3*budgetSlots;
             if(tick-rateWindow>=1000){rateWindow=tick;rateCount=0;}
-            limited=evictPerSecond && !loading && !pressure;
+            limited=evictPerSecond && !loading && !urgent;
             if(limited && rateCount>=evictPerSecond){++stats.rateLimited;return;}
             if(cursor>=allocated)cursor=0;
             i=cursor++;

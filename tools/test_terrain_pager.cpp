@@ -401,8 +401,9 @@ int main(int argc,char** argv) {
         printf("restore retry: retries=%llu giveups=%llu\n",Snapshot().restoreRetries-base.restoreRetries,Snapshot().restoreGiveUps);
         {Guard g;stats.failures=base.failures;}   // the injected refusals are not pager failures
     }
-    // Eviction rate limit: outside loading and pressure a Tick pass stops at
-    // the per-second allowance; pressure (over three times the budget) ignores it.
+    // Eviction rate limit: outside loading a Tick pass stops at the per-second
+    // allowance, over three times the budget too; only a tight commit charge
+    // (SetUrgent) lifts it.
     {
         std::vector<uint16_t*> t(16);
         for(auto& x:t){x=Allocate();assert(x);}
@@ -415,11 +416,15 @@ int main(int argc,char** argv) {
         Tick();assert(Snapshot().softBlocked==3);      // same second: nothing more
         {Guard g;rateWindow=GetTickCount64()-1001;}    // next second
         Tick();assert(Snapshot().softBlocked==6);
-        SetBudget(4*SlotBytes);                        // 16 > 12: pressure, unlimited
+        SetBudget(4*SlotBytes);                        // 16 > 12: over three times the budget
         {Guard g;rateWindow=GetTickCount64()-1001;}
-        // Pressure encodes straight down to three times the budget (12) with no
-        // allowance, then the rest is only second-chanced, as without a limit.
+        Tick();assert(Snapshot().resident==13);        // still three per second
+        SetUrgent(true);
+        {Guard g;rateWindow=GetTickCount64()-1001;}
+        // Urgent encodes straight down to three times the budget (12) with no
+        // allowance; the rest is only second-chanced.
         Tick();assert(Snapshot().resident==12 && Snapshot().softBlocked==8);
+        SetUrgent(false);
         SetEvictRate(0);
         for(auto x:t)assert(Release(x));
         printf("evict rate: limited passes=%llu\n",Snapshot().rateLimited-b.rateLimited);

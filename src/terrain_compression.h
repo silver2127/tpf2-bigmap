@@ -216,6 +216,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // Cold restores in the last second: faults minus the ones a
             // protection change alone satisfied.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
+            TerrainPager::SetUrgent(commitTight);
             if(commitTight && next>256)next=256;
             else if(!(busy||bulk||loading)) {
                 int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available);
