@@ -28,9 +28,9 @@ static volatile LONG64 g_blockAllocations=0, g_blockReleases=0, g_blockStray=0;
 // Diagnostics for the block detour: every call, calls routed by size and
 // caller, and resize calls returning to UpdateSubterrains.
 static volatile LONG64 g_blockCalls=0, g_blockSized=0, g_resultResizes=0;
-// The small pager (small_pager.h) behind terrain_blocks: budgets in MiB
-// (warm -1 = auto) and the switch the hooks read.
-static int g_smallHotMB=1024, g_smallWarmMB=-1;
+// The small pager (small_pager.h) behind terrain_blocks: its resident budget
+// in MiB and the switch the hooks read.
+static int g_smallHotMB=1024;
 static volatile LONG g_smallPagerActive=0;
 // Ceiling on evictions per second outside loading and memory pressure
 // (0 = unlimited). The rate actually used adapts below it, see EvictRateStep.
@@ -301,16 +301,15 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             TerrainPager::SetUrgent(commitTight);
             TerrainPager::SetThrottle(commitTight);
             if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
-                // The small pager follows the same loading allowance, from its own
-                // budgets; under a tight commit charge it drains to 64 MiB.
-                auto sp=SmallPager::Snapshot();
-                bool smallBulk=sp.lastBulkAllocation && now-sp.lastBulkAllocation<15000;
-                int smallNext=TerrainBudgetMB(g_smallHotMB,g_smallWarmMB,busy,bulk||loading||smallBulk,available,sp.residentBytes>>20);
-                if(commitTight && smallNext>64)smallNext=64;
+                // No loading allowance here: MEASURED 2026-09-17, with the tile
+                // pager's allowance the small pager kept 2.28 million spans
+                // (26.7 GiB) resident during the load, which is the peak it exists
+                // to remove. The budget is the fixed floor; a tight commit charge
+                // drains it to 64 MiB.
+                int smallNext=commitTight?64:g_smallHotMB;
                 SmallPager::SetBudget(size_t(smallNext)*1024*1024);
                 SmallPager::SetThrottle(commitTight);
-                if(smallNext!=smallEffectiveMB && (smallNext==g_smallHotMB||smallEffectiveMB==g_smallHotMB||smallNext-smallEffectiveMB>=1024||smallEffectiveMB-smallNext>=1024))
-                    H->log("small pager: resident target %d -> %d MiB (bulk_allocation=%d commit_tight=%d)",smallEffectiveMB,smallNext,int(smallBulk),int(commitTight));
+                if(smallNext!=smallEffectiveMB)H->log("small pager: resident target %d -> %d MiB (commit_tight=%d)",smallEffectiveMB,smallNext,int(commitTight));
                 smallEffectiveMB=smallNext;
             }
             if(commitTight && next>256)next=256;

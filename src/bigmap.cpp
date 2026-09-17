@@ -1239,10 +1239,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainLazyZero = H->cfgBool("tpf2_bigmap", "terrain_lazy_zero", 1) != 0;
     g_terrainBlocks = H->cfgBool("tpf2_bigmap", "terrain_blocks", 1) != 0;
     g_smallHotMB = H->cfgInt("tpf2_bigmap", "small_cache_hot_mb", 1024);
-    g_smallWarmMB = H->cfgInt("tpf2_bigmap", "small_cache_warm_mb", -1);
-    if (g_smallWarmMB == -1) { int h = 0, w = 0; AutoTerrainBudgets(InstalledPhysicalBytes(), &h, &w); g_smallWarmMB = w; }
     if (g_smallHotMB < 64) g_smallHotMB = 64;
-    if (g_smallWarmMB < g_smallHotMB) g_smallWarmMB = g_smallHotMB;
     g_terrainEvictPerSec = H->cfgInt("tpf2_bigmap", "terrain_cache_evict_per_s", 4000);
     g_materialEvictPerSec = H->cfgInt("tpf2_bigmap", "material_cache_evict_per_s", 4000);
     g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
