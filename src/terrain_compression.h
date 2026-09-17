@@ -131,6 +131,34 @@ static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t availab
     if(target>65536)target=65536;
     return int(target>uint64_t(hot)?target:uint64_t(hot));
 }
+// Steady state (not loading, commit not tight), once per second. `next` is the
+// policy's own target for this second (the hot budget), `prev` the target in
+// force. MEASURED 2026-09-17 on a 103,680-tile world: when the load ended the
+// target snapped from 13.4 GiB to the 3.2 GiB hot budget, the pager evicted
+// 67,000 tiles inside a minute, and the engine, which keeps ~36,000 tiles
+// (4.6 GiB) in use on that map, faulted 5,900 evicted tiles per second back in
+// through a decode each: visible freezes. Three rules replace the snap:
+// - Ramp: the target drops by at most 1/16 of itself (>= 64 MiB) per second.
+// - Stutter feedback: `decodesPerSec` is the number of cold restores in the
+//   last second. At >= 300 the engine is re-reading what was just evicted:
+//   grow by 1/8 (>= 128 MiB). At >= 100 hold. Below that, drift down.
+// - Ceiling: the hot budget plus half of what is free above a quarter reserve
+//   (`available` = min(free RAM, free commit)), never above 65536 MiB.
+// The result never goes below `next`, so the configured budget stays a floor.
+static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available) {
+    constexpr uint64_t GiB=1024ull*1024*1024;
+    uint64_t reserve=available/4>2*GiB?available/4:2*GiB;
+    uint64_t spareMB=available>reserve?(available-reserve)>>21:0;   // half of the spare
+    uint64_t ceil=uint64_t(hot)+spareMB;if(ceil>65536)ceil=65536;
+    int ceiling=int(ceil);
+    int target=next;
+    if(decodesPerSec>=300){int grow=prev/8>128?prev/8:128;target=prev+grow;}
+    else if(decodesPerSec>=100){target=prev>next?prev:next;}
+    else if(next<prev){int step=prev/16>64?prev/16:64;target=prev-step>next?prev-step:next;}
+    if(target>ceiling)target=ceiling;
+    if(target<next)target=next;
+    return target;
+}
 // Extra eviction threads: encoding runs outside the pool lock, so several
 // threads keep up with bulk allocation during loading. Policy and logging stay
 // on the main worker.
@@ -144,6 +172,7 @@ static DWORD WINAPI TerrainEvictionHelper(void*) {
 static DWORD WINAPI TerrainCompressionWorker(void*) {
     uint64_t lastLog=GetTickCount64(),lastPolicy=0;int effectiveMB=g_terrainHotMB;
     uint64_t lastProbe=0;bool probeFast=false;
+    uint64_t lastDecodes=0,lastStutterLog=0;
     TerrainWarmup warmup;
     using UiTickFn=uint64_t(*)();UiTickFn uiTick=nullptr;
     for(;;) {
@@ -173,7 +202,18 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // windows restoring tiles (85 s); with growth 41-53% (73 s). The earlier
             // RAM-only cap hit std::bad_alloc at the commit limit on a 512x512 preview.
             int next=TerrainBudgetMB(g_terrainHotMB,g_terrainWarmMB,busy,bulk||loading,available,(s.live*TerrainPager::SlotBytes)>>20);
+            // Cold restores in the last second: faults minus the ones a
+            // protection change alone satisfied.
+            uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
             if(commitTight && next>256)next=256;
+            else if(!(busy||bulk||loading)) {
+                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available);
+                if(steady>effectiveMB && decodesPerSec>=300 && now-lastStutterLog>=10000) {
+                    lastStutterLog=now;
+                    H->log("terrain compression: %llu cold restores/s, resident target %d -> %d MiB (working set exceeds the budget)",decodesPerSec,effectiveMB,steady);
+                }
+                next=steady;
+            }
             TerrainPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_terrainHotMB||effectiveMB==g_terrainHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("terrain compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d loading_tail=%d ui_signal=%d commit_tight=%d)",effectiveMB,next,int(busy),int(bulk),int(loading),int(uiTick!=nullptr),int(commitTight));
             effectiveMB=next;
@@ -257,6 +297,7 @@ extern "C" __declspec(dllexport) void BigmapTestCompressionStats(uint64_t* out) 
 }
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudget(int hot,int warm,int busy,int bulk,uint64_t available){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available);}
 extern "C" __declspec(dllexport) void BigmapTestAutoTerrainBudgets(uint64_t totalBytes,int* hot,int* warm){AutoTerrainBudgets(totalBytes,hot,warm);}
+extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available);}
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetLive(int hot,int warm,int busy,int bulk,uint64_t available,uint64_t liveMB){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available,liveMB);}
 extern "C" __declspec(dllexport) int BigmapTestWarmUpdate(TerrainWarmup* state,uint64_t now,int busy,uint64_t bulk,uint64_t ui,int signal){return state->Update(now,busy!=0,bulk,ui,signal!=0);}
 extern "C" __declspec(dllexport) int BigmapTestInstallCompression(const Tpf2mpHost* host,int gog,int spacing,int enabled,int hotMB) {
