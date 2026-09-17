@@ -460,6 +460,29 @@ int main(int argc,char** argv) {
         auto sd=Snapshot();assert(sd.live==base.live && sd.resident==base.resident && sd.failures==base.failures);
         printf("lazy zero: %llu lazy allocations\n",sd.lazyAllocations-base.lazyAllocations);
     }
+    // Backpressure: with the throttle on and the pool over budget, a fault that
+    // needs a new section waits (bounded), then proceeds; slots that already
+    // have a section do not wait; the throttle off means no wait at all.
+    {
+        assert(EnableLazyZero());
+        auto base=Snapshot();
+        auto a=Allocate();assert(a);
+        SetBudget(0);SetThrottle(true);
+        {Guard g;assert(stats.resident*SlotBytes>budget || stats.resident==0);}
+        // resident may be 0 here (nothing over budget): make one resident slot first
+        auto r=Allocate();assert(r);r[0]=1;   // this one may or may not wait; the next must
+        auto t0=GetTickCount64();a[0]=5;auto dt=GetTickCount64()-t0;
+        assert(a[0]==5 && Snapshot().throttleWaits>=base.throttleWaits+1 && dt>=ThrottleMaxMs-100);
+        volatile auto again=a[1];(void)again;   // already has a section: no wait
+        auto w=Snapshot().throttleWaits;
+        assert(Evict(Index(r),true));            // cold again
+        SetThrottle(false);
+        t0=GetTickCount64();r[1]=2;assert(r[1]==2 && GetTickCount64()-t0<500);   // throttle off: immediate
+        assert(Snapshot().throttleWaits==w);
+        SetBudget(4*SlotBytes);SetLazyZero(false);
+        assert(Release(a));assert(Release(r));
+        printf("throttle: waited %llu ms\n",Snapshot().throttleMillis);
+    }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
     DWORD beforeHandles=0,afterHandles=0;
