@@ -149,6 +149,78 @@ inline long Apply(const Grid& grid, uint64_t fingerprint, const char* path,
 }
 }  // namespace TerrainSidecar
 
+// ---- Streaming load-side API, for the alignment pass to consume per tile. ----
+// The pass creates each tile (AddTile) and would then compute its cache. When
+// a sidecar for this exact save is loaded, the pass owner skips that compute
+// for a tile Has(index) reports, and calls ApplyTile to splat the saved cache
+// instead. BeginApply verifies EVERY stored blob decodes before reporting any
+// tile, so Has(index)==true guarantees ApplyTile(index) succeeds; the pass can
+// therefore skip the compute without a fallback. The compressed file is held
+// in memory (~1.2 GiB for a full map, far under the pass's own former peak)
+// until EndApply. All of BeginApply/EndApply run once; Has/ApplyTile are
+// lock-free reads of the immutable index and may run on any pass thread
+// (ApplyTile takes the caller's own DecodeScratch).
+namespace TerrainSidecar {
+struct LoadState {
+    std::vector<uint8_t> file;                       // the whole sidecar in memory
+    std::vector<std::pair<uint32_t, uint32_t>> byIndex;   // record index -> {file offset, bytes}, offset 0 == absent
+    bool loaded = false;
+    uint32_t tiles = 0;
+};
+static LoadState g_load;
+
+// Open, validate against the live grid's fingerprint and dimensions, index
+// every tile and verify each blob decodes. Returns the number of tiles ready,
+// or 0 (nothing held) if the file is absent/foreign/stale/corrupt.
+inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* verify) {
+    g_load = LoadState{};
+    if (!grid.base || !grid.records()) return 0;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") || !f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < long(sizeof(FileHeader))) { fclose(f); return 0; }
+    std::vector<uint8_t> buf; buf.resize(size_t(sz));
+    bool read = fread(buf.data(), 1, size_t(sz), f) == size_t(sz);
+    fclose(f);
+    if (!read) return 0;
+    FileHeader hdr{}; memcpy(&hdr, buf.data(), sizeof hdr);
+    if (hdr.magic != Magic || hdr.version != Version || hdr.headerHash != HashHeader(hdr)) return 0;
+    if (hdr.fingerprint != fingerprint || hdr.nx != grid.nx() || hdr.ny != grid.ny()) return 0;
+    const uint32_t count = uint32_t(grid.nx()) * uint32_t(grid.ny());
+    std::vector<std::pair<uint32_t, uint32_t>> index(count, {0u, 0u});
+    std::vector<uint16_t> scratchOut(Samples);
+    size_t p = sizeof(FileHeader);
+    for (uint32_t k = 0; k < hdr.tiles; ++k) {
+        if (p + sizeof(TileHeader) > size_t(sz)) return 0;
+        TileHeader th{}; memcpy(&th, buf.data() + p, sizeof th); p += sizeof(TileHeader);
+        if (th.bytes == 0 || p + th.bytes > size_t(sz) || th.index >= count) return 0;
+        if (!BlockCodec::Decode(buf.data() + p, th.bytes, scratchOut.data(), Samples, *verify)) return 0;
+        index[th.index] = {uint32_t(p), th.bytes};   // p != 0 always (past the header)
+        p += th.bytes;
+    }
+    g_load.file = std::move(buf);
+    g_load.byIndex = std::move(index);
+    g_load.tiles = hdr.tiles;
+    g_load.loaded = true;
+    return long(hdr.tiles);
+}
+inline bool Loaded() { return g_load.loaded; }
+inline bool Has(uint32_t recordIndex) {
+    return g_load.loaded && recordIndex < g_load.byIndex.size() && g_load.byIndex[recordIndex].first != 0;
+}
+// Decode the saved cache for `recordIndex` into that tile's height vector.
+// False if not loaded, not stored, the tile is not present/eligible, or (not
+// possible after BeginApply verified it) the blob fails to decode.
+inline bool ApplyTile(const Grid& grid, uint32_t recordIndex, BlockCodec::DecodeScratch& scratch) {
+    if (!Has(recordIndex)) return false;
+    TileVector* v = VectorOf(grid.record(recordIndex));
+    if (!Eligible(v)) return false;
+    const auto& e = g_load.byIndex[recordIndex];
+    return BlockCodec::Decode(g_load.file.data() + e.first, e.second, v->first, Samples, scratch);
+}
+inline void EndApply() { g_load = LoadState{}; }
+}  // namespace TerrainSidecar
+
 // ---- Offline test entry points (no game state). ----
 extern "C" __declspec(dllexport) long BigmapTestSidecarWrite(void* cterrain, uint64_t fp, const char* path, uint64_t* bytesOut) {
     auto* s = new BlockCodec::EncodeScratch;

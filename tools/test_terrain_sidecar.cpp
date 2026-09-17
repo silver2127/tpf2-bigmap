@@ -98,7 +98,29 @@ int main() {
       const char* cp = "test_sidecar_corrupt.bin"; fopen_s(&f, cp, "wb"); fwrite(buf.data(), 1, sz, f); fclose(f);
       long r = Apply(GridOf(load.cterrain), 0xABCDEF12u, cp, dec); assert(r == -1); remove(cp); }
 
+    // ---- Streaming per-tile load-side API (what the pass consumes). ----
+    // Reuse the same grid; zero the live caches, then apply tile by tile.
+    FakeTerrain stream(nx, ny);
+    for (uint32_t i : live) { stream.makeTile(i, Samples, 0); for (auto& x : stream.caches[i]) x = 0; }
+    stream.finalize();
+    long ready = BeginApply(GridOf(stream.cterrain), 0xABCDEF12u, path, dec);
+    assert(ready == long(live.size()) && Loaded());
+    // Has() is true for exactly the stored tiles.
+    for (uint32_t i : live) assert(Has(i));
+    assert(!Has(unused) && !Has(uint32_t(nx * ny) + 5));
+    // ApplyTile fills each stored tile exactly; a non-stored eligible tile is refused.
+    auto* dec2 = new BlockCodec::DecodeScratch;
+    for (uint32_t i : live) assert(ApplyTile(GridOf(stream.cterrain), i, *dec2));
+    for (uint32_t i : live) assert(stream.caches[i] == save.caches[i]);
+    { FakeTerrain solo(nx, ny); solo.makeTile(unused, Samples, 7); solo.finalize();
+      assert(!ApplyTile(GridOf(solo.cterrain), unused, *dec2)); }   // not in the sidecar
+    EndApply();
+    assert(!Loaded() && !Has(live[0]));
+    // BeginApply refuses a foreign fingerprint (holds nothing).
+    assert(BeginApply(GridOf(stream.cterrain), 0xDEADBEEFu, path, dec) == 0 && !Loaded());
+    delete dec2;
+
     remove(path); delete enc; delete dec;
-    printf("PASS: write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected\n");
+    printf("PASS: write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint\n");
     return 0;
 }
