@@ -61,6 +61,30 @@ def main():
                       ((3195,3195,3195,500,64*G),3594),     # from the floor: +1/8, at least 128
                       ((500,400,400,500,64*G),628)]:        # small budgets grow by the 128 MiB minimum
         assert steady(*args)==want,(args,steady(*args),want)
+    # Adaptive eviction rate: cost cap (a quarter core), stall halving, quiet growth.
+    step=dll.BigmapTestEvictRateStep;step.argtypes=[C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.c_uint64,C.c_uint,C.c_int,C.c_uint];step.restype=C.c_uint
+    def run(rate,quiet,avg,stalls,ui,ceil):
+        r,q=C.c_uint(rate),C.c_uint(quiet);out=step(C.byref(r),C.byref(q),avg,stalls,ui,ceil);return out,r.value,q.value
+    assert run(0,0,0,0,1,4000)==(1000,1000,1)          # first second: starts at 1000
+    assert run(0,0,0,0,1,600)==(600,600,1)             # ... or at the ceiling if lower
+    assert run(1000,0,400,0,1,4000)==(625,625,1)       # 400 us each: 250 ms/s allows 625
+    assert run(1000,0,50,0,1,4000)==(1000,1000,1)      # cheap: cost cap above the rate
+    assert run(1000,3,400,1,1,4000)==(500,500,0)       # a stall halves and resets quiet
+    assert run(120,0,400,1,1,4000)==(100,100,0)        # never below 100
+    assert run(500,5,100,0,1,4000)==(625,625,6)        # sixth quiet second: +25%
+    assert run(500,5,400,0,1,4000)==(625,625,6)        # ... but capped by the cost
+    assert run(3800,9,10,0,1,4000)==(4000,4000,10)     # ... and by the ceiling
+    assert run(500,5,0,1,0,4000)==(625,625,6)          # no UI signal: stalls are ignored
+    assert run(500,5,5000,0,1,4000)==(100,100,6)       # 5 ms each: floor 100
+    assert run(1000,0,400,0,1,0)==(0,1000,0)           # ceiling 0: unlimited, state untouched
+    stallsOf=dll.BigmapTestUiStalls;stallsOf.argtypes=[C.POINTER(C.c_uint64),C.c_int];stallsOf.restype=C.c_uint
+    def stalls(seq):
+        arr=(C.c_uint64*len(seq))(*seq);return stallsOf(arr,len(seq))
+    assert stalls([100,125,150,175])==0                # 60 fps: stamps 25 ms apart as sampled
+    assert stalls([100,125,225,250])==1                # one 100 ms gap
+    assert stalls([100,100,100,160])==1                # stamp held for 60 ms: one stall
+    assert stalls([100,159,218])==0                    # 59 ms gaps do not count
+    assert stalls([0,0,100,200,0,300])==1              # zeros (no world) never pair with a stamp
     assert dll.BigmapTestCompressionInit()
     resize=dll.BigmapTestCompressionResize;resize.argtypes=[C.POINTER(Vec),C.c_size_t,C.c_int,Resize]
     copy=dll.BigmapTestCompressionCopy;copy.argtypes=[C.POINTER(Vec),C.POINTER(Vec),C.c_int,Copy];copy.restype=C.c_void_p

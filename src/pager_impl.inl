@@ -76,6 +76,7 @@ struct Stats {
     // this on 256x256+ maps, so it is counted and logged.
     uint64_t overflows;
     uint64_t rateLimited;       // Tick passes cut short by the eviction rate limit
+    uint64_t evictMicros, evictOps;   // wall time of every eviction and soft block, for the adaptive rate
     uint64_t softBlocked;       // current soft-blocked resident slots
     uint64_t softRescues;       // faults satisfied by a protection change alone
     uint64_t cancelledEvictions;
@@ -800,11 +801,15 @@ static void Tick(unsigned attempts=0) {
             ripe=s.soft && !s.evicting && tick-s.blockedAt>=SoftDelayMs;
             excess=stats.resident-stats.softBlocked>budgetSlots;
         }
-        bool did=false;
+        bool did=false;LARGE_INTEGER t0{},t1{};QueryPerformanceCounter(&t0);
         if(loading)did=Evict(i,false,LoadingMinAgeMs);
         else if(pressure||ripe)did=Evict(i);
         else if(excess)did=SoftBlock(i);
-        if(did && limited){Guard g;++rateCount;}
+        if(did) {
+            QueryPerformanceCounter(&t1);
+            Guard g;if(limited)++rateCount;
+            ++stats.evictOps;if(frequency.QuadPart)stats.evictMicros+=uint64_t((t1.QuadPart-t0.QuadPart)*1000000/frequency.QuadPart);
+        }
         if(!attempts && (n&15)==15) {
             QueryPerformanceCounter(&now);
             if((now.QuadPart-start.QuadPart)*25>frequency.QuadPart)return;

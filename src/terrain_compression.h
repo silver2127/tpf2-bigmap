@@ -19,8 +19,45 @@ static int g_terrainDedupProbe=0;
 // of encoding (see pager_impl.inl). Measured need: the two CTerrain versions of
 // a save load are byte-identical tile for tile.
 static int g_terrainDedup=0;
-// Evictions per second outside loading and memory pressure (0 = unlimited).
-static int g_terrainEvictPerSec=1000, g_materialEvictPerSec=1000;
+// Ceiling on evictions per second outside loading and memory pressure
+// (0 = unlimited). The rate actually used adapts below it, see EvictRateStep.
+static int g_terrainEvictPerSec=4000, g_materialEvictPerSec=4000;
+// Adaptive eviction rate, stepped once per second by each pager's worker.
+// Two signals, so a slow machine evicts less and a fast one more, and neither
+// notices it:
+// - Cost: `avgMicros` is the mean wall time of one eviction (protect, encode,
+//   unmap) measured in the last second. Evictions get a quarter of one core:
+//   the cap is 250 ms of that work per second, never below 100 evictions/s.
+// - Stutter: `stalls` is the number of gameplay-frame gaps of 60 ms or more
+//   seen in the last second (UiStallMeter, from the menu DLL's last-frame
+//   stamp; absent without the multiplayer DLL). A stall halves the rate; after
+//   five stall-free seconds it grows by a quarter per second back to the cap.
+struct EvictRateState {unsigned rate,quiet;};
+static unsigned EvictRateStep(EvictRateState* st,uint64_t avgMicros,unsigned stalls,bool uiSignal,unsigned ceiling) {
+    if(!ceiling)return 0;
+    if(!st->rate)st->rate=ceiling<1000?ceiling:1000;
+    unsigned costCap=avgMicros?unsigned(250000ull/avgMicros):ceiling;
+    if(costCap<100)costCap=100;
+    unsigned cap=costCap<ceiling?costCap:ceiling;
+    if(uiSignal && stalls){st->rate=st->rate/2>100?st->rate/2:100;st->quiet=0;}
+    else if(++st->quiet>5){unsigned grow=st->rate/4>50?st->rate/4:50;st->rate+=grow;}
+    if(st->rate>cap)st->rate=cap;
+    if(st->rate<100)st->rate=100;
+    return st->rate;
+}
+// Samples the menu DLL's last-gameplay-frame stamp (GetTickCount64 at each
+// CGameUI update, 0 outside a world) every 25 ms. Two consecutive observed
+// stamps 60 ms or more apart mean a frame took at least that long.
+struct UiStallMeter {
+    uint64_t last=0;unsigned stalls=0;
+    void Sample(uint64_t stamp) {
+        if(stamp && last && stamp!=last && stamp-last>=60)++stalls;
+        last=stamp;
+    }
+    unsigned Take(){unsigned n=stalls;stalls=0;return n;}
+};
+// Stalls seen by the terrain worker in its last second, for the material worker.
+static volatile LONG g_uiStallsLastSec=0;
 static void ProbeYield(){TerrainPager::Tick();}
 static void LogDedupProbe() {
     TerrainPager::ProbeResult r{};
@@ -181,13 +218,15 @@ static DWORD WINAPI TerrainEvictionHelper(void*) {
 static DWORD WINAPI TerrainCompressionWorker(void*) {
     uint64_t lastLog=GetTickCount64(),lastPolicy=0;int effectiveMB=g_terrainHotMB;
     uint64_t lastProbe=0;bool probeFast=false;
-    uint64_t lastDecodes=0,lastStutterLog=0;
+    uint64_t lastDecodes=0,lastStutterLog=0,lastRateLog=0;
+    uint64_t lastEvictMicros=0,lastEvictOps=0;EvictRateState rate{};UiStallMeter stallMeter;
     TerrainWarmup warmup;
     using UiTickFn=uint64_t(*)();UiTickFn uiTick=nullptr;
     for(;;) {
         Sleep(25);
         if(!InterlockedCompareExchange(&g_terrainCompressActive,0,0))continue;
         auto now=GetTickCount64();
+        if(uiTick)stallMeter.Sample(uiTick());
         if(now-lastPolicy>=1000) {
             lastPolicy=now;auto s=TerrainPager::Snapshot();MEMORYSTATUSEX m{};m.dwLength=sizeof m;
             // Pager sections are page-file-backed: they count against the system
@@ -230,6 +269,16 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             if(next!=effectiveMB && (next==g_terrainHotMB||effectiveMB==g_terrainHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("terrain compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d loading_tail=%d ui_signal=%d commit_tight=%d)",effectiveMB,next,int(busy),int(bulk),int(loading),int(uiTick!=nullptr),int(commitTight));
             effectiveMB=next;
             probeFast=busy||bulk||loading;
+            // Adaptive eviction rate from last second's cost and frame stalls.
+            uint64_t ops=s.evictOps-lastEvictOps,micros=s.evictMicros-lastEvictMicros;lastEvictOps=s.evictOps;lastEvictMicros=s.evictMicros;
+            unsigned stalls=stallMeter.Take();InterlockedExchange(&g_uiStallsLastSec,LONG(stalls));
+            unsigned before=rate.rate;
+            unsigned perSec=EvictRateStep(&rate,ops?micros/ops:0,stalls,uiTick!=nullptr,g_terrainEvictPerSec<0?0:unsigned(g_terrainEvictPerSec));
+            TerrainPager::SetEvictRate(perSec);
+            if(perSec && perSec<before && stalls && now-lastRateLog>=10000) {
+                lastRateLog=now;
+                H->log("terrain compression: %u frame stall(s) >= 60 ms, eviction rate %u -> %u/s (last second: %llu evictions, %llu us each)",stalls,before,perSec,ops,ops?micros/ops:0ull);
+            }
         }
         TerrainPager::Tick();
         if(g_terrainDedupProbe && now-lastProbe>=(probeFast?10000ull:120000ull)) {
@@ -238,11 +287,11 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu",
+            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
                 s.encodes,s.reusedEvictions,s.writeFaults,s.sharedClones,s.overflows,s.softBlocked,s.softRescues,s.cancelledEvictions,
-                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited);
+                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited,rate.rate,s.evictOps?s.evictMicros/s.evictOps:0ull);
             if(g_terrainCowShare)H->log("terrain cow: copy_hook_calls=%lld unmanaged_src=%lld shared=%llu refused_not_slot=%llu refused_cold=%llu refused_packed=%llu refused_busy=%llu",
                 g_cowCopyCalls,g_cowCopyUnmanaged,s.sharedViews,
                 s.shareRefusedNotSlot,s.shareRefusedCold,s.shareRefusedPacked,s.shareRefusedBusy);
@@ -310,6 +359,12 @@ extern "C" __declspec(dllexport) void BigmapTestCompressionStats(uint64_t* out) 
 }
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudget(int hot,int warm,int busy,int bulk,uint64_t available){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available);}
 extern "C" __declspec(dllexport) void BigmapTestAutoTerrainBudgets(uint64_t totalBytes,int* hot,int* warm){AutoTerrainBudgets(totalBytes,hot,warm);}
+extern "C" __declspec(dllexport) unsigned BigmapTestEvictRateStep(unsigned* rate,unsigned* quiet,uint64_t avgMicros,unsigned stalls,int uiSignal,unsigned ceiling) {
+    EvictRateState st{*rate,*quiet};unsigned r=EvictRateStep(&st,avgMicros,stalls,uiSignal!=0,ceiling);*rate=st.rate;*quiet=st.quiet;return r;
+}
+extern "C" __declspec(dllexport) unsigned BigmapTestUiStalls(const uint64_t* stamps,int n) {
+    UiStallMeter m;for(int i=0;i<n;++i)m.Sample(stamps[i]);return m.Take();
+}
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available);}
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetLive(int hot,int warm,int busy,int bulk,uint64_t available,uint64_t liveMB){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available,liveMB);}
 extern "C" __declspec(dllexport) int BigmapTestWarmUpdate(TerrainWarmup* state,uint64_t now,int busy,uint64_t bulk,uint64_t ui,int signal){return state->Update(now,busy!=0,bulk,ui,signal!=0);}
