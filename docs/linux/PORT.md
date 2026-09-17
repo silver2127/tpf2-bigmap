@@ -221,3 +221,28 @@ Validation for this partial integration: `tools/linux/build.sh` and
 `python3 tools/linux/verify_game.py GAME_ELF`. The native config test checks
 that requesting the unsupported minimap logs a warning and writes only the same existing patch sites and lengths as the default configuration. No live game
 validation was attempted, as required by this job.
+
+## Minimap company map integration d99c054 (shared code only)
+
+Windows source integrated: `d99c0549793721d9dc17c67ec28a1f9161ac0398`
+(2026-09-16, "minimap: company colours and names from the multiplayer mod's
+map"). The commit changes only the shared Lua GUI
+(`mod/minimap/bigmap_minimap.lua`) and the Windows minimap test
+(`tools/test_minimap.py`). Both merge unchanged. The GUI now reads
+`mp_company_map.txt` (`me=<cid>`, then `<cid>=<player>=<percent-escaped name>`)
+beside `mp_company_cfg.txt` and uses the creation-order guess only when that
+file is absent.
+
+The commit has no platform-specific code: no hook, byte pattern, address or
+struct offset. So there is nothing to reverse engineer, no Linux patch site is
+added and the twenty-site manifest is unchanged. As recorded for `cdfee2a`
+above, native Linux still does not install the minimap GUI or implement its
+renderer, so this change has no effect on Linux yet. It will apply unchanged
+once the minimap is ported.
+
+Validation: `tools/linux/build.sh` (four CTest suites pass) and
+`tools/linux/verify_game.py` (build-id and 20 sites pass). The merged script
+parses under system Lua 5.2 (`luac -p`). A standalone run of the new
+map-file parser on the test's sample file gave the expected player-to-company
+mapping, local company and unescaped names. `tools/test_minimap.py` was not run
+because it loads the Windows `out/tpf2_bigmap.dll` and needs `pefile`/`lupa`.
