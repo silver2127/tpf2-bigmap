@@ -1,12 +1,13 @@
 // The terrain sidecar format and grid walk against a synthetic terrain grid
 // built to the game's exact layout (CTerrain+0x18 -> {x0,y0,nx,ny,records};
-// 40-byte records; height vector at record+8; version at record+0x20). No game.
+// 40-byte records; record+8 -> control, vector at control+0x10). No game.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 #include <random>
 #include <cassert>
+#include <array>
 #include "../src/terrain_sidecar.h"
 
 using namespace TerrainSidecar;
@@ -16,7 +17,8 @@ using namespace TerrainSidecar;
 struct FakeTerrain {
     uint8_t cterrain[0x20];
     std::vector<uint8_t> grid;
-    std::vector<std::vector<uint16_t>> caches;   // backing store for each record's vector
+    std::vector<std::vector<uint16_t>> caches;               // backing for each vector's data
+    std::vector<std::array<uint8_t, 0x20>> controls;         // the shared control block per record
     FakeTerrain(int nx, int ny) {
         memset(cterrain, 0, sizeof cterrain);
         grid.assign(0x18 + size_t(nx) * ny * 40, 0);
@@ -25,20 +27,21 @@ struct FakeTerrain {
         *reinterpret_cast<int32_t*>(grid.data() + 8) = nx;
         *reinterpret_cast<int32_t*>(grid.data() + 0xc) = ny;
         caches.resize(size_t(nx) * ny);
-        // records ptr and the CTerrain+0x18 grid ptr, filled after the vector
-        // (reallocs of `grid`/`caches` are done; addresses are now stable).
+        controls.assign(size_t(nx) * ny, {});               // fixed addresses for control blocks
     }
     void finalize() {
         *reinterpret_cast<uint8_t**>(grid.data() + 0x10) = grid.data() + 0x18;
         *reinterpret_cast<uint8_t**>(cterrain + 0x18) = grid.data();
     }
     uint8_t* record(uint32_t i) { return grid.data() + 0x18 + size_t(i) * 40; }
-    // Give record i a height cache of `n` samples filled from `seed`.
+    // Give record i a height cache of `n` samples filled from `seed`: record+8
+    // -> a control block, vector {first,last,end} at control+0x10.
     void makeTile(uint32_t i, size_t n, uint32_t seed) {
         auto& c = caches[i]; c.resize(n);
         std::mt19937 rng(seed); uint16_t h = uint16_t(20000 + rng() % 500);
         for (size_t k = 0; k < n; ++k) { h = uint16_t(h + int(rng() % 7) - 3); c[k] = h; }
-        auto* v = VectorOf(record(i));
+        *reinterpret_cast<uint8_t**>(record(i) + 8) = controls[i].data();   // control block
+        auto* v = reinterpret_cast<TileVector*>(controls[i].data() + 0x10);
         v->first = c.data(); v->last = c.data() + n; v->end = c.data() + n;
         *reinterpret_cast<int32_t*>(record(i) + 0) = int32_t(i);       // entity
         *reinterpret_cast<int32_t*>(record(i) + 0x20) = 1;             // version
