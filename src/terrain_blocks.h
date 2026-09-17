@@ -37,8 +37,20 @@ static const uint8_t kBlockCtorBytes[19] = {
     0x48, 0xc7, 0x44, 0x24, 0x20, 0xfe, 0xff, 0xff, 0xff   // mov qword [rsp+0x20], -2
 };
 static void __fastcall BlockCtorDetour(BlockVector* v, size_t n) {
+    auto ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    InterlockedIncrement64(&g_blockCalls);
+    if (n == TerrainPager::Samples) {
+        InterlockedIncrement64(&g_blockSized);
+        // Record up to eight distinct callers of one-tile-sized constructions.
+        LONG64 rva = LONG64(ret - g_blockBase);
+        for (int k = 0; k < 8; ++k) {
+            LONG64 seen = InterlockedCompareExchange64(&g_blockCallers[k], rva, 0);
+            if (seen == 0) { if (H) H->log("terrain blocks: one-tile block constructed from exe+%llx", (unsigned long long)rva); break; }
+            if (seen == rva) break;
+        }
+    }
     if (n == TerrainPager::Samples && InterlockedCompareExchange(&g_terrainCompressActive, 0, 0) &&
-        reinterpret_cast<uintptr_t>(_ReturnAddress()) == g_blockBase + kBlockCtorReturn) {
+        ret == g_blockBase + kBlockCtorReturn) {
         if (auto p = TerrainPager::Allocate()) {
             *v = {p, p + n, p + n};
             if (InterlockedIncrement64(&g_blockAllocations) == 1) H->log("terrain blocks: first alignment block routed to the pager");
