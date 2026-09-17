@@ -34,14 +34,14 @@ def main():
     live=dll.BigmapTestTerrainBudgetLive;live.argtypes=[C.c_int]*4+[C.c_uint64,C.c_uint64]
     G=1<<30
     for args,want in [((1024,4096,1,0,64*G,8000),8000),        # loading: cover every live tile
-                      ((1024,4096,0,1,16*G,8000),8000),        # 16 GiB free: a quarter reserved, 12 GiB usable
+                      ((1024,4096,0,1,16*G,8000),4096),        # 16 GiB free: 12 reserved, warm is the floor
                       ((1024,4096,1,0,30*G,30000),15360),      # capped at half of available
                       ((1024,4096,1,0,200*G,100000),65536),    # absolute clamp
                       ((1024,4096,1,0,64*G,2000),4096),        # never below warm while loading
                       ((1024,4096,1,0,5*G,20000),4096),        # small machine: 2 GiB floor reserve, warm is the floor
                       ((1024,4096,0,0,64*G,8000),1024),        # not loading: hot
                       ((1024,0,1,0,64*G,8000),1024),           # warm disabled stays disabled
-                      ((1024,4096,1,1,7*G,8000),4096),         # 7 GiB free: inside the 8 GiB reserve, warm is the floor
+                      ((1024,4096,1,1,7*G,8000),4096),         # 7 GiB free: inside the 12 GiB reserve, warm is the floor
                       ((1024,4096,1,1,(4*G)-1,8000),1024),     # below the gate: hot
                       ((3072,4096,1,0,64*G,0),4096)]:          # no live size: warm only
         assert live(*args)==want,(args,live(*args),want)
