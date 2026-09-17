@@ -553,6 +553,14 @@ static bool Release(void* p) {
     FreeSlot(i);--stats.live;
     return true;
 }
+// Release by any address inside a slot: the raw base (what an aligned delete
+// reads at [-8] and hands to free) or the data pointer. False when it is not
+// a live allocation, so the caller never passes an arena address to the CRT.
+static bool ReleaseAny(void* p) {
+    if(!Contains(p))return false;
+    unsigned i=Index(p);
+    return Release(Base(i)+Offset);
+}
 // Second-chance stage: make an aged resident slot inaccessible without
 // encoding it. Returns true if it was blocked.
 static bool SoftBlock(unsigned i) {
