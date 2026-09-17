@@ -985,7 +985,7 @@ settle(1)
 R.afterTracks = IMAGES[#IMAGES]
 R.tracksSends = #IMAGES - before
 for _, row in ipairs(legendRows()) do
-    if row.label:find("^Company 1") or row.label:find("^Player 950") then row.box.toggleFn(false) end
+    if row.label:find("^Company 1") or row.label:find("^Player 950") or row.label:find("^Cid") then row.box.toggleFn(false) end
 end
 settle(1)
 R.afterCompany = IMAGES[#IMAGES]
@@ -1116,7 +1116,10 @@ def check_lua_variant(text, scale, centre, sw, sh, auto, cfg_scale, guess, owner
         expected_stations = ['S 0 2 500 500 0 1000 200', 'S 1 1 0 -500 1000 0 15']
     assert edges == expected_edges, edges
     assert stations == expected_stations, stations
-    if owners == 'companies':      # roster 1,2,3; this machine is company 2 (player 900)
+    if owners == 'companies':      # the mod's map: 950 -> company 3, 900 -> 2 (me), 970 -> 1, with names
+        assert palette == ['P 0 90 190 110', 'P 1 80 140 230', 'P 2 220 80 80'], palette
+        companies = ["Cid's 2nd company", "Bob's company (you)", "Ada's company"]
+    elif owners == 'guess':        # no map file: creation order, roster 1,2,3, this machine company 2
         assert palette == ['P 0 220 80 80', 'P 1 80 140 230', 'P 2 90 190 110'], palette
         companies = ['Company 1', 'Company 2 (you)', 'Company 3']
     elif owners == 'free':         # no roster: this player first, then ascending ids
@@ -1189,6 +1192,11 @@ def check_lua():
         cfg_dir = Path(td) / 'companies'
         cfg_dir.mkdir()
         (cfg_dir / 'mp_company_cfg.txt').write_text('companies\n2\n1,2,3\na=1,b=2,c=3\n')
+        (cfg_dir / 'mp_company_map.txt').write_text('me=2\n1=970=Ada%27s%20company\n2=900=Bob%27s%20company\n3=950=Cid%27s%202nd%20company\n')
+        # a map without the mod's file: the creation-order guess (the old behaviour)
+        guess_dir = Path(td) / 'guess'
+        guess_dir.mkdir()
+        (guess_dir / 'mp_company_cfg.txt').write_text('companies\n2\n1,2,3\na=1,b=2,c=3\n')
         empty_dir = Path(td) / 'empty'
         empty_dir.mkdir()
         # A mod industry's construction file, spelled the way industryutil-based mods spell it:
@@ -1211,6 +1219,8 @@ def check_lua():
         b = check_lua_variant(text, 1.0, False, 1920, 1080, False, 1.25, 1.25, 'free', empty_dir, mod_root)
         # A lone player's network.
         c = check_lua_variant(text, 1.75, True, 3038, 1918, True, 1.0, 1.75, 'solo', None, mod_root)
+        # Companies mode without the mod's map file: the creation-order guess still works.
+        d = check_lua_variant(text, 1.75, True, 3038, 1918, True, 1.0, 1.75, 'guess', guess_dir, mod_root)
 
     checker = ROOT.parent / 'tpf2-multiplayer/tools/luacheck.py'
     if checker.exists():
@@ -1219,13 +1229,13 @@ def check_lua():
         lint = 'tpf2-multiplayer luacheck clean'
     else:
         lint = 'tpf2-multiplayer/tools/luacheck.py not found, lint skipped'
-    print('PASS: Lua script under a mocked UI and world (%s; %s; %s): measured UI scale and layout rule, picture and '
+    print('PASS: Lua script under a mocked UI and world (%s; %s; %s; %s): measured UI scale and layout rule, picture and '
           'markers on their world positions, one cargo icon per industry type (from production, a mod\'s own construction file, the stock table, else a generic icon that exists), click-to-move and focus; the network '
           'payload lists every track and street class with Hermite tangents, both stations and owner palette '
-          'indices; companies take their lobby colours by roster, other owners distinct colours, a lone player '
+          'indices; companies take their colours and names from the multiplayer mod\'s map (creation order without it), other owners distinct colours, a lone player '
           'none; the plugin accepts the payload; layer and company toggles re-send only the header against the '
           'same network, marker toggles send nothing; the legend is rebuilt, not duplicated, on Refresh; %s'
-          % (a, b, c, lint))
+          % (a, b, c, d, lint))
 
 
 def main():
