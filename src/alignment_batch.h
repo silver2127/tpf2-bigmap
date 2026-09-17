@@ -26,6 +26,11 @@
 // vector from uninitialised memory and asserted on its box.)
 #pragma once
 static int g_alignmentBatch = 512;   // tiles per UpdateSubterrains call; 0 = stock
+// The CTerrain the alignment pass works on (UpdateSubterrains' this+8), as
+// last seen by the detour; read by the terrain sidecar (terrain_sidecar.h).
+static void* g_alignmentTerrain = nullptr;
+// Wall time of the last batched pass (the load's), milliseconds.
+static volatile LONG64 g_alignmentPassMs = 0;
 namespace AlignmentBatch {
 struct SetValue { uint64_t key; void* vfirst; void* vlast; void* vend; };   // CVec2i block + std::vector<16-byte item>
 struct SetNode { SetNode* left; SetNode* parent; SetNode* right; uint8_t color, isnil, pad[6]; SetValue value; };
@@ -67,6 +72,7 @@ static void BuildChain(SetNode* nodes, const SetValue* values, size_t n) {
 }
 static void __fastcall Detour(void* self, SetObject* set) {
     InterlockedIncrement64(&calls);
+    if (self) g_alignmentTerrain = *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 8);
     size_t total = set && set->head ? set->size : 0;
     size_t batch = g_alignmentBatch > 0 ? size_t(g_alignmentBatch) : 0;
     if (!batch || total <= batch || total > (size_t(64) << 20)) { original(self, set); return; }
@@ -79,13 +85,17 @@ static void __fastcall Detour(void* self, SetObject* set) {
     }
     size_t n = CollectValues(set, keys, total);
     InterlockedIncrement64(&batchedCalls); InterlockedAdd64(&batchedTiles, LONG64(n));
-    if (H) H->log("alignment pass: %llu blocks in %llu batches of %llu", (unsigned long long)n, (unsigned long long)((n + batch - 1) / batch), (unsigned long long)batch);
+    LARGE_INTEGER f{}, t0{}, t1{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
     for (size_t off = 0; off < n; off += batch) {
         size_t k = n - off < batch ? n - off : batch;
         BuildChain(nodes, keys + off, k);
         SetObject fake{&nodes[0], k};
         original(self, &fake);
     }
+    QueryPerformanceCounter(&t1);
+    LONG64 ms = f.QuadPart ? (t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart : 0;
+    InterlockedExchange64(&g_alignmentPassMs, ms);
+    if (H) H->log("alignment pass: %llu blocks in %llu batches of %llu, %lld ms (compute + publish)", (unsigned long long)n, (unsigned long long)((n + batch - 1) / batch), (unsigned long long)batch, ms);
     HeapFree(GetProcessHeap(), 0, keys);
     HeapFree(GetProcessHeap(), 0, nodes);
 }
