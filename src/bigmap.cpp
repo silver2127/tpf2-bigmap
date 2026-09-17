@@ -200,6 +200,7 @@ static bool g_octreeOn = true;
 #include "terrain_compression.h"
 #include "material_compression.h"
 #include "save_fast.h"
+#include "travel_time.h"
 #include "instance_shrink.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
@@ -1244,6 +1245,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_worldEntryTrackBusy = (g_terrainCompress==1 && (g_terrainWarmMB<0 || g_terrainWarmMB>g_terrainHotMB)) ||
                             (g_materialCompress==1 && (g_materialWarmMB<0 || g_materialWarmMB>g_materialHotMB));
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
+    g_travelTimeLimit = H->cfgInt("tpf2_bigmap", "travel_time_limit_s", 0);
+    g_cargoPathTime = H->cfgInt("tpf2_bigmap", "cargo_path_time_s", 0);
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
     g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 0) != 0;
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
@@ -1355,6 +1358,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallTerrainCompression();
     installed += InstallMaterialCompression();
     installed += InstallSaveFast();
+    installed += InstallTravelTime();
     installed += InstallInstanceShrink();
     installed += InstallMinimap();
 
