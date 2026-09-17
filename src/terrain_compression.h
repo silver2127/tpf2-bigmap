@@ -3,6 +3,7 @@
 // their stock allocators. Enable before loading; never retrofit live pointers.
 #pragma once
 #include "terrain_pager.h"
+#include "small_pager.h"
 #include "terrain_warmup.h"
 static int g_terrainCompress=0, g_terrainHotMB=1024;
 static int g_terrainWarmMB=4096;
@@ -24,10 +25,13 @@ static int g_terrainLazyZero=0;
 // The alignment pass's per-tile vectors go through the pager too (terrain_blocks.h).
 static int g_terrainBlocks=0;
 static volatile LONG64 g_blockAllocations=0, g_blockReleases=0, g_blockStray=0;
-// Diagnostics for the block detour: every call, calls of one-tile size, and
-// the first few distinct return addresses of those (logged once each).
+// Diagnostics for the block detour: every call, calls routed by size and
+// caller, and resize calls returning to UpdateSubterrains.
 static volatile LONG64 g_blockCalls=0, g_blockSized=0, g_resultResizes=0;
-static volatile LONG64 g_blockCallers[8]={};
+// The small pager (small_pager.h) behind terrain_blocks: budgets in MiB
+// (warm -1 = auto) and the switch the hooks read.
+static int g_smallHotMB=1024, g_smallWarmMB=-1;
+static volatile LONG g_smallPagerActive=0;
 // Ceiling on evictions per second outside loading and memory pressure
 // (0 = unlimited). The rate actually used adapts below it, see EvictRateStep.
 static int g_terrainEvictPerSec=4000, g_materialEvictPerSec=4000;
@@ -88,8 +92,21 @@ static TerrainResizeFn g_originalTerrainResize;
 static TerrainCopyFn g_originalTerrainCopy;
 static TerrainDestroyFn g_originalTerrainDestroy;
 static uintptr_t g_terrainCompressionBase;
-static void ResizeTerrainOwned(TerrainOwnedVector* v,size_t n,bool eligible) {
+static void ResizeTerrainOwned(TerrainOwnedVector* v,size_t n,bool eligible,bool toSmall=false) {
     using namespace TerrainPager;
+    if(SmallPager::Contains(v->first)) {
+        // A small-pager span: grow within its page capacity, else migrate to
+        // the stock heap before the engine's own code can see our memory.
+        size_t oldSize=size_t(v->last-v->first);
+        if(n<=SmallPager::Capacity(v->first)){v->last=v->first+n;if(n>oldSize)memset(v->first+oldSize,0,(n-oldSize)*2);return;}
+        TerrainOwnedVector replacement{};
+        g_originalTerrainResize(&replacement,n);
+        memcpy(replacement.first,v->first,oldSize*2);
+        SmallPager::Release(v->first);*v=replacement;return;
+    }
+    if(toSmall && !v->first && !v->last && !v->end && n && n<=SmallPager::MaxSamples) {
+        if(auto p=SmallPager::Allocate(n)){*v={p,p+n,p+n};return;}
+    }
     if(Contains(v->first)) {
         size_t oldSize=size_t(v->last-v->first);
         if(n<=Samples){v->last=v->first+n; if(n>oldSize)memset(v->first+oldSize,0,(n-oldSize)*2);return;}
@@ -112,10 +129,11 @@ static void __fastcall TerrainCompressedResize(TerrainOwnedVector* v,size_t n) {
     // peak); a plain vector, released through the CRT free import that
     // terrain_blocks.h routes to the pager, so only with terrain_blocks on.
     auto ret=reinterpret_cast<uintptr_t>(_ReturnAddress());
-    if(ret==g_terrainCompressionBase+0xaac4d9)InterlockedIncrement64(&g_resultResizes);
-    bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) &&
-        (ret==g_terrainCompressionBase+0x33ccaa || (g_terrainBlocks && ret==g_terrainCompressionBase+0xaac4d9));
-    ResizeTerrainOwned(v,n,eligible);
+    bool result=ret==g_terrainCompressionBase+0xaac4d9;
+    if(result)InterlockedIncrement64(&g_resultResizes);
+    bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) && ret==g_terrainCompressionBase+0x33ccaa;
+    bool toSmall=result && InterlockedCompareExchange(&g_smallPagerActive,0,0);
+    ResizeTerrainOwned(v,n,eligible,toSmall);
 }
 static TerrainOwnedVector* CopyTerrainOwned(TerrainOwnedVector* dst,const TerrainOwnedVector* src,bool eligible) {
     if(eligible && src->first && uintptr_t(src->last)-uintptr_t(src->first)==TerrainPager::Bytes) {
@@ -234,12 +252,16 @@ static unsigned PagerHelperThreads() {
     return info.dwNumberOfProcessors>=16?3:info.dwNumberOfProcessors>=8?1:0;
 }
 static DWORD WINAPI TerrainEvictionHelper(void*) {
-    for(;;){Sleep(25);if(InterlockedCompareExchange(&g_terrainCompressActive,0,0))TerrainPager::Tick();}
+    for(;;) {
+        Sleep(25);
+        if(InterlockedCompareExchange(&g_terrainCompressActive,0,0))TerrainPager::Tick();
+        if(InterlockedCompareExchange(&g_smallPagerActive,0,0))SmallPager::Tick();
+    }
 }
 static DWORD WINAPI TerrainCompressionWorker(void*) {
     uint64_t lastLog=GetTickCount64(),lastPolicy=0;int effectiveMB=g_terrainHotMB;
     uint64_t lastProbe=0;bool probeFast=false;
-    uint64_t lastDecodes=0,lastStutterLog=0,lastRateLog=0;
+    uint64_t lastDecodes=0,lastStutterLog=0,lastRateLog=0;int smallEffectiveMB=g_smallHotMB;
     uint64_t lastEvictMicros=0,lastEvictOps=0;EvictRateState rate{};UiStallMeter stallMeter;
     TerrainWarmup warmup;
     using UiTickFn=uint64_t(*)();UiTickFn uiTick=nullptr;
@@ -278,6 +300,19 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
             TerrainPager::SetUrgent(commitTight);
             TerrainPager::SetThrottle(commitTight);
+            if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
+                // The small pager follows the same loading allowance, from its own
+                // budgets; under a tight commit charge it drains to 64 MiB.
+                auto sp=SmallPager::Snapshot();
+                bool smallBulk=sp.lastBulkAllocation && now-sp.lastBulkAllocation<15000;
+                int smallNext=TerrainBudgetMB(g_smallHotMB,g_smallWarmMB,busy,bulk||loading||smallBulk,available,sp.residentBytes>>20);
+                if(commitTight && smallNext>64)smallNext=64;
+                SmallPager::SetBudget(size_t(smallNext)*1024*1024);
+                SmallPager::SetThrottle(commitTight);
+                if(smallNext!=smallEffectiveMB && (smallNext==g_smallHotMB||smallEffectiveMB==g_smallHotMB||smallNext-smallEffectiveMB>=1024||smallEffectiveMB-smallNext>=1024))
+                    H->log("small pager: resident target %d -> %d MiB (bulk_allocation=%d commit_tight=%d)",smallEffectiveMB,smallNext,int(smallBulk),int(commitTight));
+                smallEffectiveMB=smallNext;
+            }
             if(commitTight && next>256)next=256;
             else if(!(busy||bulk||loading)) {
                 int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available);
@@ -303,6 +338,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             }
         }
         TerrainPager::Tick();
+        if(InterlockedCompareExchange(&g_smallPagerActive,0,0))SmallPager::Tick();
         if(g_terrainDedupProbe && now-lastProbe>=(probeFast?10000ull:120000ull)) {
             lastProbe=now;
             if(TerrainPager::Snapshot().live)LogDedupProbe();
@@ -316,6 +352,11 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
                 s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited,rate.rate,s.evictOps?s.evictMicros/s.evictOps:0ull,s.lazyAllocations,s.throttleWaits,s.throttleMillis,
                 InterlockedCompareExchange64(&g_blockAllocations,0,0),InterlockedCompareExchange64(&g_blockReleases,0,0),InterlockedCompareExchange64(&g_blockStray,0,0),
                 InterlockedCompareExchange64(&g_blockCalls,0,0),InterlockedCompareExchange64(&g_blockSized,0,0),InterlockedCompareExchange64(&g_resultResizes,0,0));
+            if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
+                auto sp=SmallPager::Snapshot();
+                if(sp.live||sp.releases)H->log("small pager: live=%llu lazy=%llu resident=%llu resident_mb=%.1f cold=%llu compressed_mb=%.1f faults=%llu commits=%llu restores=%llu evictions=%llu releases=%llu failures=%llu incompressible=%llu cancelled=%llu commit_retries=%llu throttle_waits=%llu throttle_ms=%llu overflows=%llu ring_drops=%llu",
+                    sp.live,sp.lazy,sp.resident,double(sp.residentBytes)/(1024*1024),sp.cold,double(sp.compressedBytes)/(1024*1024),sp.faults,sp.commits,sp.restores,sp.evictions,sp.releases,sp.failures,sp.incompressible,sp.cancelled,sp.commitRetries,sp.throttleWaits,sp.throttleMillis,sp.overflows,sp.ringDrops);
+            }
             if(g_terrainCowShare)H->log("terrain cow: copy_hook_calls=%lld unmanaged_src=%lld shared=%llu refused_not_slot=%llu refused_cold=%llu refused_packed=%llu refused_busy=%llu",
                 g_cowCopyCalls,g_cowCopyUnmanaged,s.sharedViews,
                 s.shareRefusedNotSlot,s.shareRefusedCold,s.shareRefusedPacked,s.shareRefusedBusy);
