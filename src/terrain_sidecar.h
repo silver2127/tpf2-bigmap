@@ -1,0 +1,162 @@
+// Steam 35924: a terrain sidecar file, so a save's aligned 1 m height cache is
+// restored on load instead of rebuilt by the refine + alignment pass.
+//
+// The .sav stores the 4 m base heightmap and every road/track/construction
+// alignment, NOT the finished 1 m cache. On load the engine rebuilds the cache
+// (bicubic refine, terrain_util 0x3c4620) and then re-cuts it with every
+// alignment (ecs::TerrainAlignmentSystem, 0xaad6c0). On a 207,360-tile save
+// that pass is the load's memory peak and a large share of its time. The
+// finished cache is a pure function of the save, so writing it beside the save
+// and splatting it back on load of the SAME save is exact.
+//
+// This header owns the FILE FORMAT and the GRID WALK only. It reads and writes
+// the live terrain grid through the layout confirmed by RE (CTerrain::GetTile
+// 0x33d580, AddTile 0x33cb60):
+//
+//   CTerrain* + 0x18            -> grid*
+//   grid + 0x00 int32 x0        (window origin, unused here)
+//   grid + 0x04 int32 y0
+//   grid + 0x08 int32 nx        (record columns)
+//   grid + 0x0c int32 ny        (record rows)
+//   grid + 0x10 void* records   (nx*ny records, 40 bytes each)
+//   record + 0x00 int32 entity  (< 0 == no tile)
+//   record + 0x08 {uint16* first, * last, * end}   the height cache vector
+//   record + 0x20 int32 version
+//
+// A tile is eligible when its vector holds exactly Side*Side samples (66,049
+// for the 1 m cache). Each is compressed with the block codec. The file is
+// keyed to the save by a caller-supplied 64-bit fingerprint (the .sav hash);
+// Apply refuses a file whose fingerprint or grid dimensions do not match, so a
+// foreign, stale or plugin-less save is never touched.
+//
+// This header does not hook the game. The SaveGame/LoadGame hooks and the
+// short-circuit of the alignment pass are integrated separately; see the
+// exported test entry points and docs/terrain-sidecar.md.
+#pragma once
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+#include "small_codec.h"
+#include "terrain_codec.h"   // Side, Samples
+
+namespace TerrainSidecar {
+constexpr uint32_t Magic = 0x52524554;      // 'TERR'
+constexpr uint32_t Version = 1;
+constexpr size_t Side = TerrainCodec::Side;         // 257
+constexpr size_t Samples = TerrainCodec::Samples;   // 66,049
+
+#pragma pack(push, 1)
+struct FileHeader {
+    uint32_t magic, version;
+    uint64_t fingerprint;       // the save's content hash (caller-supplied)
+    int32_t nx, ny;             // grid dimensions, so a resized world is rejected
+    uint32_t tiles;             // eligible tiles stored
+    uint64_t headerHash;        // hash of the fields above, for a torn/truncated file
+};
+struct TileHeader { uint32_t index; uint32_t bytes; };   // record index in the grid, compressed length
+#pragma pack(pop)
+
+// The engine's terrain grid, as a raw view (never constructed by us).
+struct Grid {
+    uint8_t* base;
+    int32_t nx() const { return *reinterpret_cast<const int32_t*>(base + 8); }
+    int32_t ny() const { return *reinterpret_cast<const int32_t*>(base + 0xc); }
+    uint8_t* records() const { return *reinterpret_cast<uint8_t* const*>(base + 0x10); }
+    uint8_t* record(uint32_t i) const { return records() + size_t(i) * 40; }
+};
+inline Grid GridOf(void* cterrain) { return Grid{*reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(cterrain) + 0x18)}; }
+struct TileVector { uint16_t* first; uint16_t* last; uint16_t* end; };
+inline TileVector* VectorOf(uint8_t* record) { return reinterpret_cast<TileVector*>(record + 8); }
+inline bool Eligible(const TileVector* v) { return v->first && size_t(v->last - v->first) == Samples; }
+
+inline uint64_t MixHash(uint64_t h, uint64_t x) {
+    h ^= x + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h;
+}
+inline uint64_t HashHeader(const FileHeader& h) {
+    uint64_t v = 0;
+    v = MixHash(v, h.magic); v = MixHash(v, h.version); v = MixHash(v, h.fingerprint);
+    v = MixHash(v, uint64_t(uint32_t(h.nx))); v = MixHash(v, uint64_t(uint32_t(h.ny))); v = MixHash(v, h.tiles);
+    return v;
+}
+
+// ---- Write: compress every eligible tile of `grid` to `path`. ----
+// Returns the number of tiles written, or -1 on an I/O or allocation failure.
+// A partial file is removed on failure so a later Apply never sees it.
+inline long Write(const Grid& grid, uint64_t fingerprint, const char* path,
+                  BlockCodec::EncodeScratch* scratch, uint64_t* compressedBytesOut = nullptr) {
+    if (!grid.base || !grid.records()) return -1;
+    const int32_t nx = grid.nx(), ny = grid.ny();
+    if (nx <= 0 || ny <= 0 || int64_t(nx) * ny > (int64_t(1) << 24)) return -1;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") || !f) return -1;
+    FileHeader hdr{Magic, Version, fingerprint, nx, ny, 0, 0};
+    // Header rewritten at the end with the true tile count and hash.
+    if (fwrite(&hdr, sizeof hdr, 1, f) != 1) { fclose(f); remove(path); return -1; }
+    std::vector<uint8_t> blob(Samples * 2 + 128);
+    uint32_t tiles = 0; uint64_t compressed = 0; bool ok = true;
+    const uint32_t count = uint32_t(nx) * uint32_t(ny);
+    for (uint32_t i = 0; i < count && ok; ++i) {
+        TileVector* v = VectorOf(grid.record(i));
+        if (!Eligible(v)) continue;
+        size_t n = BlockCodec::Encode(v->first, Samples, blob.data(), blob.size(), *scratch);
+        if (!n) continue;   // an incompressible tile is simply omitted; Apply leaves it to the pass
+        TileHeader th{i, uint32_t(n)};
+        if (fwrite(&th, sizeof th, 1, f) != 1 || fwrite(blob.data(), 1, n, f) != n) { ok = false; break; }
+        ++tiles; compressed += n;
+    }
+    if (ok) {
+        hdr.tiles = tiles; hdr.headerHash = HashHeader(hdr);
+        if (fseek(f, 0, SEEK_SET) || fwrite(&hdr, sizeof hdr, 1, f) != 1) ok = false;
+    }
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { remove(path); return -1; }
+    if (compressedBytesOut) *compressedBytesOut = compressed;
+    return long(tiles);
+}
+
+// ---- Apply: fill every stored tile of `path` into `grid`. ----
+// Returns the number of tiles applied, 0 if the file is absent/foreign/stale
+// (the caller then lets the pass run), or -1 on a corrupt-but-matching file
+// (the caller must let the pass run and should discard the file). Only writes
+// into a record whose vector is already the right size (the tile exists); it
+// never allocates a tile, so it runs after the pass has created them.
+inline long Apply(const Grid& grid, uint64_t fingerprint, const char* path,
+                  BlockCodec::DecodeScratch* scratch) {
+    if (!grid.base || !grid.records()) return 0;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") || !f) return 0;
+    FileHeader hdr{};
+    if (fread(&hdr, sizeof hdr, 1, f) != 1) { fclose(f); return 0; }
+    if (hdr.magic != Magic || hdr.version != Version || hdr.headerHash != HashHeader(hdr)) { fclose(f); return 0; }
+    if (hdr.fingerprint != fingerprint || hdr.nx != grid.nx() || hdr.ny != grid.ny()) { fclose(f); return 0; }
+    const uint32_t count = uint32_t(grid.nx()) * uint32_t(grid.ny());
+    std::vector<uint8_t> blob(Samples * 2 + 128);
+    long applied = 0; bool corrupt = false;
+    for (uint32_t k = 0; k < hdr.tiles; ++k) {
+        TileHeader th{};
+        if (fread(&th, sizeof th, 1, f) != 1) { corrupt = true; break; }
+        if (th.bytes == 0 || th.bytes > blob.size() || th.index >= count) { corrupt = true; break; }
+        if (fread(blob.data(), 1, th.bytes, f) != th.bytes) { corrupt = true; break; }
+        TileVector* v = VectorOf(grid.record(th.index));
+        if (!Eligible(v)) continue;   // tile not present this load: skip, leave it to the pass
+        if (!BlockCodec::Decode(blob.data(), th.bytes, v->first, Samples, *scratch)) { corrupt = true; break; }
+        ++applied;
+    }
+    fclose(f);
+    return corrupt ? -1 : applied;
+}
+}  // namespace TerrainSidecar
+
+// ---- Offline test entry points (no game state). ----
+extern "C" __declspec(dllexport) long BigmapTestSidecarWrite(void* cterrain, uint64_t fp, const char* path, uint64_t* bytesOut) {
+    auto* s = new BlockCodec::EncodeScratch;
+    long r = TerrainSidecar::Write(TerrainSidecar::GridOf(cterrain), fp, path, s, bytesOut);
+    delete s; return r;
+}
+extern "C" __declspec(dllexport) long BigmapTestSidecarApply(void* cterrain, uint64_t fp, const char* path) {
+    auto* s = new BlockCodec::DecodeScratch;
+    long r = TerrainSidecar::Apply(TerrainSidecar::GridOf(cterrain), fp, path, s);
+    delete s; return r;
+}
