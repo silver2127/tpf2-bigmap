@@ -19,6 +19,8 @@ static int g_terrainDedupProbe=0;
 // of encoding (see pager_impl.inl). Measured need: the two CTerrain versions of
 // a save load are byte-identical tile for tile.
 static int g_terrainDedup=0;
+// Evictions per second outside loading and memory pressure (0 = unlimited).
+static int g_terrainEvictPerSec=1000, g_materialEvictPerSec=1000;
 static void ProbeYield(){TerrainPager::Tick();}
 static void LogDedupProbe() {
     TerrainPager::ProbeResult r{};
@@ -226,11 +228,11 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu",
+            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
                 s.encodes,s.reusedEvictions,s.writeFaults,s.sharedClones,s.overflows,s.softBlocked,s.softRescues,s.cancelledEvictions,
-                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds);
+                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited);
             if(g_terrainCowShare)H->log("terrain cow: copy_hook_calls=%lld unmanaged_src=%lld shared=%llu refused_not_slot=%llu refused_cold=%llu refused_packed=%llu refused_busy=%llu",
                 g_cowCopyCalls,g_cowCopyUnmanaged,s.sharedViews,
                 s.shareRefusedNotSlot,s.shareRefusedCold,s.shareRefusedPacked,s.shareRefusedBusy);
@@ -265,6 +267,7 @@ static bool InstallTerrainCompression() {
     if(!TerrainPager::Init(size_t(g_terrainHotMB)*1024*1024)) {
         H->log("terrain compression: placeholder/handler initialization failed; OFF");return false;
     }
+    TerrainPager::SetEvictRate(g_terrainEvictPerSec<0?0:unsigned(g_terrainEvictPerSec));
     if(g_terrainDedup && !TerrainPager::EnableDedup()){H->log("terrain compression: dedup index allocation failed; dedup OFF");g_terrainDedup=0;}
     g_terrainCompressionBase=H->moduleBase();
     // Destruction first; allocation remains disabled until EVERY hook and the

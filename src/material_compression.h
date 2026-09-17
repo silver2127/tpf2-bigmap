@@ -112,6 +112,7 @@ static DWORD WINAPI MaterialEvictionHelper(void*) {
 }
 static DWORD WINAPI MaterialCompressionWorker(void*) {
     uint64_t lastLog=GetTickCount64(),lastPolicy=0;int effectiveMB=g_materialHotMB;
+    uint64_t lastDecodes=0;
     for(;;) {
         Sleep(25);
         if(!InterlockedCompareExchange(&g_materialCompressActive,0,0))continue;
@@ -136,7 +137,12 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // windows restoring tiles (85 s); with growth 41-53% (73 s). The earlier
             // RAM-only cap hit std::bad_alloc at the commit limit on a 512x512 preview.
             int next=TerrainBudgetMB(g_materialHotMB,g_materialWarmMB,busy,bulk,available,(s.live*MaterialPager::SlotBytes)>>20);
+            // Same steady-state rules as the terrain pager: ramp down instead of
+            // snapping (MEASURED 2026-09-17: the snap evicted 93,000 cells in 30 s
+            // and the game stuttered), hold or grow while cells fault back in.
+            uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
             if(commitTight && next>256)next=256;
+            else if(!(busy||bulk))next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available);
             MaterialPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d)",effectiveMB,next,int(busy),int(bulk),int(commitTight));
             effectiveMB=next;
@@ -159,6 +165,7 @@ static const uint8_t kMaterialGridDtorBytes[]={0x48,0x89,0x5c,0x24,0x08,0x48,0x8
 static const uint8_t kMaterialAssignBytes[]={0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x48,0x89,0x74,0x24,0x20};
 static bool InstallMaterialCompression() {
     if(!g_materialCompress)return false;
+    MaterialPager::SetEvictRate(g_materialEvictPerSec<0?0:unsigned(g_materialEvictPerSec));
     if(!g_materialHotMB || g_materialWarmMB==-1) {   // 0 / -1 mean auto; other negatives stay invalid
         uint64_t total=InstalledPhysicalBytes();int hot=0,warm=0;
         AutoMaterialBudgets(total,&hot,&warm);
