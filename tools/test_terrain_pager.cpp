@@ -1,4 +1,4 @@
-// Real Windows memory mappings and real concurrent access violations, isolated
+﻿// Real Windows memory mappings and real concurrent access violations, isolated
 // from the game. Optional argv[1]: offline 257x257 uint16 terrain sample file.
 #include "../src/terrain_pager.h"
 #include <cstdio>
@@ -287,6 +287,32 @@ int main(int argc,char** argv) {
         GetProcessHandleCount(GetCurrentProcess(),&h1);assert(h1==h0);
         printf("cow sharing: shares=%u privatized=%llu failures=%llu\n",
                shares.load(),sc.privatizations,sc.failures);
+    }
+    // Content probe: identical tiles are counted whether resident or cold, the
+    // all-zero (never written) group is reported on its own, and a slot that is
+    // mid-encode is skipped rather than touched.
+    {
+        auto base=Snapshot();
+        std::vector<uint16_t> patA(Samples),patB(Samples);
+        for(size_t k=0;k<Samples;++k){patA[k]=uint16_t(k*3+11);patB[k]=uint16_t(k/7+900);}
+        auto a1=Allocate(),a2=Allocate(),a3=Allocate(),b1=Allocate(),b2=Allocate(),z1=Allocate(),z2=Allocate(),u=Allocate();
+        assert(a1&&a2&&a3&&b1&&b2&&z1&&z2&&u);
+        memcpy(a1,patA.data(),Bytes);memcpy(a2,patA.data(),Bytes);memcpy(a3,patA.data(),Bytes);
+        memcpy(b1,patB.data(),Bytes);memcpy(b2,patB.data(),Bytes);
+        for(size_t k=0;k<Samples;++k)u[k]=uint16_t(rng());
+        assert(Evict(Index(a2),true));assert(Evict(Index(b2),true));   // cold: the blob's hash
+        assert(b1[0]==patB[0]);                                          // restored read-only: still the blob's hash
+        assert(Evict(Index(b1),true));assert(b1[1]==patB[1]);
+        ProbeResult r{};assert(Probe(&r));
+        assert(r.live==base.live+8 && r.skipped==0);
+        assert(r.hashedPacked==2+1 && r.hashedResident==5);
+        assert(r.distinct==4 && r.duplicated==4 && r.zero==2 && r.pairs==2 && r.largestGroup==3);
+        // A slot whose encode is in flight is skipped, not read.
+        {Guard g;slots[Index(u)].evicting=true;}
+        assert(Probe(&r) && r.skipped==1 && r.hashedResident==4 && r.distinct==3);
+        {Guard g;slots[Index(u)].evicting=false;}
+        for(auto t:{a1,a2,a3,b1,b2,z1,z2,u})assert(Release(t));
+        printf("content probe: distinct=%llu duplicated=%llu zero=%llu ms=%llu\n",r.distinct,r.duplicated,r.zero,r.ms);
     }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.

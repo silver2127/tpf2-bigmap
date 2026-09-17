@@ -1232,6 +1232,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
     g_terrainCowShare = H->cfgBool("tpf2_bigmap", "terrain_cow_share", 0) != 0;
+    g_terrainDedupProbe = H->cfgBool("tpf2_bigmap", "terrain_dedup_probe", 0) != 0;
     g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
     g_materialHotMB = H->cfgInt("tpf2_bigmap", "material_cache_hot_mb", 0);
     g_materialWarmMB = H->cfgInt("tpf2_bigmap", "material_cache_warm_mb", -1);
