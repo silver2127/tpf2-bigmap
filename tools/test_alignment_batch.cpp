@@ -22,11 +22,13 @@ struct Entry {
     bool operator<(const Entry& o) const { return key < o.key; }
 };
 static_assert(sizeof(Entry) == 32, "entry layout");
+static uint8_t g_selfBytes[16];                // the system object: its +8 is the CTerrain the detour exposes
+static void* const g_self = g_selfBytes;
 static std::vector<std::vector<uint64_t>> g_calls;
 static void __fastcall Recorder(void* self, AlignmentBatch::SetObject* set) {
     // Iterate the way the game does: from head->left with the MSVC successor
     // step, and read each entry's vector through the copied pointers.
-    assert(self == reinterpret_cast<void*>(0x1234));
+    assert(self == g_self);
     std::vector<uint64_t> keys;
     AlignmentBatch::SetNode* head = set->head;
     for (auto* it = head->left; it != head; it = AlignmentBatch::Next(it)) {
@@ -54,9 +56,12 @@ int main() {
     assert(AlignmentBatch::CollectValues(obj, walked.data(), walked.size()) == s.size());
     for (size_t i = 0; i < walked.size(); ++i) assert(walked[i].key == expected[i]);
     // Batches of 100: 101 calls, each a chain the successor step visits in order; concatenation equals the set.
-    auto self = reinterpret_cast<void*>(0x1234);
+    auto self = g_self;
+    *reinterpret_cast<void**>(g_selfBytes + 8) = reinterpret_cast<void*>(0x5678);
     g_calls.clear();
     BigmapTestAlignmentDetour(self, obj, Recorder, 100);
+    assert(g_alignmentTerrain == reinterpret_cast<void*>(0x5678));   // the pass's CTerrain, for the sidecar
+    assert(g_alignmentPassMs >= 0);
     assert(g_calls.size() == (s.size() + 99) / 100);
     std::vector<uint64_t> got;
     for (auto& c : g_calls) { assert(c.size() <= 100); got.insert(got.end(), c.begin(), c.end()); }
