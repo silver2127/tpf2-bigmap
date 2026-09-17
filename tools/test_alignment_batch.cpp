@@ -13,27 +13,46 @@ static const Tpf2mpHost* H = nullptr;
 static bool g_gog = false;
 #include "../src/alignment_batch.h"
 
+// The game's entry: a block coordinate and a vector of 16-byte items, the
+// same shape std::set<Entry> gives in the MSVC STL (value at +0x20, the
+// vector's three pointers at +0x28, node 0x40 bytes).
+struct Item { uint64_t a, b; };
+struct Entry {
+    uint64_t key; std::vector<Item> items;
+    bool operator<(const Entry& o) const { return key < o.key; }
+};
+static_assert(sizeof(Entry) == 32, "entry layout");
 static std::vector<std::vector<uint64_t>> g_calls;
 static void __fastcall Recorder(void* self, AlignmentBatch::SetObject* set) {
-    // Iterate the way the game does: from head->left with the MSVC successor step.
+    // Iterate the way the game does: from head->left with the MSVC successor
+    // step, and read each entry's vector through the copied pointers.
     assert(self == reinterpret_cast<void*>(0x1234));
     std::vector<uint64_t> keys;
     AlignmentBatch::SetNode* head = set->head;
-    for (auto* it = head->left; it != head; it = AlignmentBatch::Next(it)) keys.push_back(it->key);
+    for (auto* it = head->left; it != head; it = AlignmentBatch::Next(it)) {
+        keys.push_back(it->value.key);
+        auto* first = static_cast<Item*>(it->value.vfirst); auto* last = static_cast<Item*>(it->value.vlast);
+        assert(size_t(last - first) == it->value.key % 5);              // the vector the test built for this key
+        for (auto* p = first; p != last; ++p) assert(p->a == it->value.key && p->b == uint64_t(p - first));
+    }
     assert(keys.size() == set->size);
     g_calls.push_back(keys);
 }
 
 int main() {
-    // The game's node layout is the STL's: value at +0x20, isnil at +0x19.
-    std::set<uint64_t> s;
+    std::set<Entry> s;
     std::mt19937_64 rng(2026);
-    for (int i = 0; i < 10007; ++i) s.insert(rng());
+    for (int i = 0; i < 10007; ++i) {
+        Entry e; e.key = rng();
+        for (uint64_t k = 0; k < e.key % 5; ++k) e.items.push_back({e.key, k});
+        s.insert(std::move(e));
+    }
     auto* obj = reinterpret_cast<AlignmentBatch::SetObject*>(&s);
     assert(obj->size == s.size());
-    std::vector<uint64_t> expected(s.begin(), s.end());
-    std::vector<uint64_t> walked(s.size());
-    assert(AlignmentBatch::CollectKeys(obj, walked.data(), walked.size()) == s.size() && walked == expected);
+    std::vector<uint64_t> expected; for (auto& e : s) expected.push_back(e.key);
+    std::vector<AlignmentBatch::SetValue> walked(s.size());
+    assert(AlignmentBatch::CollectValues(obj, walked.data(), walked.size()) == s.size());
+    for (size_t i = 0; i < walked.size(); ++i) assert(walked[i].key == expected[i]);
     // Batches of 100: 101 calls, each a chain the successor step visits in order; concatenation equals the set.
     auto self = reinterpret_cast<void*>(0x1234);
     g_calls.clear();
@@ -48,14 +67,14 @@ int main() {
     g_calls.clear(); BigmapTestAlignmentDetour(self, obj, Recorder, 0);
     assert(g_calls.size() == 1 && g_calls[0] == expected);
     // A single-element chain and an exact multiple.
-    std::set<uint64_t> one{42}; g_calls.clear();
+    std::set<Entry> one; one.insert(Entry{40, {}}); g_calls.clear();
     BigmapTestAlignmentDetour(self, reinterpret_cast<AlignmentBatch::SetObject*>(&one), Recorder, 1);
-    assert(g_calls.size() == 1 && g_calls[0] == std::vector<uint64_t>{42});
-    std::set<uint64_t> six{1, 2, 3, 4, 5, 6}; g_calls.clear();
+    assert(g_calls.size() == 1 && g_calls[0] == std::vector<uint64_t>{40});
+    std::set<Entry> six; for (uint64_t k : {5, 10, 15, 20, 25, 30}) six.insert(Entry{k, {}}); g_calls.clear();
     BigmapTestAlignmentDetour(self, reinterpret_cast<AlignmentBatch::SetObject*>(&six), Recorder, 3);
-    assert(g_calls.size() == 2 && g_calls[0] == (std::vector<uint64_t>{1, 2, 3}) && g_calls[1] == (std::vector<uint64_t>{4, 5, 6}));
+    assert(g_calls.size() == 2 && g_calls[0] == (std::vector<uint64_t>{5, 10, 15}) && g_calls[1] == (std::vector<uint64_t>{20, 25, 30}));
     // The game's set is untouched by the batching: still iterates and erases normally.
-    assert(std::vector<uint64_t>(s.begin(), s.end()) == expected);
+    { std::vector<uint64_t> again; for (auto& e : s) again.push_back(e.key); assert(again == expected); }
     s.clear();
     // Byte anchors in the real executable.
     FILE* f = nullptr; fopen_s(&f, "C:\\tools\\bin\\TransportFever2.exe", "rb"); assert(f);
