@@ -95,7 +95,21 @@ struct Stats {
     uint64_t dedupHits, dedupRebuilds;
     // Restores that had to wait for a section (the commit charge at its limit).
     uint64_t restoreRetries, restoreGiveUps;
+    // Backpressure: cold restores that waited for eviction while the commit
+    // charge was tight, and the milliseconds they waited in total.
+    uint64_t throttleWaits, throttleMillis;
 };
+// Set by the worker while the commit charge is tight. MEASURED 2026-09-17:
+// the load fills tiles (and the alignment pass its blocks) at up to ~30,000
+// sections per second, eviction sheds a few thousand, and the commit charge
+// runs out between two worker ticks whatever the target says. With the
+// throttle on, a fault that would create a NEW section first waits, up to
+// ThrottleMaxMs, while the pool is over budget, so the burst becomes a stream
+// the evictors can absorb. Slots that already have a section (blocked, soft
+// blocked, read-only) never wait: those are protection changes, not commit.
+static volatile LONG throttle=0;
+constexpr unsigned ThrottleMaxMs=2000;
+static void SetThrottle(bool on){InterlockedExchange(&throttle,on?1:0);}
 // Test hook: the next N section creations fail, as they do at the commit limit.
 static volatile LONG injectSectionFailures=0;
 static HANDLE NewSection() {
@@ -384,6 +398,17 @@ static LONG CALLBACK Fault(EXCEPTION_POINTERS* e) {
     unsigned i=Index(reinterpret_cast<void*>(r->ExceptionInformation[1]));
     bool writing=r->ExceptionInformation[0]==1;
     bool ok=false,live=true;
+    if(InterlockedCompareExchange(&throttle,0,0)) {
+        unsigned waited=0;bool counted=false;
+        while(waited<ThrottleMaxMs && InterlockedCompareExchange(&throttle,0,0)) {
+            bool wait;
+            {Guard g;wait=i<allocated && slots[i].active && !slots[i].section && !slots[i].restoring && stats.resident*SlotBytes>budget;}
+            if(!wait)break;
+            if(!counted){Guard g;++stats.throttleWaits;counted=true;}
+            Sleep(4);waited+=4;
+        }
+        if(waited){Guard g;stats.throttleMillis+=waited;}
+    }
     // A restore needs a section, and the OS refuses one when the commit charge
     // is at its limit. MEASURED 2026-09-17: during a commit-tight load a write
     // into an evicted tile found no section (failures=1) and the access
