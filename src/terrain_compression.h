@@ -24,6 +24,10 @@ static int g_terrainLazyZero=0;
 // The alignment pass's per-tile vectors go through the pager too (terrain_blocks.h).
 static int g_terrainBlocks=0;
 static volatile LONG64 g_blockAllocations=0, g_blockReleases=0, g_blockStray=0;
+// Diagnostics for the block detour: every call, calls of one-tile size, and
+// the first few distinct return addresses of those (logged once each).
+static volatile LONG64 g_blockCalls=0, g_blockSized=0, g_resultResizes=0;
+static volatile LONG64 g_blockCallers[8]={};
 // Ceiling on evictions per second outside loading and memory pressure
 // (0 = unlimited). The rate actually used adapts below it, see EvictRateStep.
 static int g_terrainEvictPerSec=4000, g_materialEvictPerSec=4000;
@@ -108,6 +112,7 @@ static void __fastcall TerrainCompressedResize(TerrainOwnedVector* v,size_t n) {
     // peak); a plain vector, released through the CRT free import that
     // terrain_blocks.h routes to the pager, so only with terrain_blocks on.
     auto ret=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    if(ret==g_terrainCompressionBase+0xaac4d9)InterlockedIncrement64(&g_resultResizes);
     bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) &&
         (ret==g_terrainCompressionBase+0x33ccaa || (g_terrainBlocks && ret==g_terrainCompressionBase+0xaac4d9));
     ResizeTerrainOwned(v,n,eligible);
@@ -304,12 +309,13 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld",
+            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld block_calls=%lld block_sized=%lld result_resizes=%lld",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
                 s.encodes,s.reusedEvictions,s.writeFaults,s.sharedClones,s.overflows,s.softBlocked,s.softRescues,s.cancelledEvictions,
                 s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited,rate.rate,s.evictOps?s.evictMicros/s.evictOps:0ull,s.lazyAllocations,s.throttleWaits,s.throttleMillis,
-                InterlockedCompareExchange64(&g_blockAllocations,0,0),InterlockedCompareExchange64(&g_blockReleases,0,0),InterlockedCompareExchange64(&g_blockStray,0,0));
+                InterlockedCompareExchange64(&g_blockAllocations,0,0),InterlockedCompareExchange64(&g_blockReleases,0,0),InterlockedCompareExchange64(&g_blockStray,0,0),
+                InterlockedCompareExchange64(&g_blockCalls,0,0),InterlockedCompareExchange64(&g_blockSized,0,0),InterlockedCompareExchange64(&g_resultResizes,0,0));
             if(g_terrainCowShare)H->log("terrain cow: copy_hook_calls=%lld unmanaged_src=%lld shared=%llu refused_not_slot=%llu refused_cold=%llu refused_packed=%llu refused_busy=%llu",
                 g_cowCopyCalls,g_cowCopyUnmanaged,s.sharedViews,
                 s.shareRefusedNotSlot,s.shareRefusedCold,s.shareRefusedPacked,s.shareRefusedBusy);
