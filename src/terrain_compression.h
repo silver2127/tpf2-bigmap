@@ -21,6 +21,8 @@ static int g_terrainDedupProbe=0;
 static int g_terrainDedup=0;
 // Fresh tiles start without a section (see TerrainPager::Allocate).
 static int g_terrainLazyZero=0;
+// The alignment pass's per-tile vectors go through the pager too (terrain_blocks.h).
+static int g_terrainBlocks=0;
 // Ceiling on evictions per second outside loading and memory pressure
 // (0 = unlimited). The rate actually used adapts below it, see EvictRateStep.
 static int g_terrainEvictPerSec=4000, g_materialEvictPerSec=4000;
@@ -99,8 +101,14 @@ static void ResizeTerrainOwned(TerrainOwnedVector* v,size_t n,bool eligible) {
     g_originalTerrainResize(v,n);
 }
 static void __fastcall TerrainCompressedResize(TerrainOwnedVector* v,size_t n) {
+    // 0x33ccaa: CTerrain::AddTile, the height cache itself. 0xaac4d9: the
+    // alignment result vector in ecs::TerrainAlignmentSystem::UpdateSubterrains
+    // (MEASURED 2026-09-17: 37,354 of them, 6.7 GiB, all alive at the load's
+    // peak); a plain vector, released through the CRT free import that
+    // terrain_blocks.h routes to the pager, so only with terrain_blocks on.
+    auto ret=reinterpret_cast<uintptr_t>(_ReturnAddress());
     bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) &&
-        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_terrainCompressionBase+0x33ccaa;
+        (ret==g_terrainCompressionBase+0x33ccaa || (g_terrainBlocks && ret==g_terrainCompressionBase+0xaac4d9));
     ResizeTerrainOwned(v,n,eligible);
 }
 static TerrainOwnedVector* CopyTerrainOwned(TerrainOwnedVector* dst,const TerrainOwnedVector* src,bool eligible) {
