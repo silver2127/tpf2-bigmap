@@ -82,6 +82,10 @@ if /i "%1"=="-decode-exp" (
     cl /nologo /O2 /MT /W3 /EHsc /FAs /Faout\decode_experiments.asm tools\decode_experiments.cpp /Fo:out\decode_experiments.obj /Fe:out\decode_experiments.exe || exit /b 1
     exit /b
 )
+if /i "%1"=="-alignbatch-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_alignment_batch.cpp /Fo:out\test_alignment_batch.obj /Fe:out\test_alignment_batch.exe || exit /b 1
+    exit /b
+)
 if /i "%1"=="-smallpager-test" (
     cl /nologo /O2 /MT /W3 /EHsc tools\test_small_pager.cpp /Fo:out\test_small_pager.obj /Fe:out\test_small_pager.exe || exit /b 1
     exit /b
