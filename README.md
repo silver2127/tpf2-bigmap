@@ -8,6 +8,8 @@ It supports large-map controls through 512 tiles per edge and six sparse density
 presets for towns and industries. Linux dev.3 adds opt-in lossless terrain RAM
 compression, faster saves and an exact SIMD terrain scan. Material compression,
 the remaining Windows speed optimizations and depth 12/13 are not yet included.
+The Windows minimap from `cdfee2a` is not yet available on native Linux;
+see the [integration evidence](docs/linux/PORT.md#minimap-integration-cdfee2a-partial).
 
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer

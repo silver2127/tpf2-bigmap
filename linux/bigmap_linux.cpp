@@ -207,6 +207,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     const bool sparse=enabled && H->cfgBool(Section,"newgame_density",1);
     if(sparse && !restored){H->log("density restore failed: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;}
     if(!enabled)return TPF2MP_ERR_DISABLED;
+    if(H->cfgBool(Section,"minimap",0))
+        H->log("minimap: unavailable on native Linux; image binding and terrain accessor are not verified (docs/linux/PORT.md)");
     const int depth=H->cfgInt(Section,"octree_depth",11);
     if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
     cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;

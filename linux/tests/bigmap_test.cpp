@@ -8,11 +8,12 @@ static std::map<std::string,int> config;
 static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
 static bool build=true;
+static bool minimapWarning=false;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
 static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
-static void Log(const char*,...){}
+static void Log(const char* format,...){if(std::strstr(format,"minimap: unavailable on native Linux"))minimapWarning=true;}
 static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
     if(mismatch)return 0;
     memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
@@ -25,7 +26,7 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){minimapWarning=false;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -48,6 +49,12 @@ int main(){
     Reset();config["octree_depth"]=13;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED && writes==0);
     Reset();mismatch=1;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && rows==9 && cap==512);
+    assert(!minimapWarning);
+    const int stockWrites=writes;const auto stockMemory=memory;
+    Reset();config["minimap"]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
+    assert(minimapWarning && writes==stockWrites && memory.size()==stockMemory.size());
+    // Near jump destinations vary because each initialization allocates a page.
+    for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
     assert(Size(6,0,nullptr)==Pack(96,96));
     assert(Size(7,0,nullptr)==Pack(128,128));
     assert(Size(15,0,nullptr)==Pack(510,510));
