@@ -29,7 +29,6 @@ using FreeFn = void(__cdecl*)(void*);
 static BlockCtorFn g_originalBlockCtor = nullptr;
 static FreeFn g_originalFree = nullptr;
 static uintptr_t g_blockBase = 0;
-static volatile LONG64 g_blockAllocations = 0, g_blockReleases = 0, g_blockStray = 0;
 static const uintptr_t kBlockCtorRva = 0x310230, kBlockCtorReturn = 0x3c4ba7, kFreeIatRva = 0x2f0b5b8;
 static const uint8_t kBlockCtorBytes[19] = {
     0x48, 0x89, 0x4c, 0x24, 0x08,                    // mov [rsp+8], rcx
@@ -42,7 +41,7 @@ static void __fastcall BlockCtorDetour(BlockVector* v, size_t n) {
         reinterpret_cast<uintptr_t>(_ReturnAddress()) == g_blockBase + kBlockCtorReturn) {
         if (auto p = TerrainPager::Allocate()) {
             *v = {p, p + n, p + n};
-            InterlockedIncrement64(&g_blockAllocations);
+            if (InterlockedIncrement64(&g_blockAllocations) == 1) H->log("terrain blocks: first alignment block routed to the pager");
             return;
         }
     }
