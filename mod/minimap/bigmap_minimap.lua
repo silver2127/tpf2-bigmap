@@ -383,6 +383,9 @@ local function readCompanyConfig()
     if localData then
         candidates[#candidates + 1] = dir(localData .. "/tpf2mp/data")
     end
+    local function unescape(s)
+        return (tostring(s):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+    end
     for i = 1, #candidates do
         local okOpen, f = pcall(io.open, candidates[i] .. "mp_company_cfg.txt", "r")
         if okOpen and f then
@@ -401,6 +404,31 @@ local function readCompanyConfig()
                 cfg.roster = {}
                 for id in lines[3]:gmatch("%d+") do
                     cfg.roster[#cfg.roster + 1] = tonumber(id)
+                end
+            end
+            -- The multiplayer mod's own map (mp_company_map.txt, since 0.5.8):
+            -- "me=<cid>", then "<cid>=<player entity>=<name>" per company. It is
+            -- the truth after switches, loads and in-game companies, where the
+            -- creation-order guess below is not.
+            local okMap, m = pcall(io.open, candidates[i] .. "mp_company_map.txt", "r")
+            if okMap and m then
+                local companyOf, names, me = {}, {}, nil
+                pcall(function()
+                    for line in m:lines() do
+                        local cid, pid, name = line:match("^(%d+)=(%d+)=(.*)$")
+                        if cid then
+                            companyOf[tonumber(pid)] = tonumber(cid)
+                            names[tonumber(cid)] = unescape(name)
+                        else
+                            me = tonumber(line:match("^me=(%d+)")) or me
+                        end
+                    end
+                end)
+                pcall(function() m:close() end)
+                if next(companyOf) then
+                    cfg.map, cfg.names = companyOf, names
+                    cfg.mode = "companies"
+                    if me then cfg.mine = me end
                 end
             end
             return cfg
@@ -440,8 +468,12 @@ local function describeOwners(owners)
     local mine
     pcall(function() mine = api.engine.util.getPlayer() end)
     local companyOf = {}
-    local companiesMode = cfg.mode == "companies" and cfg.mine and cfg.roster
-    if companiesMode then
+    local companiesMode = cfg.mode == "companies" and cfg.mine and (cfg.roster or cfg.map)
+    if cfg.map then
+        for pid, cid in pairs(cfg.map) do
+            companyOf[pid] = cid
+        end
+    elseif companiesMode then
         if mine then
             companyOf[mine] = cfg.mine
         end
@@ -485,7 +517,7 @@ local function describeOwners(owners)
         local r, g, b = companyColor(cid or rank[pid])
         local label
         if cid then
-            label = string.format(tr("Company %d"), cid)
+            label = (cfg.names and cfg.names[cid] and cfg.names[cid] ~= "") and cfg.names[cid] or string.format(tr("Company %d"), cid)
             if pid == mine then
                 label = label .. " " .. tr("(you)")
             end
