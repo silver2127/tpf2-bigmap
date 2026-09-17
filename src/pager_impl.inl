@@ -75,6 +75,7 @@ struct Stats {
     // became an uncompressed stock vector; the 131,072-slot cap hid exactly
     // this on 256x256+ maps, so it is counted and logged.
     uint64_t overflows;
+    uint64_t rateLimited;       // Tick passes cut short by the eviction rate limit
     uint64_t softBlocked;       // current soft-blocked resident slots
     uint64_t softRescues;       // faults satisfied by a protection change alone
     uint64_t cancelledEvictions;
@@ -90,7 +91,15 @@ struct Stats {
     // Content dedup: evictions that found an identical blob already stored and
     // shared it instead of encoding (hits), and index rebuilds (tombstone sweeps).
     uint64_t dedupHits, dedupRebuilds;
+    // Restores that had to wait for a section (the commit charge at its limit).
+    uint64_t restoreRetries, restoreGiveUps;
 };
+// Test hook: the next N section creations fail, as they do at the commit limit.
+static volatile LONG injectSectionFailures=0;
+static HANDLE NewSection() {
+    if(injectSectionFailures>0 && InterlockedDecrement(&injectSectionFailures)>=0)return nullptr;
+    return CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,DWORD(SlotBytes),nullptr);
+}
 using Alloc2=void*(WINAPI*)(HANDLE,void*,SIZE_T,ULONG,ULONG,void*,ULONG);
 using Map3=void*(WINAPI*)(HANDLE,HANDLE,void*,ULONG64,SIZE_T,ULONG,ULONG,void*,ULONG);
 using Unmap2=BOOL(WINAPI*)(HANDLE,void*,ULONG);
@@ -285,7 +294,7 @@ static bool Restore(unsigned i,bool writing=false) {
         s.blocked=false;ClearSoft(s);s.readOnly=protection==PAGE_READONLY;
         if(writing)DropPacked(s);return true;
     }
-    HANDLE section=CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,DWORD(SlotBytes),nullptr);
+    HANDLE section=NewSection();
     if(!section){++stats.failures;return false;}
     auto alias=static_cast<uint8_t*>(MapViewOfFile(section,FILE_MAP_ALL_ACCESS,0,0,SlotBytes));
     if(!alias){CloseHandle(section);++stats.failures;return false;}
@@ -310,7 +319,7 @@ static bool Restore(unsigned i,bool writing=false) {
 static bool RestoreUnlocked(unsigned i,Packed* source,bool writing) {
     if(!threadDecodeScratch)
         threadDecodeScratch=static_cast<PAGER_CODEC::DecodeScratch*>(VirtualAlloc(nullptr,sizeof(PAGER_CODEC::DecodeScratch),MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
-    HANDLE section=threadDecodeScratch?CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,DWORD(SlotBytes),nullptr):nullptr;
+    HANDLE section=threadDecodeScratch?NewSection():nullptr;
     auto alias=section?static_cast<uint8_t*>(MapViewOfFile(section,FILE_MAP_ALL_ACCESS,0,0,SlotBytes)):nullptr;
     bool decoded=alias && PAGER_CODEC::Decode(source->data,source->bytes,reinterpret_cast<Element*>(alias+Offset),*threadDecodeScratch);
     if(alias)*reinterpret_cast<void**>(alias+Offset-8)=Base(i);
@@ -334,28 +343,21 @@ static bool RestoreUnlocked(unsigned i,Packed* source,bool writing) {
     if(!ok){if(section)CloseHandle(section);++stats.failures;}
     return ok;
 }
-static LONG CALLBACK Fault(EXCEPTION_POINTERS* e) {
-    auto r=e->ExceptionRecord;
-    if(inFault || r->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || r->NumberParameters<2 ||
-       r->ExceptionInformation[0]>1 || !Contains(reinterpret_cast<void*>(r->ExceptionInformation[1])))
-        return EXCEPTION_CONTINUE_SEARCH;
-    // The original last-error value belongs to the interrupted engine code.
-    DWORD last=GetLastError();inFault=true;
-    bool ok=false;
-    unsigned i=Index(reinterpret_cast<void*>(r->ExceptionInformation[1]));
-    bool writing=r->ExceptionInformation[0]==1;
+// One restore attempt for a faulting slot. *live is cleared when the address
+// is not a live allocation of ours (nothing to restore, no retry).
+static bool FaultRestore(unsigned i,bool writing,bool* live) {
     for(;;) {
         Packed* source=nullptr;
         {
             Guard g;
-            if(i>=allocated || !slots[i].active)break;
+            if(i>=allocated || !slots[i].active){*live=false;return false;}
             auto& s=slots[i];
             if(!s.restoring) {
                 if(s.section || !s.packed) {
                     // Protection change, remap or a fresh zero section: cheap, locked.
-                    ok=Restore(i,writing);
+                    bool ok=Restore(i,writing);
                     if(ok){++stats.faults;if(writing)++stats.writeFaults;s.touched=GetTickCount64();}
-                    break;
+                    return ok;
                 }
                 // Cold: decode without holding the pool lock. Other threads that
                 // fault on this slot wait for it; other slots proceed in parallel.
@@ -363,9 +365,32 @@ static LONG CALLBACK Fault(EXCEPTION_POINTERS* e) {
             }
         }
         if(!source){SwitchToThread();continue;}
-        ok=RestoreUnlocked(i,source,writing);
-        break;
+        return RestoreUnlocked(i,source,writing);
     }
+}
+static LONG CALLBACK Fault(EXCEPTION_POINTERS* e) {
+    auto r=e->ExceptionRecord;
+    if(inFault || r->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || r->NumberParameters<2 ||
+       r->ExceptionInformation[0]>1 || !Contains(reinterpret_cast<void*>(r->ExceptionInformation[1])))
+        return EXCEPTION_CONTINUE_SEARCH;
+    // The original last-error value belongs to the interrupted engine code.
+    DWORD last=GetLastError();inFault=true;
+    unsigned i=Index(reinterpret_cast<void*>(r->ExceptionInformation[1]));
+    bool writing=r->ExceptionInformation[0]==1;
+    bool ok=false,live=true;
+    // A restore needs a section, and the OS refuses one when the commit charge
+    // is at its limit. MEASURED 2026-09-17: during a commit-tight load a write
+    // into an evicted tile found no section (failures=1) and the access
+    // violation went back to the engine as a crash. The eviction threads are
+    // freeing sections at exactly that moment, so wait for them: retry for up
+    // to ~2 s before giving the fault back.
+    for(unsigned attempt=0;live;++attempt) {
+        ok=FaultRestore(i,writing,&live);
+        if(ok||!live||attempt>=500)break;
+        {Guard g;++stats.restoreRetries;}
+        Sleep(4);
+    }
+    if(!ok && live){Guard g;++stats.restoreGiveUps;}
     inFault=false;SetLastError(last);
     return ok?EXCEPTION_CONTINUE_EXECUTION:EXCEPTION_CONTINUE_SEARCH;
 }
@@ -632,6 +657,18 @@ static bool Evict(unsigned i,bool force=false,uint64_t minAge=MinAgeMs) {
 }
 static Stats Snapshot(){Guard g;return stats;}
 static void SetBudget(size_t bytes){Guard g;budget=bytes;}
+// Eviction rate limit (per second, 0 = none) for the quiet case: no loading
+// burst, no memory pressure. MEASURED 2026-09-17: draining a loaded world's
+// allowance evicted ~3,100 material cells and up to ~6,700 terrain tiles per
+// second; every eviction is a VirtualProtect, an encode and an unmap, and at
+// that rate the game stutters even though the work is on background threads
+// (the 2026-09-15 note measured the same at ~3,000 cycles/s). Pressure (over
+// three times the budget, which a commit-tight back-off produces) and loading
+// keep the old unlimited behaviour. Soft blocks count too: they are a
+// protection change each and become evictions a few seconds later.
+static unsigned evictPerSecond=0;
+static uint64_t rateWindow=0;static unsigned rateCount=0;
+static void SetEvictRate(unsigned perSecond){Guard g;evictPerSecond=perSecond;}
 // Turn content dedup on (before or after allocations; blobs stored earlier are
 // indexed by the next rebuild). 32 MiB of demand-zero address space.
 static bool EnableDedup() {
@@ -737,24 +774,30 @@ static void Tick(unsigned attempts=0) {
     LARGE_INTEGER frequency{},start{},now{};
     QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&start);
     for(unsigned n=0;n<limit;++n) {
-        unsigned i;bool loading,pressure,ripe=false,excess=false;
+        unsigned i;bool loading,pressure,ripe=false,excess=false,limited;
         {
             Guard g;
             size_t budgetSlots=budget/SlotBytes;
             if(!allocated||stats.resident<=budgetSlots)return;
-            if(cursor>=allocated)cursor=0;
-            i=cursor++;
             // Loading: within 15 s of a burst of allocations the second-chance
             // delay (and the full minimum age) would only raise the peak.
-            loading=stats.lastBulkAllocation && GetTickCount64()-stats.lastBulkAllocation<15000;
+            uint64_t tick=GetTickCount64();
+            loading=stats.lastBulkAllocation && tick-stats.lastBulkAllocation<15000;
             pressure=stats.resident>3*budgetSlots;
+            if(tick-rateWindow>=1000){rateWindow=tick;rateCount=0;}
+            limited=evictPerSecond && !loading && !pressure;
+            if(limited && rateCount>=evictPerSecond){++stats.rateLimited;return;}
+            if(cursor>=allocated)cursor=0;
+            i=cursor++;
             auto& s=slots[i];
-            ripe=s.soft && !s.evicting && GetTickCount64()-s.blockedAt>=SoftDelayMs;
+            ripe=s.soft && !s.evicting && tick-s.blockedAt>=SoftDelayMs;
             excess=stats.resident-stats.softBlocked>budgetSlots;
         }
-        if(loading)Evict(i,false,LoadingMinAgeMs);
-        else if(pressure||ripe)Evict(i);
-        else if(excess)SoftBlock(i);
+        bool did=false;
+        if(loading)did=Evict(i,false,LoadingMinAgeMs);
+        else if(pressure||ripe)did=Evict(i);
+        else if(excess)did=SoftBlock(i);
+        if(did && limited){Guard g;++rateCount;}
         if(!attempts && (n&15)==15) {
             QueryPerformanceCounter(&now);
             if((now.QuadPart-start.QuadPart)*25>frequency.QuadPart)return;

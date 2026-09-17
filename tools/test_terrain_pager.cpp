@@ -379,6 +379,51 @@ int main(int argc,char** argv) {
         auto sd=Snapshot();assert(sd.live==0 && sd.compressedBytes==0 && sd.failures==base.failures);
         printf("content dedup: hits=%llu encodes=%llu rebuilds=%llu\n",sd.dedupHits-base.dedupHits,sd.encodes-base.encodes,sd.dedupRebuilds);
     }
+    // No section at the commit limit: a restore waits for one instead of
+    // handing the access violation back to the engine.
+    {
+        auto base=Snapshot();
+        std::vector<uint16_t> pat(Samples);
+        for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k%1000+20000);
+        auto a=Allocate();assert(a);memcpy(a,pat.data(),Bytes);
+        assert(Evict(Index(a),true));
+        InterlockedExchange(&injectSectionFailures,3);
+        assert(memcmp(a,pat.data(),Bytes)==0);                  // cold read: three refusals, then a section
+        auto s1=Snapshot();
+        assert(s1.restoreRetries==base.restoreRetries+3 && s1.failures==base.failures+3 && s1.restoreGiveUps==base.restoreGiveUps);
+        assert(Evict(Index(a),true));
+        InterlockedExchange(&injectSectionFailures,2);
+        a[7]=0x4242;                                              // cold write, same wait
+        assert(a[7]==0x4242 && a[8]==pat[8]);
+        assert(Snapshot().restoreRetries==s1.restoreRetries+2);
+        assert(injectSectionFailures==0);
+        assert(Release(a));
+        printf("restore retry: retries=%llu giveups=%llu\n",Snapshot().restoreRetries-base.restoreRetries,Snapshot().restoreGiveUps);
+        {Guard g;stats.failures=base.failures;}   // the injected refusals are not pager failures
+    }
+    // Eviction rate limit: outside loading and pressure a Tick pass stops at
+    // the per-second allowance; pressure (over three times the budget) ignores it.
+    {
+        std::vector<uint16_t*> t(16);
+        for(auto& x:t){x=Allocate();assert(x);}
+        SetBudget(8*SlotBytes);                        // 16 resident, 8 allowed: excess 8, no pressure
+        {Guard g;auto now=GetTickCount64();stats.lastBulkAllocation=0;for(auto x:t)slots[Index(x)].touched=now-6000;rateWindow=0;}
+        SetEvictRate(3);
+        auto b=Snapshot();
+        Tick();                                        // soft-blocks count against the allowance
+        auto s1=Snapshot();assert(s1.softBlocked==3 && s1.rateLimited==b.rateLimited+1);
+        Tick();assert(Snapshot().softBlocked==3);      // same second: nothing more
+        {Guard g;rateWindow=GetTickCount64()-1001;}    // next second
+        Tick();assert(Snapshot().softBlocked==6);
+        SetBudget(4*SlotBytes);                        // 16 > 12: pressure, unlimited
+        {Guard g;rateWindow=GetTickCount64()-1001;}
+        // Pressure encodes straight down to three times the budget (12) with no
+        // allowance, then the rest is only second-chanced, as without a limit.
+        Tick();assert(Snapshot().resident==12 && Snapshot().softBlocked==8);
+        SetEvictRate(0);
+        for(auto x:t)assert(Release(x));
+        printf("evict rate: limited passes=%llu\n",Snapshot().rateLimited-b.rateLimited);
+    }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
     DWORD beforeHandles=0,afterHandles=0;
