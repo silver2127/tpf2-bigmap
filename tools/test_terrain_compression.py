@@ -62,9 +62,15 @@ def main():
                       ((500,400,400,500,64*G),628)]:        # small budgets grow by the 128 MiB minimum
         assert steady(*args)==want,(args,steady(*args),want)
     # Adaptive eviction rate: cost cap (a quarter core), stall halving, quiet growth.
-    step=dll.BigmapTestEvictRateStep;step.argtypes=[C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.c_uint64,C.c_uint,C.c_int,C.c_uint];step.restype=C.c_uint
-    def run(rate,quiet,avg,stalls,ui,ceil):
-        r,q=C.c_uint(rate),C.c_uint(quiet);out=step(C.byref(r),C.byref(q),avg,stalls,ui,ceil);return out,r.value,q.value
+    step=dll.BigmapTestEvictRateStep;step.argtypes=[C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.POINTER(C.c_uint64),C.c_uint64,C.c_uint,C.c_int,C.c_uint];step.restype=C.c_uint
+    def run(rate,quiet,avg,stalls,ui,ceil,cost=0):
+        r,q,k=C.c_uint(rate),C.c_uint(quiet),C.c_uint64(cost);out=step(C.byref(r),C.byref(q),C.byref(k),avg,stalls,ui,ceil);return out,r.value,q.value
+    def cost_after(cost,avg):
+        r,q,k=C.c_uint(1000),C.c_uint(0),C.c_uint64(cost);step(C.byref(r),C.byref(q),C.byref(k),avg,0,1,4000);return k.value
+    assert cost_after(0,400)==400                      # first measurement is taken whole
+    assert cost_after(400,800)==500                    # then three parts old, one new
+    assert cost_after(400,0)==400                      # a second without evictions keeps it
+    assert run(4000,9,0,0,1,4000,cost=400)==(625,625,10)   # ... and the remembered cost still caps
     assert run(0,0,0,0,1,4000)==(1000,1000,1)          # first second: starts at 1000
     assert run(0,0,0,0,1,600)==(600,600,1)             # ... or at the ceiling if lower
     assert run(1000,0,400,0,1,4000)==(625,625,1)       # 400 us each: 250 ms/s allows 625
