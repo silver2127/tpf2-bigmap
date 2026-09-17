@@ -19,12 +19,24 @@
 //   grid + 0x08 int32 nx        (record columns)
 //   grid + 0x0c int32 ny        (record rows)
 //   grid + 0x10 void* records   (nx*ny records, 40 bytes each)
-//   record + 0x00 int32 entity  (< 0 == no tile)
-//   record + 0x08 {uint16* first, * last, * end}   the height cache vector
+//   record + 0x00 int32 entity  (the tile entity id AddTile stored; not a liveness flag)
+//   record + 0x08 void* control (shared block; nullptr == no tile)
+//   control + 0x10 {uint16* first, * last, * end}   the height cache vector
 //   record + 0x20 int32 version
 //
-// A tile is eligible when its vector holds exactly Side*Side samples (66,049
-// for the 1 m cache). Each is compressed with the block codec. The file is
+// record+8 is NOT the vector: it points at a control block shared between the
+// two CTerrain versions, and the std::vector<uint16_t> sits at control+0x10.
+// AddTile (0x33cb60) at 0x33cc90 does `lea rcx,[record+8]; call 0x33dd20`
+// (detach/make-writable, returns the vector = control+0x10) then resize to
+// Side*Side. A tile is eligible when its control block exists and that vector
+// holds exactly Side*Side samples (66,049 for the 1 m cache).
+//
+// ApplyTile WRITES the vector. It is called only from the pass owner's AddTile
+// post-hook, i.e. straight after AddTile has already detached (0x33dd20) and
+// resized the block, so the vector is private and writable and ApplyTile needs
+// no engine call. Its `first` may point into the terrain pager's arena; the
+// Decode write faults it in as usual. Each is compressed with the block codec.
+// The file is
 // keyed to the save by a caller-supplied 64-bit fingerprint (the .sav hash);
 // Apply refuses a file whose fingerprint or grid dimensions do not match, so a
 // foreign, stale or plugin-less save is never touched.
@@ -86,8 +98,13 @@ inline long IndexOfRecord(const Grid& g, const uint8_t* record) {
 }
 inline Grid GridOf(void* cterrain) { return Grid{*reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(cterrain) + 0x18)}; }
 struct TileVector { uint16_t* first; uint16_t* last; uint16_t* end; };
-inline TileVector* VectorOf(uint8_t* record) { return reinterpret_cast<TileVector*>(record + 8); }
-inline bool Eligible(const TileVector* v) { return v->first && size_t(v->last - v->first) == Samples; }
+// record+8 -> control block; the vector is at control+0x10. nullptr control
+// (no tile) yields a null vector, which Eligible rejects.
+inline TileVector* VectorOf(uint8_t* record) {
+    uint8_t* control = *reinterpret_cast<uint8_t**>(record + 8);
+    return control ? reinterpret_cast<TileVector*>(control + 0x10) : nullptr;
+}
+inline bool Eligible(const TileVector* v) { return v && v->first && size_t(v->last - v->first) == Samples; }
 
 inline uint64_t MixHash(uint64_t h, uint64_t x) {
     h ^= x + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
