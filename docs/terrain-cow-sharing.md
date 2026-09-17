@@ -150,8 +150,24 @@ allowance keeps it. Freeing it early would mean evicting twins regardless of
 budget, which needs a hash per candidate and re-decodes if the engine reads
 the released version; not built.
 
-Not yet measured in the game: hit count and load time with `terrain_dedup=1`
-(the 30 s `terrain compression:` line reports `dedup_hits=`).
+**Measured in the game (September 17, `LONGMAPSAVE`, 103,680 tiles per
+version, 207,360 live during the load, 94 GiB machine with the commit charge at
+its limit for most of the load):**
+
+| point | evictions | real encodes | reused (blob kept) | dedup hits |
+|---|---|---|---|---|
+| mid-load, 207,360 live, dedup ON | 165,646 | 13,732 | 0 | 151,928 |
+| same map, same point, dedup OFF (16:38 run) | 135,637 | 135,637 | 0 | - |
+| load complete, 103,680 live, dedup ON | 498,951 | 104,780 | 130,993 | 263,192 |
+
+Over the whole load only 21% of evictions encoded anything; 53% shared a blob
+that already existed. Early in the load most hits are the still-unfilled
+zero tiles the loading policy evicts (one blob for all of them); later they are
+the second twins. `failures=0`, `dedup_rebuilds=0`. Load time was not timed on
+this run (the load ran with `commit_tight=1` flapping the resident target
+between 256 MiB and 8 GiB every second, which dominates it; that back-off is
+older than this change). Compressed bytes at the end: 1,093 MiB for 45,402 cold
+tiles.
 
 ## 1. What the engine actually does (DERIVED from the machine code)
 
