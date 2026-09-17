@@ -77,6 +77,7 @@ struct Stats {
     uint64_t overflows;
     uint64_t rateLimited;       // Tick passes cut short by the eviction rate limit
     uint64_t evictMicros, evictOps;   // wall time of every eviction and soft block, for the adaptive rate
+    uint64_t lazyAllocations;         // allocations handed out as cold slots on the zero blob (no section yet)
     uint64_t softBlocked;       // current soft-blocked resident slots
     uint64_t softRescues;       // faults satisfied by a protection change alone
     uint64_t cancelledEvictions;
@@ -119,6 +120,10 @@ static unsigned windowAllocations;
 static PAGER_CODEC::DecodeScratch* decodeScratch;   // restores run under the lock
 static HANDLE packHeap;
 static bool ready=false;
+// Lazy zero allocations: the canonical all-zero blob (one reference held by
+// the pager for its lifetime) and the switch; see Allocate.
+static Packed* zeroBlob=nullptr;
+static bool lazyZero=false;
 static thread_local bool inFault=false;
 // Each evicting thread encodes with its own scratch, allocated on first use.
 static thread_local PAGER_CODEC::EncodeScratch* threadEncodeScratch=nullptr;
@@ -300,7 +305,7 @@ static bool Restore(unsigned i,bool writing=false) {
     auto alias=static_cast<uint8_t*>(MapViewOfFile(section,FILE_MAP_ALL_ACCESS,0,0,SlotBytes));
     if(!alias){CloseHandle(section);++stats.failures;return false;}
     bool ok=true;
-    if(s.packed)
+    if(s.packed && s.packed!=zeroBlob)   // a fresh section is already all zero
         ok=PAGER_CODEC::Decode(s.packed->data,s.packed->bytes,reinterpret_cast<Element*>(alias+Offset),*decodeScratch);
     // Match the stock MSVC large-allocation header. Normally only our destroy
     // and resize hooks consume this allocation; keeping the header aids audit.
@@ -322,7 +327,7 @@ static bool RestoreUnlocked(unsigned i,Packed* source,bool writing) {
         threadDecodeScratch=static_cast<PAGER_CODEC::DecodeScratch*>(VirtualAlloc(nullptr,sizeof(PAGER_CODEC::DecodeScratch),MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
     HANDLE section=threadDecodeScratch?NewSection():nullptr;
     auto alias=section?static_cast<uint8_t*>(MapViewOfFile(section,FILE_MAP_ALL_ACCESS,0,0,SlotBytes)):nullptr;
-    bool decoded=alias && PAGER_CODEC::Decode(source->data,source->bytes,reinterpret_cast<Element*>(alias+Offset),*threadDecodeScratch);
+    bool decoded=alias && (source==zeroBlob || PAGER_CODEC::Decode(source->data,source->bytes,reinterpret_cast<Element*>(alias+Offset),*threadDecodeScratch));
     if(alias)*reinterpret_cast<void**>(alias+Offset-8)=Base(i);
     Guard g;
     auto& s=slots[i];
@@ -446,9 +451,23 @@ static void FreeSlot(unsigned i) {
     unsigned generation=slots[i].generation+1;
     slots[i]={};slots[i].generation=generation;slots[i].shareNext=i;slots[i].next=freeHead;freeHead=i;
 }
+// Lazy zero allocations (MEASURED 2026-09-17, 103,680-tile save load): the
+// engine allocates every tile of both versions first, all zero, and fills them
+// over the next 20-30 s; at one probe 112,678 of 131,072 live tiles were still
+// zero. A section per allocation committed up to 27 GiB before any terrain
+// existed, faster than eviction could shed it, and the commit charge hit the
+// limit. With lazyZero a fresh allocation is a cold slot on the shared zero
+// blob: no section, no commit, until the first touch creates one (a write
+// gets a private zero section, a read a read-only one on the blob). Nothing
+// else changes: the address is fixed, the restore path is the ordinary cold
+// restore, and the blob is never freed (the pager holds one reference).
 static Element* Allocate() {
     if(!ready)return nullptr;
     Guard g;unsigned i=NewSlot();if(i==MaxSlots)return nullptr;
+    if(lazyZero && zeroBlob) {
+        slots[i].packed=zeroBlob;++zeroBlob->refs;++stats.lazyAllocations;
+        return reinterpret_cast<Element*>(Base(i)+Offset);
+    }
     if(!Restore(i,true)){FreeSlot(i);--stats.live;return nullptr;}
     return reinterpret_cast<Element*>(Base(i)+Offset);
 }
@@ -679,6 +698,28 @@ static void SetEvictRate(unsigned perSecond){Guard g;evictPerSecond=perSecond;}
 static void SetUrgent(bool on){Guard g;urgent=on;}
 // Turn content dedup on (before or after allocations; blobs stored earlier are
 // indexed by the next rebuild). 32 MiB of demand-zero address space.
+// Encode the canonical zero allocation once and hand it to Allocate. Needs
+// this thread's encode scratch (allocated on first use, as for evictors).
+static bool EnableLazyZero() {
+    Guard g;
+    if(zeroBlob){lazyZero=true;return true;}
+    if(!EnsureThreadScratch())return false;
+    auto zero=static_cast<Element*>(VirtualAlloc(nullptr,Bytes,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    if(!zero)return false;
+    size_t count=PAGER_CODEC::Encode(zero,threadPackedScratch,PackLimit,*threadEncodeScratch);
+    Packed* p=count?static_cast<Packed*>(HeapAlloc(packHeap,0,PackedSize(unsigned(count)))):nullptr;
+    if(p) {
+        p->refs=1;p->bytes=unsigned(count);p->h1=PAGER_CODEC::Hash(zero);p->h2=Hash2(zero);
+        SIZE_T usable=HeapSize(packHeap,0,p);p->commit=(usable==SIZE_T(-1)?PackedSize(unsigned(count)):usable)+16;
+        memcpy(p->data,threadPackedScratch,count);
+        stats.compressedBytes+=count;stats.compressedCommit+=p->commit;
+        DedupInsert(p);   // evictions of untouched zero tiles share it too
+    }
+    VirtualFree(zero,0,MEM_RELEASE);
+    zeroBlob=p;lazyZero=p!=nullptr;
+    return lazyZero;
+}
+static void SetLazyZero(bool on){Guard g;lazyZero=on&&zeroBlob;}
 static bool EnableDedup() {
     Guard g;
     if(dedupTable)return true;

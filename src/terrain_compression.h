@@ -19,6 +19,8 @@ static int g_terrainDedupProbe=0;
 // of encoding (see pager_impl.inl). Measured need: the two CTerrain versions of
 // a save load are byte-identical tile for tile.
 static int g_terrainDedup=0;
+// Fresh tiles start without a section (see TerrainPager::Allocate).
+static int g_terrainLazyZero=0;
 // Ceiling on evictions per second outside loading and memory pressure
 // (0 = unlimited). The rate actually used adapts below it, see EvictRateStep.
 static int g_terrainEvictPerSec=4000, g_materialEvictPerSec=4000;
@@ -292,11 +294,11 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu",
+            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
                 s.encodes,s.reusedEvictions,s.writeFaults,s.sharedClones,s.overflows,s.softBlocked,s.softRescues,s.cancelledEvictions,
-                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited,rate.rate,s.evictOps?s.evictMicros/s.evictOps:0ull);
+                s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited,rate.rate,s.evictOps?s.evictMicros/s.evictOps:0ull,s.lazyAllocations);
             if(g_terrainCowShare)H->log("terrain cow: copy_hook_calls=%lld unmanaged_src=%lld shared=%llu refused_not_slot=%llu refused_cold=%llu refused_packed=%llu refused_busy=%llu",
                 g_cowCopyCalls,g_cowCopyUnmanaged,s.sharedViews,
                 s.shareRefusedNotSlot,s.shareRefusedCold,s.shareRefusedPacked,s.shareRefusedBusy);
@@ -333,6 +335,7 @@ static bool InstallTerrainCompression() {
     }
     TerrainPager::SetEvictRate(g_terrainEvictPerSec<0?0:unsigned(g_terrainEvictPerSec));
     if(g_terrainDedup && !TerrainPager::EnableDedup()){H->log("terrain compression: dedup index allocation failed; dedup OFF");g_terrainDedup=0;}
+    if(g_terrainLazyZero && !TerrainPager::EnableLazyZero()){H->log("terrain compression: zero blob encode failed; lazy zero OFF");g_terrainLazyZero=0;}
     g_terrainCompressionBase=H->moduleBase();
     // Destruction first; allocation remains disabled until EVERY hook and the
     // worker succeed. Partial installation cannot create managed allocations.
@@ -347,7 +350,7 @@ static bool InstallTerrainCompression() {
     for(unsigned n=PagerHelperThreads();n--;)
         if(HANDLE helperThread=CreateThread(nullptr,0,TerrainEvictionHelper,nullptr,0,nullptr)){SetThreadPriority(helperThread,THREAD_PRIORITY_BELOW_NORMAL);CloseHandle(helperThread);}
     InterlockedExchange(&g_terrainCompressActive,1);
-    H->log("terrain compression: lossless 1 m cache enabled, %d MiB resident target, cow_share=%d dedup=%d dedup_probe=%d; restart to disable",g_terrainHotMB,g_terrainCowShare,g_terrainDedup,g_terrainDedupProbe);
+    H->log("terrain compression: lossless 1 m cache enabled, %d MiB resident target, cow_share=%d dedup=%d lazy_zero=%d dedup_probe=%d; restart to disable",g_terrainHotMB,g_terrainCowShare,g_terrainDedup,g_terrainLazyZero,g_terrainDedupProbe);
     return true;
 }
 

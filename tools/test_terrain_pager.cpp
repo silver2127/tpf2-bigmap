@@ -430,6 +430,36 @@ int main(int argc,char** argv) {
         auto se=Snapshot();assert(se.evictOps>b.evictOps && se.evictMicros>b.evictMicros);   // every eviction and soft block is timed
         printf("evict rate: limited passes=%llu, %llu us per eviction\n",se.rateLimited-b.rateLimited,se.evictMicros/se.evictOps);
     }
+    // Lazy zero allocations: no section until the first touch; a read gets a
+    // read-only zero section on the shared blob, a write a private one; an
+    // untouched slot releases without ever having had a section.
+    {
+        assert(EnableLazyZero());
+        auto base=Snapshot();
+        auto a=Allocate();assert(a);
+        auto s1=Snapshot();assert(s1.resident==base.resident && s1.live==base.live+1 && s1.lazyAllocations==base.lazyAllocations+1);
+        {Guard g;assert(slots[Index(a)].packed==zeroBlob && !slots[Index(a)].section);}
+        for(size_t k=0;k<Samples;k+=257)assert(a[k]==0);           // read: section appears, still on the blob
+        assert(Snapshot().resident==base.resident+1);
+        {Guard g;assert(slots[Index(a)].packed==zeroBlob && slots[Index(a)].readOnly);}
+        a[5]=1234;assert(a[5]==1234 && a[6]==0);                    // write: private
+        {Guard g;assert(!slots[Index(a)].packed);}
+        assert(Evict(Index(a),true));assert(a[5]==1234);            // ordinary from here
+        assert(Release(a));
+        auto b=Allocate();assert(b);assert(Release(b));            // never touched: no section, no failure
+        auto c=Allocate();assert(c);c[0]=7;assert(c[0]==7 && c[Samples-1]==0);   // write first
+        assert(Snapshot().resident==base.resident+1);assert(Release(c));
+        // An untouched tile evicted... cannot be: not resident. A touched-but-
+        // still-zero tile evicts as a dedup hit on the blob.
+        auto d=Allocate();assert(d);assert(d[0]==0);
+        auto s2=Snapshot();assert(Evict(Index(d),true));
+        assert(Snapshot().reusedEvictions==s2.reusedEvictions+1);   // read-only on the blob: reused, no encode
+        assert(d[1]==0);assert(Release(d));
+        SetLazyZero(false);
+        auto e=Allocate();assert(e);assert(Snapshot().resident==base.resident+1);assert(Release(e));
+        auto sd=Snapshot();assert(sd.live==base.live && sd.resident==base.resident && sd.failures==base.failures);
+        printf("lazy zero: %llu lazy allocations\n",sd.lazyAllocations-base.lazyAllocations);
+    }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
     DWORD beforeHandles=0,afterHandles=0;
@@ -439,7 +469,8 @@ int main(int argc,char** argv) {
     for(auto t:many){Evict(Index(t),true);assert(memcmp(t,expected.data(),Bytes)==0);Evict(Index(t),true);}
     for(auto t:many)assert(Release(t));
     GetProcessHandleCount(GetCurrentProcess(),&afterHandles);assert(beforeHandles==afterHandles);
-    auto s=Snapshot();assert(s.live==0&&s.resident==0&&s.compressedBytes==0&&s.compressedCommit==0&&s.failures==0);
+    // The zero blob stays for the pager's lifetime; everything else is gone.
+    auto s=Snapshot();assert(s.live==0&&s.resident==0&&s.compressedBytes==zeroBlob->bytes&&s.compressedCommit==zeroBlob->commit&&s.failures==0);
     printf("PASS: exact roundtrips, write faults, address reuse, incompressible fallback, "
            "%u concurrent writes; faults=%llu evictions=%llu failures=%llu\n",
            Threads*Iterations,s.faults,s.evictions,s.failures);
