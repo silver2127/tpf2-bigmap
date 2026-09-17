@@ -198,6 +198,7 @@ static bool g_octreeOn = true;
 #include "terrain_align_fast.h"
 #include "terrain_cache.h"
 #include "terrain_compression.h"
+#include "terrain_blocks.h"
 #include "material_compression.h"
 #include "save_fast.h"
 #include "travel_time.h"
@@ -1236,6 +1237,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainDedupProbe = H->cfgBool("tpf2_bigmap", "terrain_dedup_probe", 0) != 0;
     g_terrainDedup = H->cfgBool("tpf2_bigmap", "terrain_dedup", 0) != 0;
     g_terrainLazyZero = H->cfgBool("tpf2_bigmap", "terrain_lazy_zero", 1) != 0;
+    g_terrainBlocks = H->cfgBool("tpf2_bigmap", "terrain_blocks", 1) != 0;
     g_terrainEvictPerSec = H->cfgInt("tpf2_bigmap", "terrain_cache_evict_per_s", 4000);
     g_materialEvictPerSec = H->cfgInt("tpf2_bigmap", "material_cache_evict_per_s", 4000);
     g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
@@ -1357,6 +1359,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallTerrainAlignFast();
     installed += InstallTerrainCache();
     installed += InstallTerrainCompression();
+    installed += InstallTerrainBlocks();
     installed += InstallMaterialCompression();
     installed += InstallSaveFast();
     installed += InstallTravelTime();
