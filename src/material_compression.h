@@ -112,7 +112,7 @@ static DWORD WINAPI MaterialEvictionHelper(void*) {
 }
 static DWORD WINAPI MaterialCompressionWorker(void*) {
     uint64_t lastLog=GetTickCount64(),lastPolicy=0;int effectiveMB=g_materialHotMB;
-    uint64_t lastDecodes=0;
+    uint64_t lastDecodes=0,lastEvictMicros=0,lastEvictOps=0,lastRateLog=0;EvictRateState rate{};
     for(;;) {
         Sleep(25);
         if(!InterlockedCompareExchange(&g_materialCompressActive,0,0))continue;
@@ -147,6 +147,18 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             MaterialPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d)",effectiveMB,next,int(busy),int(bulk),int(commitTight));
             effectiveMB=next;
+            // Adaptive eviction rate: this pager's own cost, the terrain worker's
+            // frame-stall count (one meter for the process).
+            uint64_t ops=s.evictOps-lastEvictOps,micros=s.evictMicros-lastEvictMicros;lastEvictOps=s.evictOps;lastEvictMicros=s.evictMicros;
+            unsigned stalls=unsigned(InterlockedCompareExchange(&g_uiStallsLastSec,0,0));
+            bool uiSignal=GetModuleHandleW(L"tpf2_menu.dll")!=nullptr;
+            unsigned before=rate.rate;
+            unsigned perSec=EvictRateStep(&rate,ops?micros/ops:0,stalls,uiSignal,g_materialEvictPerSec<0?0:unsigned(g_materialEvictPerSec));
+            MaterialPager::SetEvictRate(perSec);
+            if(perSec && perSec<before && stalls && now-lastRateLog>=10000) {
+                lastRateLog=now;
+                H->log("material compression: %u frame stall(s) >= 60 ms, eviction rate %u -> %u/s (last second: %llu evictions, %llu us each)",stalls,before,perSec,ops,ops?micros/ops:0ull);
+            }
         }
         MaterialPager::Tick();
         if(now-lastLog>=30000) {

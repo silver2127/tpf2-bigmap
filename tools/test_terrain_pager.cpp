@@ -427,7 +427,8 @@ int main(int argc,char** argv) {
         SetUrgent(false);
         SetEvictRate(0);
         for(auto x:t)assert(Release(x));
-        printf("evict rate: limited passes=%llu\n",Snapshot().rateLimited-b.rateLimited);
+        auto se=Snapshot();assert(se.evictOps>b.evictOps && se.evictMicros>b.evictMicros);   // every eviction and soft block is timed
+        printf("evict rate: limited passes=%llu, %llu us per eviction\n",se.rateLimited-b.rateLimited,se.evictMicros/se.evictOps);
     }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
