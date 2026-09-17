@@ -45,6 +45,20 @@ def main():
                       ((1024,4096,1,1,(4*G)-1,8000),1024),     # below the gate: hot
                       ((3072,4096,1,0,64*G,0),4096)]:          # no live size: warm only
         assert live(*args)==want,(args,live(*args),want)
+    # Steady state after a load: ramp down instead of snapping, hold or grow
+    # while the engine faults evicted tiles back in, cap by what is free.
+    steady=dll.BigmapTestTerrainBudgetSteady;steady.argtypes=[C.c_int]*3+[C.c_uint64,C.c_uint64]
+    for args,want in [((13365,3195,3195,0,64*G),12530),     # quiet: down by 1/16 per second
+                      ((300,256,256,0,64*G),256),           # the floor is the policy's own target
+                      ((8000,3195,3195,150,64*G),8000),     # 100..299 cold restores/s: hold
+                      ((8000,3195,3195,500,64*G),9000),     # >= 300/s: grow by 1/8
+                      ((600,3195,3195,500,64*G),3195),      # never below the floor
+                      ((8000,3195,3195,500,8*G),6267),      # 8 GiB free: 2 GiB reserve, half of 6 GiB on top of hot
+                      ((8000,3195,3195,0,8*G),6267),        # the ceiling also pulls a quiet ramp down faster
+                      ((65000,3195,3195,500,400*G),65536),  # absolute clamp
+                      ((3195,3195,3195,500,64*G),3594),     # from the floor: +1/8, at least 128
+                      ((500,400,400,500,64*G),628)]:        # small budgets grow by the 128 MiB minimum
+        assert steady(*args)==want,(args,steady(*args),want)
     assert dll.BigmapTestCompressionInit()
     resize=dll.BigmapTestCompressionResize;resize.argtypes=[C.POINTER(Vec),C.c_size_t,C.c_int,Resize]
     copy=dll.BigmapTestCompressionCopy;copy.argtypes=[C.POINTER(Vec),C.POINTER(Vec),C.c_int,Copy];copy.restype=C.c_void_p
