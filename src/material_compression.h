@@ -141,6 +141,7 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // snapping (MEASURED 2026-09-17: the snap evicted 93,000 cells in 30 s
             // and the game stuttered), hold or grow while cells fault back in.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
+            MaterialPager::SetUrgent(commitTight);
             if(commitTight && next>256)next=256;
             else if(!(busy||bulk))next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available);
             MaterialPager::SetBudget(size_t(next)*1024*1024);
