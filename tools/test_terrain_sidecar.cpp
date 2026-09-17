@@ -120,6 +120,26 @@ int main() {
     assert(BeginApply(GridOf(stream.cterrain), 0xDEADBEEFu, path, dec) == 0 && !Loaded());
     delete dec2;
 
+    // ---- RecordIndex / IndexOfRecord on a windowed grid (x0,y0 != 0). ----
+    {
+        FakeTerrain w(nx, ny);
+        *reinterpret_cast<int32_t*>(w.grid.data() + 0) = 100;   // x0
+        *reinterpret_cast<int32_t*>(w.grid.data() + 4) = -50;   // y0
+        w.finalize();
+        Grid g = GridOf(w.cterrain);
+        assert(RecordIndex(g, 100, -50) == 0);                          // origin -> index 0
+        assert(RecordIndex(g, 101, -50) == 1);                          // +x
+        assert(RecordIndex(g, 100, -49) == nx);                         // +y -> +nx
+        assert(RecordIndex(g, 100 + nx - 1, -50 + ny - 1) == long(nx) * ny - 1);
+        assert(RecordIndex(g, 99, -50) == -1 && RecordIndex(g, 100, -51) == -1);   // outside window
+        assert(RecordIndex(g, 100 + nx, -50) == -1);
+        // IndexOfRecord agrees, and matches GetTile's formula for every cell.
+        for (long i = 0; i < long(nx) * ny; i += 137) assert(IndexOfRecord(g, g.record(uint32_t(i))) == i);
+        assert(IndexOfRecord(g, g.records() + 40 * nx * ny) == -1);     // one past the end
+        assert(IndexOfRecord(g, g.record(0) + 8) == -1);               // misaligned
+        printf("index: RecordIndex and IndexOfRecord agree with the engine's (x-x0)+(y-y0)*nx\n");
+    }
+
     remove(path); delete enc; delete dec;
     printf("PASS: write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint\n");
     return 0;

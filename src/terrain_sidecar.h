@@ -60,11 +60,30 @@ struct TileHeader { uint32_t index; uint32_t bytes; };   // record index in the 
 // The engine's terrain grid, as a raw view (never constructed by us).
 struct Grid {
     uint8_t* base;
+    int32_t x0() const { return *reinterpret_cast<const int32_t*>(base + 0); }
+    int32_t y0() const { return *reinterpret_cast<const int32_t*>(base + 4); }
     int32_t nx() const { return *reinterpret_cast<const int32_t*>(base + 8); }
     int32_t ny() const { return *reinterpret_cast<const int32_t*>(base + 0xc); }
     uint8_t* records() const { return *reinterpret_cast<uint8_t* const*>(base + 0x10); }
     uint8_t* record(uint32_t i) const { return records() + size_t(i) * 40; }
 };
+// The record index for tile coordinate (x, y), the same value CTerrain::GetTile
+// (0x33d580) and AddTile (0x33cb60) compute: (x - x0) + (y - y0) * nx. -1 when
+// the coordinate is outside the grid window. This is the index the file stores
+// and the argument Has()/ApplyTile() expect. A caller that already holds the
+// engine's record pointer can use IndexOfRecord instead.
+inline long RecordIndex(const Grid& g, int32_t x, int32_t y) {
+    const int32_t x0 = g.x0(), y0 = g.y0(), nx = g.nx(), ny = g.ny();
+    if (x < x0 || y < y0 || x >= x0 + nx || y >= y0 + ny) return -1;
+    return long(x - x0) + long(y - y0) * nx;
+}
+inline long IndexOfRecord(const Grid& g, const uint8_t* record) {
+    if (!g.records() || record < g.records()) return -1;
+    size_t off = size_t(record - g.records());
+    if (off % 40) return -1;
+    long i = long(off / 40);
+    return i < long(g.nx()) * g.ny() ? i : -1;
+}
 inline Grid GridOf(void* cterrain) { return Grid{*reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(cterrain) + 0x18)}; }
 struct TileVector { uint16_t* first; uint16_t* last; uint16_t* end; };
 inline TileVector* VectorOf(uint8_t* record) { return reinterpret_cast<TileVector*>(record + 8); }
