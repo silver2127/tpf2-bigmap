@@ -31,7 +31,7 @@ def main():
                                 (96,(3276,8192),(546,2048)),(512,(4096,8192),(1024,4096))]:
         h,w=C.c_int(),C.c_int();autoT(gib<<30,C.byref(h),C.byref(w));assert (h.value,w.value)==(th,tw),(gib,h.value,w.value,th,tw)
         h,w=C.c_int(),C.c_int();autoM(gib<<30,C.byref(h),C.byref(w));assert (h.value,w.value)==(mh,mw),(gib,h.value,w.value,mh,mw)
-    live=dll.BigmapTestTerrainBudgetLive;live.argtypes=[C.c_int]*4+[C.c_uint64,C.c_uint64]
+    live=dll.BigmapTestTerrainBudgetLive;live.argtypes=[C.c_int]*4+[C.c_uint64,C.c_uint64,C.c_uint64]
     G=1<<30
     for args,want in [((1024,4096,1,0,64*G,8000),8000),        # loading: cover every live tile
                       ((1024,4096,0,1,16*G,8000),4096),        # 16 GiB free: 12 reserved, warm is the floor
@@ -44,22 +44,43 @@ def main():
                       ((1024,4096,1,1,7*G,8000),4096),         # 7 GiB free: inside the 12 GiB reserve, warm is the floor
                       ((1024,4096,1,1,(4*G)-1,8000),1024),     # below the gate: hot
                       ((3072,4096,1,0,64*G,0),4096)]:          # no live size: warm only
-        assert live(*args)==want,(args,live(*args),want)
+        assert live(*args,0)==want,(args,live(*args,0),want)
+    # The reserve floor follows the machine (PagerHeadroom): 32 GiB -> 4.6 GiB,
+    # so a 32 GiB machine with 16 GiB free keeps 8 GiB of tiles while loading
+    # (a flat 12 GiB floor allowed 4 GiB, the warm budget).
+    headroom=dll.BigmapTestPagerHeadroom;headroom.argtypes=[C.c_uint64];headroom.restype=C.c_uint64
+    tight=dll.BigmapTestCommitTightBytes;tight.argtypes=[C.c_uint64];tight.restype=C.c_uint64
+    for phys,want in [(0,12*G),(8*G,2*G),(16*G,(16*G)//7),(32*G,(32*G)//7),(94*G,12*G),(512*G,12*G)]:
+        assert headroom(phys)==want,(phys,headroom(phys),want)
+    for phys,want in [(0,10*G),(8*G,2*G),(16*G,2*G),(32*G,4*G),(94*G,10*G)]:
+        assert tight(phys)==want,(phys,tight(phys),want)
+    assert live(1024,4096,1,0,16*G,20000,32*G)==8192
+    assert live(1024,4096,1,0,5*G,20000,32*G)==4096      # under the 4.6 GiB headroom: warm is the floor
+    assert live(1024,4096,1,0,16*G,20000,96*G)==4096     # a big machine keeps its measured 12 GiB
     # Steady state after a load: ramp down instead of snapping, hold or grow
     # while the engine faults evicted tiles back in, cap by what is free.
-    steady=dll.BigmapTestTerrainBudgetSteady;steady.argtypes=[C.c_int]*3+[C.c_uint64,C.c_uint64]
-    for args,want in [((13365,3195,3195,0,64*G),12530),     # quiet: down by 1/16 per second
-                      ((300,256,256,0,64*G),256),           # the floor is the policy's own target
-                      ((8000,3195,3195,150,64*G),8000),     # 100..299 cold restores/s: hold
-                      ((8000,3195,3195,500,64*G),9000),     # >= 300/s: grow by 1/8
-                      ((600,3195,3195,500,64*G),3195),      # never below the floor
-                      ((8000,3195,3195,500,8*G),3195),      # 8 GiB free: all reserve, the ceiling is the floor
-                      ((9000,3195,3195,500,24*G),9339),     # 24 GiB free: 12 reserved, half of 12 on top of hot
-                      ((8000,3195,3195,0,24*G),7500),       # a quiet ramp under the ceiling
-                      ((12000,3195,3195,0,24*G),9339),      # the ceiling also pulls a quiet ramp down faster
-                      ((65000,3195,3195,500,400*G),65536),  # absolute clamp
-                      ((3195,3195,3195,500,64*G),3594),     # from the floor: +1/8, at least 128
-                      ((500,400,400,500,64*G),628)]:        # small budgets grow by the 128 MiB minimum
+    # The ceiling counts what the pager holds as room of its own (free RAM +
+    # prev), reserves a quarter of that room or the machine's headroom, and
+    # gives the terrain pager 3/4 of the rest (share 3), the material pager 1/2.
+    steady=dll.BigmapTestTerrainBudgetSteady;steady.argtypes=[C.c_int]*3+[C.c_uint64]*3+[C.c_uint]
+    for args,want in [((13365,3195,3195,0,64*G,0,2),12530),     # quiet: down by 1/16 per second
+                      ((300,256,256,0,64*G,0,2),256),           # the floor is the policy's own target
+                      ((8000,3195,3195,150,64*G,0,2),8000),     # 100..299 cold restores/s: hold
+                      ((8000,3195,3195,500,64*G,0,2),9000),     # >= 300/s: grow by 1/8
+                      ((600,3195,3195,500,64*G,0,2),3195),      # never below the floor
+                      ((8000,3195,3195,500,8*G,0,2),5147),      # 8 GiB free under a 12 GiB headroom: pressure cuts 1/8, room 15.8 GiB - 12 leaves 1.9 GiB on top of hot
+                      ((9000,3195,3195,500,24*G,0,2),10125),    # 24 GiB free + 8.8 held: 12 reserved, half of 20.8 on top of hot; grows by 1/8
+                      ((8000,3195,3195,0,24*G,0,2),7500),       # a quiet ramp under the ceiling
+                      ((12000,3195,3195,0,24*G,0,2),11250),     # a quiet ramp from a high target
+                      ((65000,3195,3195,500,400*G,0,2),65536),  # absolute clamp
+                      ((3195,3195,3195,500,64*G,0,2),3594),     # from the floor: +1/8, at least 128
+                      ((500,400,400,500,64*G,0,2),628),         # small budgets grow by the 128 MiB minimum
+                      # A 32 GiB machine after a big load: 12 GiB held, 4 GiB free, engine faulting.
+                      # Old rule: the ceiling was the 1092 MiB hot budget (free < 12 GiB) -> mass eviction and decode thrash.
+                      ((12000,1092,1092,500,4*G,32*G,3),9652),  # pressure (4 < 4.6 GiB free) cuts 1/8; room 16 GiB - 4.6 reserve, 3/4 of it on top of hot
+                      ((9652,1092,1092,50,6*G,32*G,3),9049),    # 6 GiB free: no pressure, a quiet 1/16 ramp
+                      ((9000,1092,1092,150,8*G,32*G,3),9000),   # 8 GiB free: hold under a 10.2 GiB ceiling
+                      ((9000,1092,1092,500,8*G,32*G,3),10125)]: # ... or grow by 1/8 inside it
         assert steady(*args)==want,(args,steady(*args),want)
     # Adaptive eviction rate: cost cap (a quarter core), stall halving, quiet growth.
     step=dll.BigmapTestEvictRateStep;step.argtypes=[C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.POINTER(C.c_uint64),C.c_uint64,C.c_uint,C.c_int,C.c_uint];step.restype=C.c_uint
