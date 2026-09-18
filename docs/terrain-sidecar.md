@@ -53,6 +53,27 @@ Not yet integrated (needs the pass, which `src/alignment_batch.h` owns):
      the refine yields *base* heights and the pass cuts them afterwards, so it
      only works if the cut is also suppressed for served tiles.
 
+## Two CTerrain versions, one image
+
+A save load holds two CTerrain versions transiently, each with the full tile
+grid (measured: a 256x256 save is 65,536 tiles per version, 131,072 AddTile
+calls, two alignment passes of ~13.9 s each = 27.8 s). One sidecar image serves
+both, and no second grid is stored, because:
+
+- The two versions' tile caches are byte-identical tile for tile. This is the
+  same fact the content-dedup measured (every tile has exactly one byte-identical
+  twin in the other version); it is why `terrain_dedup` works.
+- Both grids share dimensions and origin, so `RecordIndex(x, y)` is the same in
+  both, and `ApplyTile(GridOf(versionB), index)` decodes the same blob into
+  version B's tile correctly.
+
+All serving happens at AddTile, and every AddTile (both versions) completes
+before either alignment pass runs, so `g_load` need only live from the first
+AddTile to the last; `EndApply` after the first pass is correct today, after the
+last pass is strictly safe. At save time there is normally one CTerrain, so
+`WriteForSave` captures the single live version, which is the state both
+transient versions converge to on the next load.
+
 ## File format
 
 Little-endian. `TERR`, version 1.
