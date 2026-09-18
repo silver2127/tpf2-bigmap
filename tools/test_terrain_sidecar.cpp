@@ -8,6 +8,7 @@
 #include <random>
 #include <cassert>
 #include <array>
+#include <string>
 #include "../src/terrain_sidecar.h"
 
 using namespace TerrainSidecar;
@@ -143,7 +144,45 @@ int main() {
         printf("index: RecordIndex and IndexOfRecord agree with the engine's (x-x0)+(y-y0)*nx\n");
     }
 
+    // ---- Fingerprint + arm/begin/end + WriteForSave glue. ----
+    {
+        // A stand-in .sav file; its hash is the fingerprint.
+        const char* sav = "test_glue.sav";
+        { FILE* f = nullptr; fopen_s(&f, sav, "wb"); std::mt19937 r(9); std::vector<uint8_t> b(300000); for (auto& x : b) x = uint8_t(r()); fwrite(b.data(), 1, b.size(), f); fclose(f); }
+        char terr[520]; SidecarPath(sav, terr, sizeof terr);
+        assert(std::string(terr) == "test_glue.terr");
+        uint64_t fp1 = HashFile(sav), fp2 = HashFile(sav);
+        assert(fp1 && fp1 == fp2);                                  // deterministic, non-zero
+        assert(HashFile("no_such.sav") == 0);
+        // WriteForSave hashes the .sav and writes <base>.terr beside it.
+        FakeTerrain src(nx, ny);
+        for (uint32_t i : live) src.makeTile(i, Samples, i * 7 + 1);   // same data as `save`
+        src.finalize();
+        long w2 = WriteForSave(src.cterrain, sav, enc, nullptr);
+        assert(w2 == long(live.size()));
+        // Arm from the same .sav, then BeginIfPending with the CTerrain.
+        FakeTerrain dstg(nx, ny);
+        for (uint32_t i : live) { dstg.makeTile(i, Samples, 0); for (auto& x : dstg.caches[i]) x = 0; }
+        dstg.finalize();
+        ArmForLoad(sav);
+        assert(g_pending && g_saveFingerprint == fp1);
+        assert(BeginIfPending(dstg.cterrain, dec) && Loaded() && !g_pending);
+        assert(BeginIfPending(dstg.cterrain, dec) && Loaded());     // idempotent once loaded
+        for (uint32_t i : live) assert(ApplyTile(GridOf(dstg.cterrain), i, *dec));
+        for (uint32_t i : live) assert(dstg.caches[i] == src.caches[i]);
+        EndApply();
+        // A tampered .sav (different bytes) arms a different fingerprint, so the
+        // stale .terr is rejected: BeginIfPending loads nothing.
+        { FILE* f = nullptr; fopen_s(&f, sav, "ab"); uint8_t z = 0; fwrite(&z, 1, 1, f); fclose(f); }
+        ArmForLoad(sav);
+        assert(g_saveFingerprint != fp1);
+        assert(!BeginIfPending(dstg.cterrain, dec) && !Loaded());
+        // Not armed -> BeginIfPending is a no-op (per-frame passes during play).
+        g_pending = false; assert(!BeginIfPending(dstg.cterrain, dec) && !Loaded());
+        remove(sav); remove(terr);
+    }
+
     remove(path); delete enc; delete dec;
-    printf("PASS: write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint\n");
+    printf("PASS: write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint; fingerprint+arm/begin/end and WriteForSave round-trip, a changed .sav rejects the stale sidecar\n");
     return 0;
 }
