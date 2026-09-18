@@ -205,10 +205,19 @@ struct LoadState {
 };
 static LoadState g_load;
 
-// Open, validate against the live grid's fingerprint and dimensions, index
-// every tile and verify each blob decodes. Returns the number of tiles ready,
-// or 0 (nothing held) if the file is absent/foreign/stale/corrupt.
-inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* verify) {
+// Open, validate the header against the live grid's fingerprint and dimensions,
+// and index every tile by scanning the tile headers (NO decode). Returns the
+// number of tiles indexed, or 0 (nothing held) if the file is absent, foreign,
+// stale, or structurally broken (a header whose lengths run past the file).
+//
+// It deliberately does NOT decode the blobs up front: on a 100k-tile map that
+// would stall the first AddTile for the whole verify. Each blob carries its own
+// content hash, so a bad blob is caught at ApplyTile, which returns false. The
+// contract is therefore: the caller marks a tile served (and skips its
+// publication) ONLY when ApplyTile returns true; a false result must fall back
+// to the normal compute for that tile. `verify` is unused, kept so the caller's
+// BeginIfPending(cterrain, scratch) signature is stable.
+inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* /*verify*/ = nullptr) {
     g_load = LoadState{};
     if (!grid.base || !grid.records()) return 0;
     FILE* f = nullptr;
@@ -224,13 +233,11 @@ inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path,
     if (hdr.fingerprint != fingerprint || hdr.nx != grid.nx() || hdr.ny != grid.ny()) return 0;
     const uint32_t count = uint32_t(grid.nx()) * uint32_t(grid.ny());
     std::vector<std::pair<uint32_t, uint32_t>> index(count, {0u, 0u});
-    std::vector<uint16_t> scratchOut(Samples);
     size_t p = sizeof(FileHeader);
     for (uint32_t k = 0; k < hdr.tiles; ++k) {
         if (p + sizeof(TileHeader) > size_t(sz)) return 0;
         TileHeader th{}; memcpy(&th, buf.data() + p, sizeof th); p += sizeof(TileHeader);
         if (th.bytes == 0 || p + th.bytes > size_t(sz) || th.index >= count) return 0;
-        if (!BlockCodec::Decode(buf.data() + p, th.bytes, scratchOut.data(), Samples, *verify)) return 0;
         index[th.index] = {uint32_t(p), th.bytes};   // p != 0 always (past the header)
         p += th.bytes;
     }
@@ -245,8 +252,10 @@ inline bool Has(uint32_t recordIndex) {
     return g_load.loaded && recordIndex < g_load.byIndex.size() && g_load.byIndex[recordIndex].first != 0;
 }
 // Decode the saved cache for `recordIndex` into that tile's height vector.
-// False if not loaded, not stored, the tile is not present/eligible, or (not
-// possible after BeginApply verified it) the blob fails to decode.
+// False if not loaded, not stored, the tile is not present/eligible, or the
+// blob fails to decode (a corrupt blob: the caller must then leave the tile to
+// the normal compute, i.e. not mark it served). The block codec's content hash
+// makes a bad decode a reliable false, never a wrong restore.
 inline bool ApplyTile(const Grid& grid, uint32_t recordIndex, BlockCodec::DecodeScratch& scratch) {
     if (!Has(recordIndex)) return false;
     TileVector* v = VectorOf(grid.record(recordIndex));
