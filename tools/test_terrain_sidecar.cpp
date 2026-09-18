@@ -122,6 +122,24 @@ int main() {
     assert(!Loaded() && !Has(live[0]));
     // BeginApply refuses a foreign fingerprint (holds nothing).
     assert(BeginApply(GridOf(stream.cterrain), 0xDEADBEEFu, path, dec) == 0 && !Loaded());
+
+    // BeginApply no longer decodes up front: a file with ONE corrupt tile blob
+    // still loads, and the bad tile surfaces as a false from ApplyTile (so the
+    // caller falls back to compute for it) while every other tile restores.
+    {
+        FILE* f = nullptr; fopen_s(&f, path, "rb"); fseek(f, 0, SEEK_END); long sz = ftell(f); fclose(f);
+        std::vector<uint8_t> buf(sz); fopen_s(&f, path, "rb"); assert(fread(buf.data(), 1, sz, f) == size_t(sz)); fclose(f);
+        TileHeader first{}; memcpy(&first, buf.data() + sizeof(FileHeader), sizeof first);
+        buf[sizeof(FileHeader) + sizeof(TileHeader) + 30] ^= 0x40;   // flip a byte in the first tile's body
+        const char* cp = "test_sidecar_1bad.bin"; fopen_s(&f, cp, "wb"); fwrite(buf.data(), 1, sz, f); fclose(f);
+        for (uint32_t i : live) { for (auto& x : stream.caches[i]) x = 0; }
+        assert(BeginApply(GridOf(stream.cterrain), 0xABCDEF12u, cp, dec) == long(live.size()) && Has(first.index));
+        int failures = 0;
+        for (uint32_t i : live) if (!ApplyTile(GridOf(stream.cterrain), i, *dec2)) ++failures;
+        assert(failures == 1 && !ApplyTile(GridOf(stream.cterrain), first.index, *dec2));   // exactly the corrupt tile
+        for (uint32_t i : live) if (i != first.index) assert(stream.caches[i] == save.caches[i]);
+        EndApply(); remove(cp);
+    }
     delete dec2;
 
     // ---- RecordIndex / IndexOfRecord on a windowed grid (x0,y0 != 0). ----
