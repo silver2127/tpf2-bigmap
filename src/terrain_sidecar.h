@@ -255,6 +255,69 @@ inline bool ApplyTile(const Grid& grid, uint32_t recordIndex, BlockCodec::Decode
     return BlockCodec::Decode(g_load.file.data() + e.first, e.second, v->first, Samples, scratch);
 }
 inline void EndApply() { g_load = LoadState{}; }
+
+// ---- Fingerprint and the save/load glue. ----
+// The fingerprint ties a sidecar to one save: a 64-bit hash of the .sav bytes.
+// The aligned terrain is a pure function of those bytes, so an exact hash match
+// means the stored caches are correct, and any other save (even the same map
+// with different roads) hashes differently and is rejected.
+inline uint64_t HashFile(const char* path) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") || !f) return 0;
+    uint64_t h = 0xCBF29CE484222325ull; uint64_t total = 0;
+    uint8_t buf[1 << 16];
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof buf, f);
+        if (!n) break;
+        total += n;
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, buf + i, 8); h = TerrainCodec::Rotl(h ^ (w * 0xC2B2AE3D27D4EB4Full), 31) * 0x9E3779B185EBCA87ull; }
+        for (; i < n; ++i) h = TerrainCodec::Rotl(h ^ (uint64_t(buf[i]) * 0xC2B2AE3D27D4EB4Full), 27) * 0x9E3779B185EBCA87ull;
+    }
+    fclose(f);
+    if (!total) return 0;              // empty/unreadable -> 0, which callers treat as "no fingerprint"
+    h ^= total; h ^= h >> 33; h *= 0xC2B2AE3D27D4EB4Full; h ^= h >> 29;
+    return h ? h : 1;                  // never 0 for a real file
+}
+inline void SidecarPath(const char* savPath, char* out, size_t cap) {
+    // "<save>.sav" -> "<save>.terr"; otherwise "<path>.terr".
+    size_t n = strlen(savPath);
+    const char* ext = (n >= 4 && !_stricmp(savPath + n - 4, ".sav")) ? savPath + n - 4 : savPath + n;
+    size_t base = size_t(ext - savPath);
+    if (base + 6 >= cap) { if (cap) out[0] = 0; return; }
+    memcpy(out, savPath, base); memcpy(out + base, ".terr", 6);
+}
+
+static uint64_t g_saveFingerprint = 0;
+static char g_sidecarPath[520] = {0};
+static bool g_pending = false;         // a fingerprint is armed; BeginApply not yet run this load (set on
+                                       // the load thread before the pass, read once at its entry)
+
+// Called from the LoadGame hook once the .sav path is known, before the world
+// builds. Hashes the save and arms the sidecar; the actual BeginApply waits for
+// the CTerrain, which BeginIfPending supplies.
+inline void ArmForLoad(const char* savPath) {
+    g_saveFingerprint = HashFile(savPath);
+    SidecarPath(savPath, g_sidecarPath, sizeof g_sidecarPath);
+    g_pending = g_saveFingerprint && g_sidecarPath[0];
+}
+// Called with the CTerrain the pass will populate, before its first AddTile
+// (the pass owner's Detour entry is the natural spot). Runs BeginApply once.
+// Returns true if a valid sidecar is now loaded.
+inline bool BeginIfPending(void* cterrain, BlockCodec::DecodeScratch* verify) {
+    if (!g_pending || !cterrain) return Loaded();
+    g_pending = false;
+    return BeginApply(GridOf(cterrain), g_saveFingerprint, g_sidecarPath, verify) > 0;
+}
+// Called from the SaveGame hook after the save is written, with the CTerrain and
+// the .sav just written. Hashes the save and writes the sidecar beside it.
+inline long WriteForSave(void* cterrain, const char* savPath, BlockCodec::EncodeScratch* scratch, uint64_t* bytesOut = nullptr) {
+    uint64_t fp = HashFile(savPath);
+    if (!fp || !cterrain) return -1;
+    char path[520]; SidecarPath(savPath, path, sizeof path);
+    if (!path[0]) return -1;
+    return Write(GridOf(cterrain), fp, path, scratch, bytesOut);
+}
 }  // namespace TerrainSidecar
 
 // ---- Offline test entry points (no game state). ----
