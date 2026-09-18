@@ -59,10 +59,32 @@ static long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     }
     return -1;
 }
+static SRWLOCK beginLock = SRWLOCK_INIT;
+static volatile LONG64 beginMs = 0;   // wall time of the sidecar's open + verify, in the first AddTile of the load
+// The LoadGame hook armed a fingerprint (TerrainSidecar::ArmForLoad); the
+// first AddTile of the load opens and verifies the sidecar against this very
+// CTerrain's grid. Other AddTile threads that saw the arm wait on the lock,
+// then find it loaded (or refused); ones that raced past it miss their tile.
+static void BeginIfArmed(void* terrain) {
+    if (!TerrainSidecar::g_pending) return;
+    AcquireSRWLockExclusive(&beginLock);
+    if (TerrainSidecar::g_pending) {
+        if (!scratch) scratch = new (std::nothrow) BlockCodec::DecodeScratch;
+        LARGE_INTEGER f{}, t0{}, t1{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        bool ok = scratch && TerrainSidecar::BeginIfPending(terrain, scratch);
+        QueryPerformanceCounter(&t1);
+        InterlockedExchange64(&beginMs, f.QuadPart ? (t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart : 0);
+        InterlockedExchange(&cursor, 0);
+        if (H) H->log("terrain sidecar: %s (%lld ms; %u tiles)", ok ? "loaded for this save, serving tiles at AddTile" : "absent, foreign or stale; loading stock", beginMs, TerrainSidecar::g_load.tiles);
+    }
+    ReleaseSRWLockExclusive(&beginLock);
+}
 static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a3) {
     original(terrain, entity, a2, a3);
     InterlockedIncrement64(&calls);
-    if (!g_terrainServe || !terrain || !TerrainSidecar::Loaded()) return;
+    if (!g_terrainServe || !terrain) return;
+    BeginIfArmed(terrain);
+    if (!TerrainSidecar::Loaded()) return;
     TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records()) return;
     long idx = FindRecord(g, entity);
@@ -91,6 +113,12 @@ static bool InstallTerrainServe() {
     }
     mark = TerrainPager::SetServed;
     g_terrainServedCheck = TerrainPager::IsServed;
+    g_alignmentPassDone = []() {
+        if (!TerrainSidecar::Loaded()) return;
+        if (H) H->log("terrain sidecar: load done, %lld tiles served (%lld unmarked, %lld absent, %lld not found, %lld copies skipped, open+verify %lld ms); releasing the file",
+            applied, unmarked, absent, notFound, g_terrainServedCopiesSkipped, beginMs);
+        TerrainSidecar::EndApply();
+    };
     H->log("terrain sidecar: a loaded sidecar's tiles are applied at AddTile and the load's publication into them is skipped");
     return true;
 }

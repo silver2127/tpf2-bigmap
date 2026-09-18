@@ -31,6 +31,9 @@ static int g_alignmentBatch = 512;   // tiles per UpdateSubterrains call; 0 = st
 static void* g_alignmentTerrain = nullptr;
 // Wall time of the last batched pass (the load's), milliseconds.
 static volatile LONG64 g_alignmentPassMs = 0;
+// Called after a batched pass (a load's) has published its last batch; the
+// terrain sidecar (terrain_serve.h) releases the loaded file here.
+static void (*g_alignmentPassDone)() = nullptr;
 namespace AlignmentBatch {
 struct SetValue { uint64_t key; void* vfirst; void* vlast; void* vend; };   // CVec2i block + std::vector<16-byte item>
 struct SetNode { SetNode* left; SetNode* parent; SetNode* right; uint8_t color, isnil, pad[6]; SetValue value; };
@@ -98,6 +101,7 @@ static void __fastcall Detour(void* self, SetObject* set) {
     if (H) H->log("alignment pass: %llu blocks in %llu batches of %llu, %lld ms (compute + publish)", (unsigned long long)n, (unsigned long long)((n + batch - 1) / batch), (unsigned long long)batch, ms);
     HeapFree(GetProcessHeap(), 0, keys);
     HeapFree(GetProcessHeap(), 0, nodes);
+    if (g_alignmentPassDone) g_alignmentPassDone();
 }
 }  // namespace AlignmentBatch
 static bool InstallAlignmentBatch() {
