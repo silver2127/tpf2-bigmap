@@ -86,6 +86,14 @@ if /i "%1"=="-alignbatch-test" (
     cl /nologo /O2 /MT /W3 /EHsc tools\test_alignment_batch.cpp /Fo:out\test_alignment_batch.obj /Fe:out\test_alignment_batch.exe || exit /b 1
     exit /b
 )
+if /i "%1"=="-serve-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_terrain_serve.cpp /Fo:out\test_terrain_serve.obj /Fe:out\test_terrain_serve.exe || exit /b 1
+    exit /b
+)
+if /i "%1"=="-sidecar-test" (
+    cl /nologo /O2 /MT /W3 /EHsc tools\test_terrain_sidecar.cpp /Fo:out\test_terrain_sidecar.obj /Fe:out\test_terrain_sidecar.exe || exit /b 1
+    exit /b
+)
 if /i "%1"=="-smallpager-test" (
     cl /nologo /O2 /MT /W3 /EHsc tools\test_small_pager.cpp /Fo:out\test_small_pager.obj /Fe:out\test_small_pager.exe || exit /b 1
     exit /b
