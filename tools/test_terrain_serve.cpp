@@ -18,6 +18,7 @@ static bool g_gog = false;
 namespace TerrainPager { static bool SetServed(const void*) { return false; } static bool IsServed(const void*) { return false; } }
 static bool (*g_terrainServedCheck)(const void*) = nullptr;
 static volatile LONG64 g_terrainServedCopiesSkipped = 0;
+static void (*g_alignmentPassDone)() = nullptr;
 #include "../src/terrain_sidecar.h"
 #include "../src/terrain_serve.h"
 using namespace TerrainSidecar;
@@ -122,6 +123,25 @@ int main() {
     BigmapTestServeCounters(c);
     assert(c[4] == before[4] + 1 && c[1] == before[1]);
     EndApply();
+    // 6. Armed by the LoadGame hook (fingerprint + path, BeginApply not yet run):
+    //    the first AddTile opens and verifies the file against this grid, the
+    //    rest serve; the pass-done callback releases it.
+    TerrainSidecar::g_saveFingerprint = 0x5EED; strcpy_s(TerrainSidecar::g_sidecarPath, path); TerrainSidecar::g_pending = true;
+    FakeTerrain live4(nx, ny); g_live = &live4; g_marked.clear(); BigmapTestServeCounters(before);
+    for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
+        BigmapTestServeDetour(live4.cterrain, int(1000 + i), FakeAddTile, Mark);
+        assert(Loaded() && !TerrainSidecar::g_pending);
+    }
+    BigmapTestServeCounters(c);
+    assert(c[1] - before[1] == written && c[4] == before[4]);
+    for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) if (stored[i]) assert(live4.caches[i] == save.caches[i]);
+    EndApply(); assert(!Loaded());
+    // A foreign fingerprint armed: refused at the first AddTile, everything loads stock.
+    TerrainSidecar::g_saveFingerprint = 0xBAD; TerrainSidecar::g_pending = true;
+    FakeTerrain live5(nx, ny); g_live = &live5; BigmapTestServeCounters(before);
+    BigmapTestServeDetour(live5.cterrain, 1000, FakeAddTile, Mark);
+    assert(!Loaded() && !TerrainSidecar::g_pending);
+    BigmapTestServeCounters(c); assert(c[1] == before[1] && c[5] == before[5]);
     remove(path);
     // 6. Byte anchors in the real executable.
     FILE* f = nullptr; fopen_s(&f, "C:\\tools\\bin\\TransportFever2.exe", "rb"); assert(f);
