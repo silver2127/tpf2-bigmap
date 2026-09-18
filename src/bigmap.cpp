@@ -203,6 +203,8 @@ static bool g_octreeOn = true;
 #include "save_fast.h"
 #include "travel_time.h"
 #include "alignment_batch.h"
+#include "terrain_sidecar.h"
+#include "terrain_serve.h"
 #include "instance_shrink.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
@@ -1253,6 +1255,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
     g_travelTimeLimit = H->cfgInt("tpf2_bigmap", "travel_time_limit_s", 0);
     g_alignmentBatch = H->cfgInt("tpf2_bigmap", "alignment_batch_tiles", 512);
+    g_terrainServe = H->cfgBool("tpf2_bigmap", "terrain_sidecar", 1) != 0;
     g_cargoPathTime = H->cfgInt("tpf2_bigmap", "cargo_path_time_s", 0);
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
     g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 0) != 0;
@@ -1368,6 +1371,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallSaveFast();
     installed += InstallTravelTime();
     installed += InstallAlignmentBatch();
+    installed += InstallTerrainServe();
     installed += InstallInstanceShrink();
     installed += InstallMinimap();
 

@@ -251,6 +251,8 @@ static unsigned PagerHelperThreads() {
     SYSTEM_INFO info{};GetSystemInfo(&info);
     return info.dwNumberOfProcessors>=16?3:info.dwNumberOfProcessors>=8?1:0;
 }
+// Defined in terrain_serve.h (included later): the sidecar counters for the 30 s line.
+static int TerrainServeStatus(char* out, size_t cap);
 static DWORD WINAPI TerrainEvictionHelper(void*) {
     for(;;) {
         Sleep(25);
@@ -344,13 +346,14 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld block_calls=%lld block_sized=%lld result_resizes=%lld",
+            char serve[256];TerrainServeStatus(serve,sizeof serve);
+            if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld block_calls=%lld block_sized=%lld result_resizes=%lld%s",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
                 s.encodes,s.reusedEvictions,s.writeFaults,s.sharedClones,s.overflows,s.softBlocked,s.softRescues,s.cancelledEvictions,
                 s.sharedViews,s.sharedSlots,s.privatizations,double(s.privatizeBytes)/(1024*1024),s.dedupHits,s.dedupRebuilds,s.restoreRetries,s.restoreGiveUps,s.rateLimited,rate.rate,s.evictOps?s.evictMicros/s.evictOps:0ull,s.lazyAllocations,s.throttleWaits,s.throttleMillis,
                 InterlockedCompareExchange64(&g_blockAllocations,0,0),InterlockedCompareExchange64(&g_blockReleases,0,0),InterlockedCompareExchange64(&g_blockStray,0,0),
-                InterlockedCompareExchange64(&g_blockCalls,0,0),InterlockedCompareExchange64(&g_blockSized,0,0),InterlockedCompareExchange64(&g_resultResizes,0,0));
+                InterlockedCompareExchange64(&g_blockCalls,0,0),InterlockedCompareExchange64(&g_blockSized,0,0),InterlockedCompareExchange64(&g_resultResizes,0,0),serve);
             if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
                 auto sp=SmallPager::Snapshot();
                 if(sp.live||sp.releases)H->log("small pager: live=%llu lazy=%llu resident=%llu resident_mb=%.1f cold=%llu compressed_mb=%.1f faults=%llu commits=%llu restores=%llu evictions=%llu releases=%llu failures=%llu incompressible=%llu cancelled=%llu commit_retries=%llu throttle_waits=%llu throttle_ms=%llu overflows=%llu ring_drops=%llu",

@@ -66,6 +66,10 @@ struct Slot {
     // to any of them privatizes that one slot first, so the versions never alias.
     bool shared;
     unsigned shareNext;
+    // The tile's content came from the terrain sidecar (terrain_serve.h): the
+    // load's refine/alignment publication copies into it are skipped. Cleared
+    // with the rest of the slot on allocation.
+    bool served;
 };
 struct Stats {
     uint64_t live, resident, compressedBytes, compressedCommit, faults, evictions, failures;
@@ -158,6 +162,21 @@ static bool Contains(const void* p) {
 }
 static unsigned Index(const void* p){return unsigned((uintptr_t(p)-uintptr_t(arena))/SlotBytes);}
 static size_t Committed(size_t n){return (n+4095)&~size_t(4095);}
+// Mark the live slot holding `p` as served by the sidecar (under the lock).
+static bool SetServed(const void* p) {
+    if(!Contains(p))return false;
+    Guard g;unsigned i=Index(p);
+    if(i>=allocated||!slots[i].active)return false;
+    slots[i].served=true;return true;
+}
+// Lock-free read for the block-copy hot path: `served` is set only on a live
+// slot and cleared under the lock before the slot is handed out again, so a
+// caller holding a pointer into a tile never sees another tile's flag.
+static bool IsServed(const void* p) {
+    if(!Contains(p))return false;
+    unsigned i=Index(p);
+    return i<allocated && slots[i].active && slots[i].served;
+}
 static size_t PackedSize(unsigned bytes){return offsetof(Packed,data)+bytes;}
 // Caller holds lock.
 static void ClearSoft(Slot& s){if(s.soft){s.soft=false;--stats.softBlocked;}}
