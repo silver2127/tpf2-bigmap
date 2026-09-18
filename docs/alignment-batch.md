@@ -85,6 +85,17 @@ one and exact multiples, and the byte anchors in the real executable.
 - Load time was not timed against stock on the same map; the pass now
   publishes 3,240 times, each with its own per-call overhead.
 - The alignment pass is still necessary work. A sidecar file holding the
-  finished 1 m cache would skip both the refine and the pass on load, at the
-  cost of a fingerprint that must reject a stale sidecar (in progress in a
-  separate session).
+  finished 1 m cache (`src/terrain_sidecar.h`, `docs/terrain-sidecar.md`)
+  skips its result on load: `src/terrain_serve.h` post-hooks
+  `CTerrain::AddTile` (`0x33cb60`, the only place a tile record comes to
+  life; it returns void, so the record is found by entity from a rotating
+  cursor), decodes the saved cache into the fresh vector while it is still
+  private after AddTile's own detach, and marks the tile arena slot `served`;
+  the block-copy replacement (`0x30a540`) then skips every copy into a served
+  slot, so the refine and the pass still compute but publish nothing over it.
+  Counters ride on the pager's 30 s line (`sidecar: add_tile= applied=
+  copies_skipped=`). Whether the compute itself can be skipped per served
+  tile depends on mapping a dirty-set block to its tile, not yet done; the
+  pass's wall time (`alignment pass: ... ms`) says what that would save.
+  The sidecar's SaveGame/LoadGame hooks and fingerprint are the other
+  session's; until they load a file, `terrain_sidecar=1` is inert.
