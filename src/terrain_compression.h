@@ -306,8 +306,16 @@ static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t availab
 //   quarter of that room or the machine's headroom (PagerHeadroom), whichever
 //   is larger; never above 65536 MiB.
 // - Pressure: free RAM under the headroom shrinks by 1/8 per second.
+// - Working-set floor (`wsFloor`, the caller's state): the target the stutter
+//   feedback drove this pager to is remembered and the drift never goes below
+//   it; it decays by 1/256 per quiet second (halves in about three minutes).
+//   MEASURED 2026-09-20 with the policy simulating 32 GiB (hot 1092 MiB) on a
+//   freshly generated map: without it the target sawtoothed between 1.4 and
+//   1.6 GiB under 1,000-2,100 cold restores/s -- each quiet second drifted
+//   1/16 toward hot, the next burst grew 1/8, and the engine faulted the same
+//   tiles back in over and over. A real 32 GiB machine runs exactly that.
 // The result never goes below `next`, so the configured budget stays a floor.
-static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical=0,unsigned shareQuarters=2) {
+static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical=0,unsigned shareQuarters=2,int* wsFloor=nullptr) {
     uint64_t headroom=PagerHeadroom(physical);
     // RAM this pager could own: what is free now PLUS what it holds itself.
     // Counting free RAM alone starved the pager on a full machine: its own
@@ -330,6 +338,11 @@ static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,
     // worse than any decode.
     if(available<headroom){int cut=prev/8>128?prev/8:128;int forced=prev-cut>next?prev-cut:next;if(target>forced)target=forced;}
     if(target>ceiling)target=ceiling;
+    if(wsFloor) {
+        if(decodesPerSec>=300 && target>*wsFloor)*wsFloor=target;
+        else if(decodesPerSec<100 && *wsFloor>0)*wsFloor-=(*wsFloor/256>1?*wsFloor/256:1);
+        if(target<*wsFloor && *wsFloor<=ceiling)target=*wsFloor;
+    }
     if(target<next)target=next;
     return target;
 }
@@ -410,7 +423,8 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             }
             if(commitTight && next>256)next=256;
             else if(!(busy||bulk||loading)) {
-                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3);
+                static int wsFloor=0;
+                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3,&wsFloor);
                 if(steady>effectiveMB && decodesPerSec>=300 && now-lastStutterLog>=10000) {
                     lastStutterLog=now;
                     H->log("terrain compression: %llu cold restores/s, resident target %d -> %d MiB (working set exceeds the budget)",decodesPerSec,effectiveMB,steady);
