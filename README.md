@@ -550,6 +550,14 @@ checkout's build outputs instead (dev only). `build_msi.ps1` refuses to build if
 [OSMF EULA](https://wixtoolset.org/osmf/); `-AcceptWixEula` passes it
 per-invocation and nothing accepts it for you.
 
+GitHub Actions runs the same script (`.github/workflows/build-msi.yml`): every push to `dev` or `main` and
+every pull request builds `TpF2BigMaps-<version>.msi` and `SHA256SUMS.txt` on a `windows-2022` runner from the
+vendored shared binaries and keeps them as the run's artifact; a `v*` tag (which must equal `installer\VERSION`)
+also creates a draft GitHub release with them attached, ready to be edited and published. The runner has no
+multiplayer checkout beside this one, so the workflow compares `PluginHost.wxs` with the copy at the release
+named in `installer\vendor\VENDORED.md` instead. The workflow passes `-AcceptWixEula`, which is the
+repository owner accepting the WiX terms for those builds.
+
 ## Verifying it worked
 
 `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log` shows the hook lines, the
