@@ -125,7 +125,7 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // smaller of free RAM and free commit, and back off hard when commit is
             // nearly exhausted (a 512x512 desert preview hit std::bad_alloc at the
             // 114.6 GB commit limit while tiles were held uncompressed).
-            bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
+            bool haveStatus=PagerMemoryStatus(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
             static const uint64_t physical=InstalledPhysicalBytes();
             static CommitTightState tightState;    // sticky: see CommitTightSticky

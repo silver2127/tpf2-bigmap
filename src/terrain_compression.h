@@ -2,6 +2,7 @@
 // eligible. Existing vectors, source heightmaps and rendering buffers stay on
 // their stock allocators. Enable before loading; never retrofit live pointers.
 #pragma once
+#include "memory_status.h"
 #include "terrain_pager.h"
 #include "small_pager.h"
 #include "terrain_warmup.h"
@@ -188,7 +189,7 @@ static void AutoTerrainBudgets(uint64_t totalBytes,int* hot,int* warm) {
 }
 static uint64_t InstalledPhysicalBytes() {
     MEMORYSTATUSEX m{};m.dwLength=sizeof m;
-    return GlobalMemoryStatusEx(&m)?m.ullTotalPhys:0;
+    return PagerMemoryStatus(&m)?m.ullTotalPhys:0;   // the simulated size when simulate_physical_mb is set
 }
 // Headroom the pagers keep free for the OS and the engine, sized to the
 // machine: physical/7, clamped to 2..12 GiB. 12 GiB was MEASURED as the need
@@ -363,7 +364,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // smaller of free RAM and free commit, and back off hard when commit is
             // nearly exhausted (a 512x512 desert preview hit std::bad_alloc at the
             // 114.6 GB commit limit while tiles were held uncompressed).
-            bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
+            bool haveStatus=PagerMemoryStatus(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
             static const uint64_t physical=InstalledPhysicalBytes();
             // Sized to the machine (CommitTightBytes): 10 GiB here, 4 GiB on 32 GiB;
