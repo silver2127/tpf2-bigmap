@@ -13,6 +13,7 @@
 #include "material_pager.h"
 #include "terrain_compression.h"
 static int g_materialCompress=0, g_materialHotMB=256, g_materialWarmMB=1024;
+static int g_materialMaxMB=0;   // material_cache_max_mb: hard cap on the resident target, 0 = auto (a quarter of the terrain cap), -1 = none
 static volatile LONG g_materialCompressActive=0;
 struct MaterialOwnedVector {uint8_t *first,*last,*end;};
 using MaterialResizeFn=void(__fastcall*)(MaterialOwnedVector*,size_t);
@@ -127,7 +128,9 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
             static const uint64_t physical=InstalledPhysicalBytes();
-            bool commitTight=haveStatus && m.ullAvailPageFile<CommitTightBytes(physical);
+            static CommitTightState tightState;    // sticky: see CommitTightSticky
+            bool commitTight=haveStatus && CommitTightSticky(tightState,m.ullAvailPageFile<CommitTightBytes(physical),m.ullAvailPageFile,
+                                                            CommitTightBytes(physical),(uint64_t(g_materialHotMB>256?g_materialHotMB-256:0)<<20)+(1ull<<30),now);
             bool pressure=haveStatus && m.ullAvailPhys<PagerHeadroom(physical);
             bool busy=InterlockedCompareExchange(&g_worldEntryActive,0,0)!=0;
             // Initial generation, edit boxes and a full repaint allocate or
@@ -147,6 +150,7 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             MaterialPager::SetThrottle(commitTight);
             if(commitTight && next>256)next=256;
             else if(!(busy||bulk))next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2);
+            { int cap=PagerCapMB(g_materialMaxMB,g_materialHotMB,physical,1); if(cap && next>cap)next=cap; }
             MaterialPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d pressure=%d free=%llu MiB)",effectiveMB,next,int(busy),int(bulk),int(commitTight),int(pressure),(unsigned long long)(m.ullAvailPhys>>20));
             effectiveMB=next;

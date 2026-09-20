@@ -7,6 +7,7 @@
 #include "terrain_warmup.h"
 static int g_terrainCompress=0, g_terrainHotMB=1024;
 static int g_terrainWarmMB=4096;
+static int g_terrainMaxMB=0;   // terrain_cache_max_mb: hard cap on the resident target, 0 = auto (PagerCapMB), -1 = none
 // Measurement stage of docs/terrain-cow-sharing.md: share the section between
 // the two CTerrain versions instead of copying, privatizing on first write.
 static int g_terrainCowShare=0;
@@ -216,6 +217,45 @@ static uint64_t CommitTightBytes(uint64_t physical) {
     if(t>10*GiB)t=10*GiB;
     return t;
 }
+// The automatic resident cap, the same on every machine that can afford it:
+// terrain 4 GiB, material a quarter of that, and physical/8 on machines
+// where that is less (16 GiB: 2 GiB / 512 MiB). Without a cap the steady
+// policy fills RAM down to the headroom, which is what keeps a big map
+// smooth -- and what made the game 20 GB on a 32 GiB machine while the
+// same save sat at 3 GB on a 94 GiB one that happened to be commit-tight
+// (2026-09-20). The user's ask: the same size everywhere; the price is
+// decodes (`cold restores/s` in the log). hot stays the floor.
+static int PagerCapMB(int configured,int hot,uint64_t physical,unsigned shareQuarters=4) {
+    constexpr uint64_t GiB=1024ull*1024*1024;
+    if(configured<0)return 0;                       // -1: no cap
+    uint64_t cap;
+    if(configured>0)cap=uint64_t(configured);
+    else {
+        uint64_t autoBytes=physical?physical/8:4*GiB;
+        if(autoBytes>4*GiB)autoBytes=4*GiB;
+        if(autoBytes<1*GiB)autoBytes=1*GiB;
+        cap=((autoBytes>>20)*shareQuarters)/4;
+    }
+    return int(cap>uint64_t(hot)?cap:uint64_t(hot));
+}
+// The commit-tight throttle with hysteresis. Raw `tight` is free commit under
+// CommitTightBytes; once tight, this stays tight until free commit clears the
+// threshold by more than this pager itself gives back when throttled (its
+// hot target minus the 256 MiB floor, plus 1 GiB), and for at least 30 s.
+// MEASURED 2026-09-20 on the 94 GiB rig with 9 GiB of free commit under a
+// 10 GiB threshold: the pager throttled to 256 MiB, its own 3 GiB release
+// cleared the threshold, it re-expanded, and the flag set again -- 74 flips
+// in one session, each one evicting and re-inflating the terrain in front of
+// the camera: the zoomed-in stutter.
+struct CommitTightState { bool tight=false; ULONGLONG since=0; };
+static bool CommitTightSticky(CommitTightState& st,bool raw,uint64_t availPageFile,uint64_t threshold,uint64_t releaseBytes,ULONGLONG now) {
+    if(raw){ if(!st.tight)st.since=now; st.tight=true; return true; }
+    if(st.tight) {
+        if(availPageFile<threshold+releaseBytes || now-st.since<30000)return true;
+        st.tight=false;
+    }
+    return false;
+}
 static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t available,uint64_t liveMB=0,uint64_t physical=0) {
     // Memory pressure overrides the warmup allowance. Available RAM is sampled
     // outside the pager lock; this is a conservative policy, not an allocation.
@@ -326,8 +366,11 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
             static const uint64_t physical=InstalledPhysicalBytes();
-            // Sized to the machine (CommitTightBytes): 10 GiB here, 4 GiB on 32 GiB.
-            bool commitTight=haveStatus && m.ullAvailPageFile<CommitTightBytes(physical);
+            // Sized to the machine (CommitTightBytes): 10 GiB here, 4 GiB on 32 GiB;
+            // sticky (CommitTightSticky), so this pager's own release cannot clear it.
+            static CommitTightState tightState;
+            bool commitTight=haveStatus && CommitTightSticky(tightState,m.ullAvailPageFile<CommitTightBytes(physical),m.ullAvailPageFile,
+                                                            CommitTightBytes(physical),(uint64_t(g_terrainHotMB>256?g_terrainHotMB-256:0)<<20)+(1ull<<30),now);
             // Free RAM under the machine's headroom: shrink and evict urgently.
             bool pressure=haveStatus && m.ullAvailPhys<PagerHeadroom(physical);
             bool busy=InterlockedCompareExchange(&g_worldEntryActive,0,0)!=0;
@@ -369,6 +412,10 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
                 }
                 next=steady;
             }
+            // The cap (configured, or the machine-independent automatic one) wins
+            // over every allowance: RAM for decodes, the user's trade; hot stays
+            // the floor.
+            { int cap=PagerCapMB(g_terrainMaxMB,g_terrainHotMB,physical,4); if(cap && next>cap)next=cap; }
             TerrainPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_terrainHotMB||effectiveMB==g_terrainHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("terrain compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d loading_tail=%d ui_signal=%d commit_tight=%d pressure=%d free=%llu MiB)",effectiveMB,next,int(busy),int(bulk),int(loading),int(uiTick!=nullptr),int(commitTight),int(pressure),(unsigned long long)(m.ullAvailPhys>>20));
             effectiveMB=next;
