@@ -219,22 +219,26 @@ static uint64_t CommitTightBytes(uint64_t physical) {
     return t;
 }
 // The automatic resident cap, the same on every machine that can afford it:
-// terrain 4 GiB, material a quarter of that, and physical/8 on machines
-// where that is less (16 GiB: 2 GiB / 512 MiB). Without a cap the steady
-// policy fills RAM down to the headroom, which is what keeps a big map
-// smooth -- and what made the game 20 GB on a 32 GiB machine while the
-// same save sat at 3 GB on a 94 GiB one that happened to be commit-tight
-// (2026-09-20). The user's ask: the same size everywhere; the price is
-// decodes (`cold restores/s` in the log). hot stays the floor.
+// terrain physical/4 clamped to 4..8 GiB (16 GiB: 4, 32 GiB and up: 8),
+// material a quarter of that. Without a cap the steady policy fills RAM
+// down to the headroom, which is what keeps a big map smooth -- and what
+// made the game 20 GB on a 32 GiB machine (2026-09-20). MEASURED the same
+// day with the policy simulating 32 GiB on a freshly generated big map: a
+// 4 GiB cap sat under the engine's working set -- 370-512 cold restores/s
+// steady with spikes to 5,971, the log's own "working set exceeds the
+// budget" -- while the game itself was 15 GiB private before the pager
+// held a byte. So the map is most of the 20 GB; the pager can only be
+// capped where its working set fits, and 8 GiB holds this one. The price
+// of any cap is decodes (`cold restores/s`). hot stays the floor.
 static int PagerCapMB(int configured,int hot,uint64_t physical,unsigned shareQuarters=4) {
     constexpr uint64_t GiB=1024ull*1024*1024;
     if(configured<0)return 0;                       // -1: no cap
     uint64_t cap;
     if(configured>0)cap=uint64_t(configured);
     else {
-        uint64_t autoBytes=physical?physical/8:4*GiB;
-        if(autoBytes>4*GiB)autoBytes=4*GiB;
-        if(autoBytes<1*GiB)autoBytes=1*GiB;
+        uint64_t autoBytes=physical?physical/4:8*GiB;
+        if(autoBytes>8*GiB)autoBytes=8*GiB;
+        if(autoBytes<4*GiB)autoBytes=4*GiB;
         cap=((autoBytes>>20)*shareQuarters)/4;
     }
     return int(cap>uint64_t(hot)?cap:uint64_t(hot));
