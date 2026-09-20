@@ -505,6 +505,22 @@ the real `msiexec` transactions (both orders, both directions, the shared
 registry value tracked and restored). It needs an elevated PowerShell because
 the packages are per-machine.
 
+### Virus-scanner findings
+
+The DLLs and the MSI are not code-signed, so any rule of the form *unsigned
+image loaded* matches them wherever the game loads them. One report (a mod site's
+sandbox scan, 2026-09-20) went further and matched *Unsigned Image Loaded Into
+LSASS Process*: its event named `C:\p250ps71\dll\OrqiEaoo.dll`, a randomly
+named file that is the sandbox's own monitoring hook, injected into every
+process including `lsass.exe`. Nothing here loads into any process but the
+game: the installer places the files in the table above and two registry
+strings under `HKLM\SOFTWARE\silver2127\TpF2 Big Maps`, registers no service,
+no security package, no `AppInit_DLLs`, and the plugin sets no hooks and opens
+no other process. The one custom action, on full uninstall only, runs
+`rundll32` on the plugin to put the stock `base_mod.lua` back. Compare the
+SHA-256 in such a report with the release assets' digests on the GitHub
+release page; they will not match.
+
 ### Uninstall
 
 Add/Remove Programs → **TpF2 Big Maps**. Puts the stock `res\config\base_mod.lua`
@@ -568,42 +584,93 @@ and read `numTilesX`/`numTilesY` back out of the `.sav` header with the snippet
 near the top of this file — that proves the value survived generation *and*
 serialization, which is stronger than trusting the log.
 
+The same log carries the pagers' `resident target` lines: one at start with the
+auto budgets for this machine's RAM, a few during the load, and then quiet. See
+*Reading the log* under Memory.
+
 ## Extended map ratios
 
 New Game ratios can now extend through **1:20** with `max_ratio=20` (Steam).
 Both stock and added size rows are supported; map-edge and heightmap limits
 still apply. See [map-ratios.md](docs/map-ratios.md) for dimensions and validation.
 
-## Experimental gameplay RAM reduction
+## Memory: what a big map costs, and how the plugin keeps it in check
 
-**Lossless 1 m cache compression is implemented separately**: set
-`terrain_cache_spacing_m=1`, `terrain_cache_compress=1` and optionally
-`terrain_cache_hot_mb=1024`, then restart. `terrain_cache_warm_mb=4096` provides
-a temporary larger resident allowance during generation/bulk allocation.
-Version 2 improves lossless encoding, reuses unchanged compressed tiles, and
-shares compressed COW copies. Native ownership/concurrency tests, world loading
-and two connected rail builds followed by save/reload pass. Runtime terrain backing settled near
-2.55 GiB on the 114x570-tile world. It preserves every sample and the octree.
-See [terrain-compression.md](docs/terrain-compression.md) for measured codec
-results, the fixed-address paging mechanism and validation status.
+**What the game itself needs.** Most of a big map's memory is the engine's own
+data, and no setting here changes that. Measured 2026-09-20: a freshly generated
+large stock map was **15 GiB private** at the end of generation before the
+plugin's caches held a byte, and a 44 MB save of a mid-sized world loaded to
+about 6.6 GiB. A 16 GiB machine cannot hold a 128 x 128 world however the caches
+are set; a 32 GiB one holds it at around 20 GB.
 
-The renderer upload mismatch is patched: 131x131 buffered CPU samples are
-expanded temporarily to the stock 259x259 GPU upload, including borders.
-**The 2 m experiment is discontinued after repeated terrain fragments, large
-tile seams and a rail construction crash. Keep the active setting at 1 m.**
-An alignment-coordinate bridge was deployed; the subsequent construction
-prototype was only built and unit-tested, and is not a validated gameplay fix.
+**What the plugin adds, and controls.** The 1 m terrain cache and the material
+grid are the two engine structures that scale with the map (see
+[terrain-compression.md](docs/terrain-compression.md) and
+[material-grid-lifetime.md](docs/material-grid-lifetime.md)). The plugin routes both through
+pagers that keep a *resident target* of tiles uncompressed and hold the rest
+compressed, losslessly, decoding a tile when the engine touches it (about
+0.2 ms each). Shipped on since 0.3.1. Once a second each pager sets its target
+from four rules, in this order:
 
-`terrain_cache_spacing_m=2` uses a 2 m derived terrain height cache when creating
-or loading a world. On the measured 114x570-tile map, the calculated cache
-payload saving is 5.98 GiB. The 4 m source heightmap and octree depth remain
-unchanged; fine terrain alignment and deformation become coarser.
+1. **Loading allowance.** While a world generates or loads, everything live may
+   stay resident up to what free RAM and free commit allow, less the machine's
+   headroom (`PagerHeadroom`: a seventh of RAM, 2..12 GiB). The loader re-reads
+   what was just evicted, so evicting during a load only makes it slower.
+2. **Steady state.** Afterwards the target ramps down by 1/16 a second toward
+   the *hot* budget, grows by 1/8 when the engine faults 300 or more evicted
+   tiles back in per second (`cold restores/s` in the log), and holds between.
+   Since 2026-09-20 the target the stutter feedback drove it to is kept as a
+   **working-set floor** that decays by 1/256 per quiet second (halves in about
+   three minutes) instead of sawtoothing back to hot every second the camera
+   rests -- on a 32 GiB machine that sawtooth was 1,000-2,000 decodes a second.
+3. **The cap.** `terrain_cache_max_mb` bounds the target: **0 = automatic, a
+   quarter of RAM clamped to 4096..8192 MiB** (16 GiB: 4096; 32 GiB and up:
+   8192), the same size on every machine that can afford it; `-1` removes it,
+   and the target then fills RAM down to the headroom, which is smoothest and
+   is what made the game 20 GB on a 32 GiB machine. `material_cache_max_mb`
+   is the same for material cells, automatic = a quarter of the terrain cap. A
+   cap below the map's working set is paid in decodes: at 300 or more
+   `cold restores/s` it is costing frames (a 4096 cap did, on a freshly
+   generated large map).
+4. **Commit pressure.** When free commit (RAM plus page file) drops under
+   `CommitTightBytes` (an eighth of RAM, 2..10 GiB) both pagers throttle to
+   256 MiB and evict urgently; when free RAM drops under the headroom they
+   shrink by 1/8 a second. The throttle is **sticky**: it holds until free commit
+   clears the threshold by more than the pager itself gives back, and for at
+   least 30 s. Without that, on a machine with no page file sitting 1 GiB under
+   the threshold, the pager's own 3 GiB release cleared it, it re-expanded, and
+   the flag set again -- 74 flips in one session, each re-inflating the terrain
+   in front of the camera: a stutter at every close zoom (2026-09-20).
 
-Use `1` and reload to restore 1 m caches. `0` preserves the saved/default
-resolution. Steam 35924 only, experimental; full gameplay verification is
-pending. See [gameplay-memory.md](docs/gameplay-memory.md) for evidence, tests
-and rollback. Build and run `python tools/test_terrain_cache.py` to check the
-hook and original game allocation instructions without modifying the game.
+**Budgets and knobs** (`plugins\tpf2_bigmap.cfg`, restart to apply):
+
+| key | default | meaning |
+| --- | --- | --- |
+| `terrain_cache_hot_mb` | `0` = auto: RAM/30, 256..4096 | the steady-state floor (94 GiB: 3195; 32 GiB: 1092) |
+| `terrain_cache_warm_mb` | `-1` = auto: RAM/12, up to 8192 | the allowance while loading |
+| `terrain_cache_max_mb` | `0` = auto: RAM/4, 4096..8192 | the cap; `-1` = none |
+| `material_cache_hot_mb` / `_warm_mb` / `_max_mb` | auto | the same three for material cells (hot RAM/180, 96..1024; warm RAM/48, up to 4096; cap a quarter of the terrain cap) |
+| `terrain_cache_evict_per_s` | `4000` | eviction ceiling at rest; `0` = unlimited |
+| `simulate_physical_mb` | `0` = off | **rig-only**: the policy sizes itself for a machine of this RAM, free RAM and free commit scaled to the real machine's fractions; the engine is not constrained. `32768` tests the 32 GiB sizing on a bigger PC |
+
+**Reading the log** (`%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log`): a
+`resident target A -> B MiB (... commit_tight=N pressure=N free=M MiB)` line
+per change of target (a handful per session is normal; dozens means the
+throttle is flapping), `N cold restores/s, resident target A -> B MiB (working
+set exceeds the budget)` when the engine is re-reading evicted tiles, and the
+`world entry:` lines with the process's private and resident size at each
+stage of a load.
+
+**If the game is bigger than you want.** Set `terrain_cache_max_mb` lower and
+watch `cold restores/s`; below 100 the cap is free, above 300 you are paying
+frames for RAM. The rest is the map: pick a smaller size.
+
+The experiments this replaced are kept for the record in
+[gameplay-memory.md](docs/gameplay-memory.md): the 2 m derived cache
+(`terrain_cache_spacing_m=2`, discontinued after terrain fragments, tile seams
+and a rail construction crash -- keep `1`), and the early fixed budgets. The
+renderer upload mismatch fix (131x131 buffered CPU samples expanded to the
+stock 259x259 GPU upload) is part of the 1 m cache and stays.
 
 ## Faster autosaves and manual saves
 
