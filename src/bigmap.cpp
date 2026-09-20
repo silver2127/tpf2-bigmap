@@ -1236,6 +1236,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
+    g_terrainMaxMB = H->cfgInt("tpf2_bigmap", "terrain_cache_max_mb", 0);
     g_terrainCowShare = H->cfgBool("tpf2_bigmap", "terrain_cow_share", 0) != 0;
     g_terrainDedupProbe = H->cfgBool("tpf2_bigmap", "terrain_dedup_probe", 0) != 0;
     g_terrainDedup = H->cfgBool("tpf2_bigmap", "terrain_dedup", 0) != 0;
@@ -1248,6 +1249,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
     g_materialHotMB = H->cfgInt("tpf2_bigmap", "material_cache_hot_mb", 0);
     g_materialWarmMB = H->cfgInt("tpf2_bigmap", "material_cache_warm_mb", -1);
+    g_materialMaxMB = H->cfgInt("tpf2_bigmap", "material_cache_max_mb", 0);
     // Auto budgets (hot 0, warm -1) are resolved at install; both imply a warm
     // allowance, so world-entry tracking must be on for them too.
     g_worldEntryTrackBusy = (g_terrainCompress==1 && (g_terrainWarmMB<0 || g_terrainWarmMB>g_terrainHotMB)) ||
