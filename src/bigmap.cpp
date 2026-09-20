@@ -1237,6 +1237,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
     g_terrainMaxMB = H->cfgInt("tpf2_bigmap", "terrain_cache_max_mb", 0);
+    g_simPhysicalMB = H->cfgInt("tpf2_bigmap", "simulate_physical_mb", 0);
+    if (g_simPhysicalMB > 0) H->log("[tpf2_bigmap] SIMULATING a %d MiB machine for the pager policy (simulate_physical_mb; rig-only)", g_simPhysicalMB);
     g_terrainCowShare = H->cfgBool("tpf2_bigmap", "terrain_cow_share", 0) != 0;
     g_terrainDedupProbe = H->cfgBool("tpf2_bigmap", "terrain_dedup_probe", 0) != 0;
     g_terrainDedup = H->cfgBool("tpf2_bigmap", "terrain_dedup", 0) != 0;
