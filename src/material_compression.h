@@ -149,7 +149,7 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             MaterialPager::SetUrgent(commitTight||pressure);
             MaterialPager::SetThrottle(commitTight);
             if(commitTight && next>256)next=256;
-            else if(!(busy||bulk))next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2);
+            else if(!(busy||bulk)){ static int wsFloor=0; next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2,&wsFloor); }
             { int cap=PagerCapMB(g_materialMaxMB,g_materialHotMB,physical,1); if(cap && next>cap)next=cap; }
             MaterialPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d pressure=%d free=%llu MiB)",effectiveMB,next,int(busy),int(bulk),int(commitTight),int(pressure),(unsigned long long)(m.ullAvailPhys>>20));
