@@ -84,19 +84,6 @@
          Signature order, last hit wins, hence the 1/2 prefixes: a folder
          remembered from an earlier install beats Steam's registration. -->
     <Property Id="INSTALLFOLDER" Secure="yes">
-      <!-- GOG registers the install folder here, one row per product id. The id
-           differs per product and per edition: the base game and its two
-           upgrade packs are three rows all pointing at the same folder, so the
-           search needs a wildcard and must be non-fatal. Last hit wins, so
-           this stays behind both searches below. -->
-      <?ifdef GogVariant ?>
-      <RegistrySearch Id="Search0GogGamePath"
-                      Root="HKLM"
-                      Key="SOFTWARE\WOW6432Node\GOG.com\Games\*"
-                      Name="path"
-                      Type="directory"
-                      Bitness="always64" />
-      <?endif?>
       <RegistrySearch Id="Search1SteamAppInstallLocation"
                       Root="HKLM"
                       Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780"
