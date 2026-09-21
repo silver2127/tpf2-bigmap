@@ -1,8 +1,8 @@
 # Builds TpF2BigMaps.msi the way a release does: installer\build_msi.ps1
 # (build.bat -> out\tpf2_bigmap.dll, the vendored shared binaries, wix build,
-# then an administrative-install validation). Every push to dev/main and every
-# pull request gets the MSI and its checksum as an artifact; a v* tag also gets
-# a draft GitHub release with them attached.
+# then an administrative-install validation). A push to main, a v* tag or a manual run
+# gets the MSI and its checksum as an artifact; a v* tag also gets a draft GitHub
+# release with them attached. Nothing builds on dev or pull requests.
 #
 # build.bat finds the runner's Visual Studio through vswhere, so no Build Tools
 # path is assumed. WiX v7 is installed as a .NET global tool; passing
@@ -17,11 +17,12 @@ name: Build MSI
 
 on:
   push:
-    branches: [dev, main]
+    branches: [main]
     tags: ['v*']
-    paths-ignore: ['docs/**', '*.md']
-  pull_request:
-    paths-ignore: ['docs/**', '*.md']
+    # docs and every Markdown file, release notes included, change no byte of the
+    # package. A release commit always touches installer/VERSION, so a tag is
+    # never filtered out by this.
+    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
 
 permissions:
@@ -32,7 +33,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ONE BUILD PER RELEASE. A release is a tag on a commit that main is then
+  # fast-forwarded to; both pushes would build the same bytes. The tag goes up
+  # first (tools/ci_run.py, the release recipe), so a main push finds its tag's
+  # run here and steps aside. A main push nobody tagged still builds.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.dup.outputs.skip }}
+    steps:
+      - id: dup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skip=false
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            tag=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&per_page=30" \
+              --jq '[.workflow_runs[] | select(.event == "push" and (.head_branch | startswith("v")) and (.id != ${{ github.run_id }}))] | .[0].head_branch // empty')
+            if [ -n "$tag" ]; then skip=true; echo "commit ${{ github.sha }} is release $tag: its tag run builds it"; fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
   msi:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
