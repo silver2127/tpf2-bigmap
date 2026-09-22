@@ -33,7 +33,8 @@ def check(name, cond, extra=""):
 
 class Terrain:
     """CTerrain+0x18 -> grid {x0,y0,nx,ny,records*}; record 40 B {entity, control*@8, version@0x20};
-    control+0x10 = std::vector<uint16_t> {first,last,end}."""
+    record+8 = the vector object {first,last,end} (make_shared: block+0x10), record+0x10 = its
+    control block (block+0)."""
 
     def __init__(self, nx, ny, full, seed):
         self.n = nx * ny
@@ -55,7 +56,8 @@ class Terrain:
                 c[k] = h
             rec = C.addressof(self.records) + 40 * i
             C.cast(rec, C.POINTER(C.c_int32))[0] = i
-            C.cast(rec + 8, C.POINTER(C.c_void_p))[0] = C.addressof(self.controls[i])
+            C.cast(rec + 8, C.POINTER(C.c_void_p))[0] = C.addressof(self.controls[i]) + 0x10
+            C.cast(rec + 0x10, C.POINTER(C.c_void_p))[0] = C.addressof(self.controls[i])
             C.cast(rec + 0x20, C.POINTER(C.c_int32))[0] = 1
             v = C.cast(C.addressof(self.controls[i]) + 0x10, C.POINTER(C.c_void_p))
             v[0] = C.addressof(c)

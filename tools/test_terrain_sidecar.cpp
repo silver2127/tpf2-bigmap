@@ -1,6 +1,6 @@
 // The terrain sidecar format and grid walk against a synthetic terrain grid
 // built to the game's exact layout (CTerrain+0x18 -> {x0,y0,nx,ny,records};
-// 40-byte records; record+8 -> control, vector at control+0x10). No game.
+// 40-byte records; record+8 = the vector object, record+0x10 its control block). No game.
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -35,13 +35,15 @@ struct FakeTerrain {
         *reinterpret_cast<uint8_t**>(cterrain + 0x18) = grid.data();
     }
     uint8_t* record(uint32_t i) { return grid.data() + 0x18 + size_t(i) * 40; }
-    // Give record i a height cache of `n` samples filled from `seed`: record+8
-    // -> a control block, vector {first,last,end} at control+0x10.
+    // Give record i a height cache of `n` samples filled from `seed`, laid out as
+    // make_shared does: block+0 control, block+0x10 the vector {first,last,end};
+    // record+8 = the vector object, record+0x10 = the control block.
     void makeTile(uint32_t i, size_t n, uint32_t seed) {
         auto& c = caches[i]; c.resize(n);
         std::mt19937 rng(seed); uint16_t h = uint16_t(20000 + rng() % 500);
         for (size_t k = 0; k < n; ++k) { h = uint16_t(h + int(rng() % 7) - 3); c[k] = h; }
-        *reinterpret_cast<uint8_t**>(record(i) + 8) = controls[i].data();   // control block
+        *reinterpret_cast<uint8_t**>(record(i) + 8) = controls[i].data() + 0x10;   // the vector object
+        *reinterpret_cast<uint8_t**>(record(i) + 0x10) = controls[i].data();       // its control block
         auto* v = reinterpret_cast<TileVector*>(controls[i].data() + 0x10);
         v->first = c.data(); v->last = c.data() + n; v->end = c.data() + n;
         *reinterpret_cast<int32_t*>(record(i) + 0) = int32_t(i);       // entity
