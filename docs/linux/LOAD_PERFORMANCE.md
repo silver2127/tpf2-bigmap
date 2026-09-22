@@ -83,8 +83,8 @@ switch stays off by default, and production was not restarted for these tests.
 The earlier 240 FPS experiment took 121.11 seconds and also showed no benefit.
 
 Do not extrapolate the Windows microbenchmark speedups to whole Linux loads.
-Other candidates, including bicubic refinement, alignment scratch reuse and
-terrain sidecars, still need native ABI identification and separate tests.
+The follow-up below implements native refinement, alignment and calculation
+caching; these were not included in the initial measurements above.
 
 The existing fast-save patches were also tested in the private process after
 holding and pausing the world: stock saving took 5.742 seconds, then the
@@ -93,3 +93,100 @@ comparison is not a controlled proof of sustained improvement.
 The save grew from 117,305,393 to 127,381,563 bytes (about 8.6%). After restoring
 all four original save-code sites, the stock loader read the optimized save
 successfully and reported `world_ready` in 57.863 seconds.
+
+## Follow-up: exact native terrain kernels
+
+`terrain_refine_fast=1` replaces native `InternBicubicRefine` at `0xd9b850`.
+Its CVec3f argument is a SysV aggregate in xmm0/xmm1; the Windows pointer ABI
+must not be used. The complete 0xb3d-byte function has FNV-1a fingerprint
+`b1513c7c66b75843`; its first 16 position-independent bytes form the trampoline.
+The SSE2 implementation retains operation ordering and runs stock code for
+unsupported factors/assert cases. FMA contraction is disabled at compile time.
+
+`terrain_align_fast=1` replaces `CalculateHeightMod` at `0xda1a70` (0xc76 bytes,
+FNV-1a `24620013235767ef`). The first 15 bytes form its trampoline. The port
+uses pooled scratch, exact SSE2 blending, the native rasterizer at `0x31bd660`
+and triangle entry at `0x31bd6e0`. Triangle coordinates are three SysV SSE
+aggregates. An empty alignment list leaves output unchanged and bypasses
+scratch fills and scanning. A scope guard returns scratch if rasterization
+throws. Unsupported inputs use the original implementation.
+
+Both patches participate in the plugin's preflight and rollback plan. The
+host must accept the exact game build before either function is read/patched.
+
+Tests execute the original functions from a private image of the user's ELF:
+
+- Refinement: 432 comparisons, 359,765,664 samples, including overlap cases.
+- Alignment: 1,536 comparisons, 16,957,824 samples, including randomized
+  triangles, all three types, default/custom weights, empty lists and edges.
+  Cases include the live 65x65 block shape and eight scales/four offsets.
+- Cold and warm cached outputs are compared with the same original outputs.
+- Six Soldier CTest suites pass, including corruption, wrong-input/size,
+  concurrent publication and budget tests for the persistent cache.
+
+The oracle executables accept the native `TransportFever2` path. They are
+standalone tests, not live-process injection. The game image is not distributed.
+
+## Persistent calculation cache
+
+`terrain_kernel_cache=1` enables a native cache under the mod data directory,
+`terrain-kernels-v2`. `terrain_kernel_cache_mb` bounds new entries (default
+2048 MiB). Restart after changing settings. Missing, malformed, foreign,
+truncated or checksum-invalid entries fall back to computation. Full keys are
+compared, so filename hash collisions cannot serve another input's output.
+Files are published atomically and cache allocation/I/O failures are optional.
+Once the budget is full, valid hits remain available and new writes stop.
+
+This replaces the proposed direct Windows `.terr` port with exact-input
+calculation reuse. It does not read/write Windows sidecars. Refinement keys
+include every source sample read, call parameters and floating-point controls;
+alignment keys also include the original result, triangle lists and weights.
+Save renaming or copying has no effect on matching. Edits change the inputs.
+Aliased calls bypass the cache. Hits skip calculation and restore only the
+function's output region. Empty alignment calls bypass cache I/O entirely.
+
+Disk caching is **off by default**. The initial implementation took 154.15 s
+cold and 135.30 s warm, versus 90.11 s with only the fast kernels and a
+15-second menu grace. It encountered 557,568 calls and filled its 2 GiB budget.
+This motivated word-wise checksums and skipping empty alignment cache entries.
+Do not enable disk caching based solely on its hit count.
+
+The kernel-only follow-up repeated at 92.12 and 93.11 s. These are whole startup times,
+including a separately configurable native multiplayer startup grace. They
+are not isolated kernel speedup measurements; the VPS also runs production.
+
+The revised cache measured 151.23 s cold and 118.19 s warm. It remains slower
+than computation on this save and stays disabled in the server configuration.
+The cache implementation is experimental; these results do not justify
+enabling it in production. A separate SDL startup failure before any terrain
+calls was discarded; the benchmark harness now waits for the private display
+and stops the game before stopping Xvfb.
+
+The remaining presentation experiment (`dedicated_nowsi=1`) took 94.10 s with
+the kernels and 15-second grace, versus 92.12 s normally. No new graphics skip
+is enabled. Terrain tessellation/SSAO/shadows were already disabled. Skipping
+render-data initialization wholesale still needs proof that its CPU consumers
+do not require the resulting vectors.
+
+## In-session save/reload check
+
+The private server held and paused the loaded world, saved `mp_perfcheck`
+(117,305,444 bytes, 4.271 s), then loaded that exact file three times in the
+same process. For the middle load only, the refinement/alignment prologues
+were restored to stock; min/max and row-copy stayed enabled throughout.
+The two detours were restored before the last load and again in `finally`.
+
+- New kernels, first reload: 69.484 s.
+- Stock refinement/alignment: 73.711 s.
+- New kernels, repeat reload: 72.371 s.
+
+All three emitted successful `world_ready` and accepted pause/hold commands.
+This is only a modest observed improvement (1.3–4.2 seconds), subject to cache
+and VPS scheduling variation. It does not establish a large join-time gain.
+The 15-second startup grace does not apply to these reloads.
+
+Standalone native kernel measurements (same VPS, original ELF functions):
+10,000 19x19 refinement calls took 0.273316 s stock / 0.103551 s optimized;
+1,000 65x65 alignment calls with six triangles took 0.111373 / 0.055869 s.
+Empty alignment calls took 0.015595 / 0.000294 s (including output reset).
+These microbenchmarks explain local wins, not a proportional whole-load gain.

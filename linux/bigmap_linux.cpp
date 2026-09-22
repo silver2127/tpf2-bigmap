@@ -12,6 +12,7 @@
 #include "density.h"
 #include "terrain_pager.h"
 #include "terrain_copy.h"
+#include "terrain_cached_kernels.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -197,7 +198,7 @@ bool PlanCall(uintptr_t rva,uintptr_t callee,void* target,uint8_t*& stub) {
 extern "C" __attribute__((visibility("default")))
 int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!host || !info || host->abiMajor!=TPF2MP_ABI_MAJOR || host->size<sizeof(Tpf2mpHost))return TPF2MP_ERR_ABI;
-    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.4","Native Linux large maps and exact terrain load optimizations"};
+    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.5","Native Linux large maps and exact terrain load optimizations"};
     const bool performanceOnly=H->cfgBool(Section,"performance_only",0);
     const auto baseMod=density::GamePath();
     std::string densityWhy;
@@ -266,6 +267,38 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
     const bool fastCopy=H->cfgBool(Section,"terrain_copy_fast",0);
+    const bool fastRefine=H->cfgBool(Section,"terrain_refine_fast",0);
+    if(fastRefine) {
+        constexpr uintptr_t site=0xd9b850;
+        const auto* code=reinterpret_cast<const uint8_t*>(H->moduleBase()+site);
+        uint64_t hash=14695981039346656037ull;
+        for(size_t i=0;i<0xb3d;++i)hash=(hash^code[i])*1099511628211ull;
+        if(hash!=0xb1513c7c66b75843ull)return TPF2MP_ERR_BUILD;
+        // Complete, position-independent prologue through push r12.
+        uint8_t after[16];std::memset(after,0x90,sizeof(after));
+        Jump(after,uintptr_t(TerrainRefineCached));
+        auto* trampoline=page+640;
+        std::memcpy(trampoline,code,16);Jump(trampoline+16,H->moduleBase()+site+16);
+        g_originalBicubicRefine=reinterpret_cast<BicubicRefineFn>(trampoline);
+        if(!Plan(site,code,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+    }
+    const bool fastAlign=H->cfgBool(Section,"terrain_align_fast",0);
+    if(fastAlign) {
+        constexpr uintptr_t site=0xda1a70;
+        const auto* code=reinterpret_cast<const uint8_t*>(H->moduleBase()+site);
+        uint64_t hash=14695981039346656037ull;
+        for(size_t i=0;i<0xc76;++i)hash=(hash^code[i])*1099511628211ull;
+        if(hash!=0x24620013235767efull)return TPF2MP_ERR_BUILD;
+        // SysV: box/size/list/result in rdi/rsi/rdx/rcx; floats in xmm0/xmm1.
+        const uint8_t before[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x49,0x89,0xd6};
+        uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));
+        Jump(after,uintptr_t(TerrainAlignCached));
+        auto* trampoline=page+704;
+        std::memcpy(trampoline,code,sizeof(before));Jump(trampoline+sizeof(before),H->moduleBase()+site+sizeof(before));
+        g_originalCalculateHeightMod=reinterpret_cast<CalculateHeightModFn>(trampoline);
+        g_terrainAlignBase=H->moduleBase();
+        if(!Plan(site,before,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+    }
     if(fastCopy) {
         uint8_t after[sizeof(TerrainCopyBytes)];std::memset(after,0x90,sizeof(after));
         Jump(after,uintptr_t(TerrainCopyBridge));
@@ -322,6 +355,16 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         H->log("density levels active: six sparse presets for towns, industries and industry target");
     }
     if(minMax)H->log("terrain min/max: exact SSE2 scan enabled");
+    if(fastRefine)H->log("terrain refinement: native SysV SSE2 kernel enabled");
+    if(fastAlign)H->log("terrain alignment: pooled scratch and native SSE2 blend enabled");
+    if(H->cfgBool(Section,"terrain_kernel_cache",0) && (fastRefine || fastAlign)) {
+        const std::string path=std::string(H->dataDir())+"/terrain-kernels-v2";
+        const auto budget=uint64_t(std::clamp(H->cfgInt(Section,"terrain_kernel_cache_mb",2048),64,16384))*1024*1024;
+        if(terrain_cache::Cache().Open(path,budget)) {
+            H->log("terrain kernel cache: exact inputs, persistent, bounded at %llu MiB",(unsigned long long)(budget>>20));
+            std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto& c=terrain_cache::Cache();H->log("terrain cache: hits=%llu misses=%llu writes=%llu rejected=%llu bytes=%llu",(unsigned long long)c.hits.load(),(unsigned long long)c.misses.load(),(unsigned long long)c.writes.load(),(unsigned long long)c.rejected.load(),(unsigned long long)c.used.load());}}).detach();
+        }else H->log("terrain kernel cache unavailable; using exact kernels");
+    }
     if(fastCopy)H->log("terrain row copy: wide disjoint copy enabled; overlapping rows retain scalar order");
     if(fastSave)H->log("fast saves: zstd level 1, 64 KiB input buffer; save files may be larger");
     if(terrainPager){
