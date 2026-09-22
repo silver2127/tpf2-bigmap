@@ -190,3 +190,18 @@ Standalone native kernel measurements (same VPS, original ELF functions):
 1,000 65x65 alignment calls with six triangles took 0.111373 / 0.055869 s.
 Empty alignment calls took 0.015595 / 0.000294 s (including output reset).
 These microbenchmarks explain local wins, not a proportional whole-load gain.
+
+## Production deployment
+
+The live world was held, paused and saved before restart (`mp_o_6ab2acae`).
+The VPS now runs the four exact kernels in performance-only mode, with disk
+caching, fast-save compression and terrain paging off. Native multiplayer's
+menu grace is 15 seconds. Steam stayed offline. The production restart took
+193.50 seconds and completed with a loaded world, an idle native controller,
+and listening lobby/bridge/relay sockets. Its remaining rendering
+initialization was visibly slower than the private warmed test setup, so the
+90–93-second private results must not be presented as the live restart time.
+
+Deployed plugin SHA-256:
+`51c2893b7e9001a44721af9caa4f43b01d17ee79ca5dcfc6b99e17fcfd881b95`.
+A client-join check remains for when the separate test machine is online.

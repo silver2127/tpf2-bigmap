@@ -388,4 +388,3 @@ static void CalculateHeightModDetour(const float* box, const int32_t* size, floa
     CalculateHeightModImpl(g_originalCalculateHeightMod, g_terrainAlignBase, box, size, scale,
                            offset, alignments, result);
 }
-
