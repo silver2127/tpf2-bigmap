@@ -68,6 +68,7 @@ static LoadGameFn originalLoad = nullptr;
 static uintptr_t base = 0;
 static bool backendOk = false;            // the three accessors verified byte for byte
 static bool (*inArena)(const void*) = nullptr;
+static uint64_t (*liveTiles)() = nullptr;   // the terrain pager's live tile count
 static volatile LONG64 saves = 0, written = 0, skipped = 0, loadsArmed = 0;
 
 // The save's directory for an id with an empty path, from the engine's backend.
@@ -106,25 +107,48 @@ static bool ResolveSavePath(const SaveGameId* id, char* out, size_t cap) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-// Is this CTerrain live and ours to read? Counts its full tiles; -1 = do not trust it.
+// Is this CTerrain live and ours to read? Counts its full tiles; negative = do not trust it:
+// -1 null, -2 no grid, -3 dimensions, -4 a full tile outside the pager's arena, -5 unreadable.
 static long CheckTerrain(void* terrain, long* recordsOut) {
     if (!terrain) return -1;
     __try {
         TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
-        if (!g.base || !g.records()) return -1;
+        if (!g.base || !g.records()) return -2;
         const int32_t nx = g.nx(), ny = g.ny();
-        if (nx <= 0 || ny <= 0 || nx > 4096 || ny > 4096) return -1;
+        if (nx <= 0 || ny <= 0 || nx > 4096 || ny > 4096) return -3;
         const uint32_t count = uint32_t(nx) * uint32_t(ny);
         if (recordsOut) *recordsOut = long(count);
         long full = 0;
         for (uint32_t i = 0; i < count; ++i) {
             const TerrainSidecar::TileVector* v = TerrainSidecar::VectorOf(g.record(i));
             if (!TerrainSidecar::Eligible(v)) continue;
-            if (inArena && !inArena(v->first)) return -1;   // a tile outside the arena: not the pager's world
+            if (inArena && !inArena(v->first)) return -4;   // a tile outside the arena: not the pager's world
             ++full;
         }
         return full;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -5; }
+}
+// The live CTerrain among the candidates: the alignment system's last, and every CTerrain
+// this load populated. A load holds two versions and frees one; the freed one fails the
+// checks or counts fewer full tiles than the pager has live. The winner must hold at least
+// 99% of the pager's live tiles, so a half-overwritten stale grid is never captured.
+static void* PickTerrain(long* fullOut, long* recordsOut, char* why, size_t whyCap) {
+    void* cands[5] = { g_alignmentTerrain, TerrainServe::seenTerrains[0], TerrainServe::seenTerrains[1], TerrainServe::seenTerrains[2], TerrainServe::seenTerrains[3] };
+    void* best = nullptr; long bestFull = 0, bestRecords = 0; size_t w = 0;
+    if (whyCap) why[0] = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (!cands[i]) continue;
+        bool dup = false; for (int k = 0; k < i; ++k) if (cands[k] == cands[i]) dup = true;
+        if (dup) continue;
+        long records = 0; const long full = CheckTerrain(cands[i], &records);
+        if (w + 40 < whyCap) w += size_t(snprintf(why + w, whyCap - w, "%s%p=%ld", w ? " " : "", cands[i], full));
+        if (full > bestFull) { best = cands[i]; bestFull = full; bestRecords = records; }
+    }
+    const uint64_t live = liveTiles ? liveTiles() : 0;
+    if (w + 40 < whyCap) snprintf(why + w, whyCap - w, "; pager live=%llu", (unsigned long long)live);
+    if (!best || (live && uint64_t(bestFull) * 100 < live * 99)) return nullptr;
+    *fullOut = bestFull; *recordsOut = bestRecords;
+    return best;
 }
 static long GuardedWrite(void* terrain, const char* path, BlockCodec::EncodeScratch* scratch, uint64_t* bytes) {
     __try { return TerrainSidecar::Write(TerrainSidecar::GridOf(terrain), 0, path, scratch, bytes); }
@@ -172,9 +196,9 @@ static void BeforeSave(const SaveGameId* id, PendingWrite& p) {
     InterlockedIncrement64(&saves);
     if (!g_sidecarWrite || !g_terrainServe) return;
     if (!ResolveSavePath(id, p.sav, sizeof p.sav)) { InterlockedIncrement64(&skipped); if (H) H->log("terrain sidecar: this save's path could not be resolved; no sidecar"); return; }
-    long records = 0;
-    const long full = CheckTerrain(g_alignmentTerrain, &records);
-    if (full <= 0) { InterlockedIncrement64(&skipped); if (H) H->log("terrain sidecar: no live terrain to capture (%s); no sidecar for this save", g_alignmentTerrain ? "the last seen CTerrain is not this world's" : "no alignment pass has run yet"); return; }
+    long records = 0, full = 0; char why[256];
+    void* terrain = PickTerrain(&full, &records, why, sizeof why);
+    if (!terrain) { InterlockedIncrement64(&skipped); if (H) H->log("terrain sidecar: no live terrain to capture (candidates: %s); no sidecar for this save", why[0] ? why : "none"); return; }
     if (g_sidecarMaxTiles > 0 && records > g_sidecarMaxTiles) {
         InterlockedIncrement64(&skipped);
         if (H) H->log("terrain sidecar: %ld grid records is over terrain_sidecar_max_tiles=%d; no sidecar for this save", records, g_sidecarMaxTiles);
@@ -187,7 +211,7 @@ static void BeforeSave(const SaveGameId* id, PendingWrite& p) {
     auto* scratch = new (std::nothrow) BlockCodec::EncodeScratch;
     if (!scratch) { InterlockedIncrement64(&skipped); return; }
     LARGE_INTEGER f{}, t0{}, t1{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-    p.tiles = GuardedWrite(g_alignmentTerrain, p.tmp, scratch, &p.bytes);
+    p.tiles = GuardedWrite(terrain, p.tmp, scratch, &p.bytes);
     QueryPerformanceCounter(&t1);
     delete scratch;
     p.encodeMs = f.QuadPart ? (t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart : 0;
@@ -231,6 +255,7 @@ static void* __fastcall SaveDetour(void* ret, void* meta, void* shot, void* cfg,
 static void* __fastcall LoadDetour(void* ret, void* ctx, void* modRep, const SaveGameId* id, void* mods, void* settings, void* pairs, bool flag, void* s1, void* s2, void* monitor) {
     // A new world: whatever CTerrain the alignment system last saw is gone.
     g_alignmentTerrain = nullptr;
+    TerrainServe::ForgetTerrains();
     if (g_terrainServe) {
         char sav[1040];
         if (ResolveSavePath(id, sav, sizeof sav)) {
@@ -259,6 +284,7 @@ static bool InstallSidecarIo() {
                 H->verifyBytes(kSaveDirRva, kSaveDirBytes, sizeof kSaveDirBytes);
     if (!backendOk) H->log("terrain sidecar: the save backend accessors do not match; only saves that carry their own folder get a sidecar");
     inArena = TerrainPager::Contains;
+    liveTiles = []() -> uint64_t { return TerrainPager::Snapshot().live; };
     g_sidecarIoStatus = SidecarIoStatus;
     if (!H->installHook(base + kLoadGameRva, reinterpret_cast<void*>(LoadDetour), sizeof kLoadGameBytes, reinterpret_cast<void**>(&originalLoad))) {
         H->log("terrain sidecar: LoadGame hook failed; sidecars are not read"); return false;
