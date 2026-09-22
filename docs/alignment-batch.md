@@ -99,3 +99,4 @@ one and exact multiples, and the byte anchors in the real executable.
   pass's wall time (`alignment pass: ... ms`) says what that would save.
   The sidecar's SaveGame/LoadGame hooks and fingerprint are the other
   session's; until they load a file, `terrain_sidecar=1` is inert.
+  (Wired 2026-09-21: `src/terrain_sidecar_io.h`, see `docs/terrain-sidecar.md`.)

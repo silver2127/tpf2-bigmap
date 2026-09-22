@@ -11,6 +11,50 @@ refine and the pass.
 
 ## Status
 
+**Wired since 2026-09-21** (`src/terrain_sidecar_io.h`): every save writes
+`<save>.terr` and every load arms it. Before that nothing wrote or armed a
+sidecar and `terrain_sidecar=1` was inert. How it works now:
+
+- **SaveGame** (`0x2e97c0`) is detoured. The terrain is captured at the
+  detour's *entry*, into `<save>.terr.tmp` with fingerprint 0: the world is
+  frozen for the length of the call, so the capture is exactly what the save
+  holds. When the engine returns and the `.sav`'s write time has moved, the file
+  is stamped with the new `.sav`'s hash (`Refingerprint`) and renamed over
+  `<save>.terr`. A failed save leaves no sidecar. Capturing after the engine
+  returned would race the first alignment of the resumed simulation.
+- **LoadGame** (`0x2e5ec0`) is detoured: it clears `g_alignmentTerrain`, resolves
+  the save's path, hashes the `.sav` and arms the sidecar (`ArmForLoad`). The
+  first `AddTile` of the load opens it, as before.
+- **The path** comes from the `SaveGameId` both functions receive
+  (`{ wstring path; string name; string ns }`): `<path>\<name>.sav`, and for an
+  id with no path the directory `StandardSaveGameBackend` keeps for `ns`
+  (`0xbb23c0` app, `0xbb2db0` backend, `0x2471640` directory lookup, the
+  backend's vftable checked against `0x38e5758`). All five sites are
+  byte-verified; paths are UTF-8 and opened wide.
+- **Found by fingerprint.** Multiplayer loads a *copy* of the host's save as
+  `mp_shared.sav`; the copy has the same bytes, so when `<save>.terr` is absent
+  or foreign the loader takes any `.terr` in that folder whose header carries
+  the save's hash (32 bytes read per candidate).
+- **Which terrain.** `g_alignmentTerrain`, trusted only when its grid is sane
+  and every full tile's cache lies in the terrain pager's arena.
+- **Orphans.** Autosaves rotate; after each write a `.terr` whose `.sav` is gone
+  is deleted.
+- **Cost** (synthetic tiles, 2026-09-21): 0.17 ms and 22.7 KiB per tile, 17.6 %
+  of raw. 8,712 tiles: 1.5 s, 190 MiB. 65,536 tiles: 11 s, 1.4 GiB, on every
+  save. There is no size limit by default (the owner's call, 2026-09-21: a slow
+  save is fine, the load is what matters); `terrain_sidecar_max_tiles=<n>` skips
+  the sidecar above n grid records.
+  `terrain_sidecar_write=0` reads sidecars without writing them.
+- **Test:** `python tools\test_sidecar_io.py` (16 checks, a non-ASCII folder).
+- **Not yet measured in a game.** What a served load saves is the refine's and
+  the pass's *publication* into served tiles; their compute still runs. The
+  first real numbers should come from the `terrain sidecar:` log lines and the
+  `alignment pass:` timings of a load with and without the file. A save sent to
+  another machine (the dedicated server) needs its `.terr` sent with it.
+
+The rest of this section is the groundwork as first recorded.
+
+
 Built and tested here: the **file format**, the **grid walk** that reads and
 restores every tile's height cache, and the **codec** (the variable-length
 `BlockCodec` from `small_codec.h`). `tools/test_terrain_sidecar.cpp` builds a

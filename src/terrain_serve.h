@@ -122,11 +122,14 @@ static bool InstallTerrainServe() {
     H->log("terrain sidecar: a loaded sidecar's tiles are applied at AddTile and the load's publication into them is skipped");
     return true;
 }
+// Set by terrain_sidecar_io.h when its hooks install: the save/load hook counters.
+static int (*g_sidecarIoStatus)(char* out, size_t cap) = nullptr;
 // One line for the pager's 30 s log, empty when nothing happened.
 static int TerrainServeStatus(char* out, size_t cap) {
     using namespace TerrainServe;
-    if (!calls) { if (cap) out[0] = 0; return 0; }
-    return snprintf(out, cap, " sidecar: add_tile=%lld applied=%lld unmarked=%lld absent=%lld not_found=%lld decode_failed=%lld probes=%lld copies_skipped=%lld",
+    char io[128] = ""; if (g_sidecarIoStatus) g_sidecarIoStatus(io, sizeof io);
+    if (!calls) return snprintf(out, cap, "%s", io);
+    return snprintf(out, cap, "%s", io) < 0 ? 0 : snprintf(out + strlen(out), cap - strlen(out), " sidecar: add_tile=%lld applied=%lld unmarked=%lld absent=%lld not_found=%lld decode_failed=%lld probes=%lld copies_skipped=%lld",
         calls, applied, unmarked, absent, notFound, decodeFailed, probes, g_terrainServedCopiesSkipped);
 }
 extern "C" __declspec(dllexport) void BigmapTestServeDetour(void* terrain, int entity, TerrainServe::AddTileFn fn, bool (*markFn)(const void*)) {
