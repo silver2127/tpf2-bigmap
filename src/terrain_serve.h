@@ -59,6 +59,20 @@ static long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     }
     return -1;
 }
+// Every CTerrain this load populated (a load holds two versions briefly and frees one).
+// The SaveGame hook validates each and captures the live one: the alignment system's
+// last-seen pointer alone was the FREED version on an idle world (2026-09-21, the
+// dedicated server's first save: "the last seen CTerrain is not this world's").
+static void* seenTerrains[4] = {};
+static SRWLOCK seenLock = SRWLOCK_INIT;
+static void NoteTerrain(void* t) {
+    for (void* s : seenTerrains) if (s == t) return;          // the common case, no lock
+    AcquireSRWLockExclusive(&seenLock);
+    bool have = false; for (void* s : seenTerrains) if (s == t) have = true;
+    if (!have) { for (int i = 3; i > 0; --i) seenTerrains[i] = seenTerrains[i - 1]; seenTerrains[0] = t; }
+    ReleaseSRWLockExclusive(&seenLock);
+}
+static void ForgetTerrains() { AcquireSRWLockExclusive(&seenLock); for (void*& s : seenTerrains) s = nullptr; ReleaseSRWLockExclusive(&seenLock); }
 static SRWLOCK beginLock = SRWLOCK_INIT;
 static volatile LONG64 beginMs = 0;   // wall time of the sidecar's open + verify, in the first AddTile of the load
 // The LoadGame hook armed a fingerprint (TerrainSidecar::ArmForLoad); the
@@ -83,6 +97,7 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     original(terrain, entity, a2, a3);
     InterlockedIncrement64(&calls);
     if (!g_terrainServe || !terrain) return;
+    NoteTerrain(terrain);
     BeginIfArmed(terrain);
     if (!TerrainSidecar::Loaded()) return;
     TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
