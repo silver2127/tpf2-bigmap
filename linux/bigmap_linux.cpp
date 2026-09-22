@@ -196,7 +196,7 @@ bool PlanCall(uintptr_t rva,uintptr_t callee,void* target,uint8_t*& stub) {
 extern "C" __attribute__((visibility("default")))
 int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!host || !info || host->abiMajor!=TPF2MP_ABI_MAJOR || host->size<sizeof(Tpf2mpHost))return TPF2MP_ERR_ABI;
-    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.3","Native Linux large maps, sparse density and lossless terrain paging"};
+    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.4","Native Linux large maps, sparse density and lossless terrain paging"};
     const auto baseMod=density::GamePath();
     std::string densityWhy;
     // Remove our prior labels before validating hooks, so a failed initialization
@@ -209,6 +209,10 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!enabled)return TPF2MP_ERR_DISABLED;
     if(H->cfgBool(Section,"minimap",0))
         H->log("minimap: unavailable on native Linux; image binding and terrain accessor are not verified (docs/linux/PORT.md)");
+    if(H->cfgBool(Section,"terrain_blocks",0) || H->cfgInt(Section,"alignment_batch_tiles",0)>0)
+        H->log("alignment blocks/batching: unavailable on native Linux; allocation ownership and batch lifetime await live verification (docs/linux/PORT.md)");
+    if(H->cfgInt(Section,"terrain_cache_evict_per_s",0)>0 || H->cfgInt(Section,"terrain_cache_warm_mb",0)>0)
+        H->log("terrain policy: Linux retains a fixed hot budget; Windows loading/commit/frame-adaptive policy is not ported (docs/linux/PORT.md)");
     const int depth=H->cfgInt(Section,"octree_depth",11);
     if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
     cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;
@@ -265,6 +269,17 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(entry));
         if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
+    // The Linux ELF pools these constants in .rodata. All six RIP-relative
+    // readers are recorded in docs/linux/PORT.md; no Windows RVA is reused.
+    for(const auto& cell : {std::pair<const char*,uintptr_t>{"travel_time_limit_s",0x43029a8},
+                            {"cargo_path_time_s",0x43029a4}}) {
+        int value=H->cfgInt(Section,cell.first,0);
+        if(value<=0)continue;
+        float stock=cell.second==0x43029a8?1200.f:6000.f;
+        float replacement=float(std::clamp(value,60,86400));
+        if(!Plan(cell.second,reinterpret_cast<const uint8_t*>(&stock),
+                 reinterpret_cast<const uint8_t*>(&replacement),4))return TPF2MP_ERR_BUILD;
+    }
     const bool minMax=H->cfgBool(Section,"terrain_minmax_fast",1);
     if(minMax) {
         const uint8_t before[]={0xf,0xb7,0x13,0x48,0x83,0xc3,0x2,0xf,0xb7,0xc2,0x41,0x89,0xd5,0xeb,0x16,0xf,0x1f,0x80,0x0,0x0,0x0,0x0,0x44,0xf,0xb7,0x3b,0x41,0x89,0xc5,0x48,0x83,0xc3,0x2,0x41,0xf,0xb7,0xc7,0x66,0x44,0x39,0xe8,0x72,0xa,0x66,0x39,0xc2,0xf,0x42,0xd0,0x41,0xf,0xb7,0xc5,0x49,0x39,0xde,0x75,0xdc};
@@ -286,7 +301,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         // Dispose is the shared-vector control block's exact native free path.
         auto* candidate=new linux_pager::TerrainPager;
         const int hot=std::clamp(H->cfgInt(Section,"terrain_cache_hot_mb",1024),128,16384);
-        if(!candidate->Start(1u<<20,size_t(hot)<<20)) {
+        if(!candidate->Start(1u<<20,size_t(hot)<<20,H->cfgBool(Section,"terrain_dedup",1),H->cfgBool(Section,"terrain_lazy_zero",1))) {
             delete candidate;H->log("terrain compression unavailable: userfaultfd missing/write-protect support required");
         } else {
             terrainPager=candidate;
@@ -318,7 +333,14 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(fastSave)H->log("fast saves: zstd level 1, 64 KiB input buffer; save files may be larger");
     if(terrainPager){
         H->log("terrain compression: Linux userfaultfd, lossless 1 m codec, enabled");
-        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto s=terrainPager->Get();H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu",(unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,(unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals);}}).detach();
+        if(H->cfgBool(Section,"terrain_dedup_probe",0))std::thread([]{for(;;){
+            std::this_thread::sleep_for(std::chrono::seconds(120));
+            try {auto p=terrainPager->Probe();H->log("terrain dedup probe (hash groups): hashed=%llu skipped=%llu distinct=%llu duplicates=%llu zero=%llu pairs=%llu largest=%llu",
+                (unsigned long long)p.hashed,(unsigned long long)p.skipped,(unsigned long long)p.distinct,
+                (unsigned long long)p.duplicates,(unsigned long long)p.zero,(unsigned long long)p.pairs,(unsigned long long)p.largest);}
+            catch(const std::bad_alloc&){H->log("terrain dedup probe: allocation failed");}
+        }}).detach();
+        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto s=terrainPager->Get();H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu dedup_hits=%llu",(unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,(unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals,(unsigned long long)s.dedupHits);}}).detach();
     }
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
     H->log("Experimental port: depth 12/13 and material compression are not enabled");

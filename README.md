@@ -6,8 +6,9 @@ Maps larger than Transport Fever 2's New Game menu will build.
 [Linux installation](docs/linux/INSTALL.md) and [port scope and evidence](docs/linux/PORT.md).
 It supports large-map controls through 512 tiles per edge and six sparse density
 presets for towns and industries. Linux dev.3 adds opt-in lossless terrain RAM
-compression, faster saves and an exact SIMD terrain scan. Material compression,
-the remaining Windows speed optimizations and depth 12/13 are not yet included.
+compression, faster saves and an exact SIMD terrain scan. Linux dev.4 adds lazy zero terrain tiles, compressed-content deduplication and
+travel-time controls. Alignment batching, block/material paging, adaptive memory
+policy and depth 12/13 remain unported; see [integration evidence](docs/linux/PORT.md#windows-integration-bd0d85f-linux-dev4-partial).
 The Windows minimap from `cdfee2a` is not yet available on native Linux;
 see the [integration evidence](docs/linux/PORT.md#minimap-integration-cdfee2a-partial).
 
@@ -615,6 +616,17 @@ same-world comparison with stock total save time remains outstanding.
 Save contents and format are unchanged. Set `0` and restart to restore stock
 compression. See [save-performance.md](docs/save-performance.md) for validation
 and limitations.
+
+## Travel-time limits
+
+`travel_time_limit_s` and `cargo_path_time_s` rewrite the two `.rdata` cells
+that hold the urbansim's limits (Steam 35924): 1200 s, the 20 minutes at 1x
+within which a cargo type must be able to reach a consumer's station (the same
+cell bounds people's paths and destination choice), and 6000 s, the longest path
+the path builder gives a cargo item. Values are game seconds, 0 keeps stock,
+others clamp to 60..86400. Byte-verified; `python tools\test_travel_time.py`.
+Shipped off: on a big map, set `travel_time_limit_s=3600` to let demand reach
+towns an hour apart.
 
 ## Licence
 

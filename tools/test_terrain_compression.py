@@ -34,17 +34,63 @@ def main():
     live=dll.BigmapTestTerrainBudgetLive;live.argtypes=[C.c_int]*4+[C.c_uint64,C.c_uint64]
     G=1<<30
     for args,want in [((1024,4096,1,0,64*G,8000),8000),        # loading: cover every live tile
-                      ((1024,4096,0,1,16*G,8000),8000),        # 16 GiB free: a quarter reserved, 12 GiB usable
-                      ((1024,4096,1,0,30*G,30000),23040),      # capped at available minus a quarter
+                      ((1024,4096,0,1,16*G,8000),4096),        # 16 GiB free: 12 reserved, warm is the floor
+                      ((1024,4096,1,0,30*G,30000),15360),      # capped at half of available
                       ((1024,4096,1,0,200*G,100000),65536),    # absolute clamp
                       ((1024,4096,1,0,64*G,2000),4096),        # never below warm while loading
                       ((1024,4096,1,0,5*G,20000),4096),        # small machine: 2 GiB floor reserve, warm is the floor
                       ((1024,4096,0,0,64*G,8000),1024),        # not loading: hot
                       ((1024,0,1,0,64*G,8000),1024),           # warm disabled stays disabled
-                      ((1024,4096,1,1,7*G,8000),5120),         # 7 GiB free: 2 GiB reserve
+                      ((1024,4096,1,1,7*G,8000),4096),         # 7 GiB free: inside the 12 GiB reserve, warm is the floor
                       ((1024,4096,1,1,(4*G)-1,8000),1024),     # below the gate: hot
                       ((3072,4096,1,0,64*G,0),4096)]:          # no live size: warm only
         assert live(*args)==want,(args,live(*args),want)
+    # Steady state after a load: ramp down instead of snapping, hold or grow
+    # while the engine faults evicted tiles back in, cap by what is free.
+    steady=dll.BigmapTestTerrainBudgetSteady;steady.argtypes=[C.c_int]*3+[C.c_uint64,C.c_uint64]
+    for args,want in [((13365,3195,3195,0,64*G),12530),     # quiet: down by 1/16 per second
+                      ((300,256,256,0,64*G),256),           # the floor is the policy's own target
+                      ((8000,3195,3195,150,64*G),8000),     # 100..299 cold restores/s: hold
+                      ((8000,3195,3195,500,64*G),9000),     # >= 300/s: grow by 1/8
+                      ((600,3195,3195,500,64*G),3195),      # never below the floor
+                      ((8000,3195,3195,500,8*G),3195),      # 8 GiB free: all reserve, the ceiling is the floor
+                      ((9000,3195,3195,500,24*G),9339),     # 24 GiB free: 12 reserved, half of 12 on top of hot
+                      ((8000,3195,3195,0,24*G),7500),       # a quiet ramp under the ceiling
+                      ((12000,3195,3195,0,24*G),9339),      # the ceiling also pulls a quiet ramp down faster
+                      ((65000,3195,3195,500,400*G),65536),  # absolute clamp
+                      ((3195,3195,3195,500,64*G),3594),     # from the floor: +1/8, at least 128
+                      ((500,400,400,500,64*G),628)]:        # small budgets grow by the 128 MiB minimum
+        assert steady(*args)==want,(args,steady(*args),want)
+    # Adaptive eviction rate: cost cap (a quarter core), stall halving, quiet growth.
+    step=dll.BigmapTestEvictRateStep;step.argtypes=[C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.POINTER(C.c_uint64),C.c_uint64,C.c_uint,C.c_int,C.c_uint];step.restype=C.c_uint
+    def run(rate,quiet,avg,stalls,ui,ceil,cost=0):
+        r,q,k=C.c_uint(rate),C.c_uint(quiet),C.c_uint64(cost);out=step(C.byref(r),C.byref(q),C.byref(k),avg,stalls,ui,ceil);return out,r.value,q.value
+    def cost_after(cost,avg):
+        r,q,k=C.c_uint(1000),C.c_uint(0),C.c_uint64(cost);step(C.byref(r),C.byref(q),C.byref(k),avg,0,1,4000);return k.value
+    assert cost_after(0,400)==400                      # first measurement is taken whole
+    assert cost_after(400,800)==500                    # then three parts old, one new
+    assert cost_after(400,0)==400                      # a second without evictions keeps it
+    assert run(4000,9,0,0,1,4000,cost=400)==(625,625,10)   # ... and the remembered cost still caps
+    assert run(0,0,0,0,1,4000)==(1000,1000,1)          # first second: starts at 1000
+    assert run(0,0,0,0,1,600)==(600,600,1)             # ... or at the ceiling if lower
+    assert run(1000,0,400,0,1,4000)==(625,625,1)       # 400 us each: 250 ms/s allows 625
+    assert run(1000,0,50,0,1,4000)==(1000,1000,1)      # cheap: cost cap above the rate
+    assert run(1000,3,400,1,1,4000)==(500,500,0)       # a stall halves and resets quiet
+    assert run(120,0,400,1,1,4000)==(100,100,0)        # never below 100
+    assert run(500,5,100,0,1,4000)==(625,625,6)        # sixth quiet second: +25%
+    assert run(500,5,400,0,1,4000)==(625,625,6)        # ... but capped by the cost
+    assert run(3800,9,10,0,1,4000)==(4000,4000,10)     # ... and by the ceiling
+    assert run(500,5,0,1,0,4000)==(625,625,6)          # no UI signal: stalls are ignored
+    assert run(500,5,5000,0,1,4000)==(100,100,6)       # 5 ms each: floor 100
+    assert run(1000,0,400,0,1,0)==(0,1000,0)           # ceiling 0: unlimited, state untouched
+    stallsOf=dll.BigmapTestUiStalls;stallsOf.argtypes=[C.POINTER(C.c_uint64),C.c_int];stallsOf.restype=C.c_uint
+    def stalls(seq):
+        arr=(C.c_uint64*len(seq))(*seq);return stallsOf(arr,len(seq))
+    assert stalls([100,125,150,175])==0                # 60 fps: stamps 25 ms apart as sampled
+    assert stalls([100,125,225,250])==1                # one 100 ms gap
+    assert stalls([100,100,100,160])==1                # stamp held for 60 ms: one stall
+    assert stalls([100,159,218])==0                    # 59 ms gaps do not count
+    assert stalls([0,0,100,200,0,300])==1              # zeros (no world) never pair with a stamp
     assert dll.BigmapTestCompressionInit()
     resize=dll.BigmapTestCompressionResize;resize.argtypes=[C.POINTER(Vec),C.c_size_t,C.c_int,Resize]
     copy=dll.BigmapTestCompressionCopy;copy.argtypes=[C.POINTER(Vec),C.POINTER(Vec),C.c_int,Copy];copy.restype=C.c_void_p

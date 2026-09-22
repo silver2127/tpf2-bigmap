@@ -246,3 +246,170 @@ parses under system Lua 5.2 (`luac -p`). A standalone run of the new
 map-file parser on the test's sample file gave the expected player-to-company
 mapping, local company and unescaped names. `tools/test_minimap.py` was not run
 because it loads the Windows `out/tpf2_bigmap.dll` and needs `pefile`/`lupa`.
+
+## Windows integration bd0d85f (Linux dev.4, partial)
+
+Integrated on 2026-09-22: the oldest twenty Windows commits, `6121934` through
+`bd0d85f2b01f9564f6a9b77aecef684d7e0026af`. The original baseline above remains
+historical; this is an incremental merge into `linux-native`. No conflicts were
+present. Windows sources and tests are preserved. The merge is staged, not
+committed. The remaining 27 Windows commits are outside this integration.
+
+| Windows commits | Native disposition |
+| --- | --- |
+| `6121934`, `a75f83e`, `ae3027e` | Native terrain deduplication and diagnostic hash-group census; Windows measurement documentation merged unchanged. |
+| `4b39aad`, `a0805be`, `5271b75`, `48946d2`, `c4aa846`, `09fd641`, `35317e7` | Working-set/loading budgets, section retry, commit pressure and adaptive eviction policy remain unported; investigation below. |
+| `101d36e` | Both travel-time controls ported to verified Linux data cells. |
+| `9431584` | Lazy zero terrain allocations through userfaultfd missing-page handling. |
+| `8f4e6a9`, `52ede02`, `cce148a`, `0d2c47e`, `b528366` | Block routing, block diagnostics, small pager and commit backpressure remain unported. Shared block codec builds and is tested natively. |
+| `c76db05`, `30cb13a`, `bd0d85f` | Batching implementation and corrected 32-byte values retained for Windows; Linux tree/lifetime investigation below. Windows measurements are not Linux results. |
+
+### Native pager changes
+
+`terrain_lazy_zero=1` leaves a newly allocated slot missing, with explicit zero
+metadata and no blob. Its first read or write copies one zero-filled stride using
+UFFDIO_COPY, then removes write protection and wakes the faulting threads.
+Untouched release does not restore pages. `terrain_lazy_zero=0` retains eager
+UFFDIO_ZEROPAGE initialization. Both preserve the existing CTerrain allocation
+and release ABI; no new game allocation hooks or offsets are introduced.
+
+`terrain_dedup=1` indexes immutable packed blobs by the codec hash. Before sharing,
+the policy worker decodes a candidate and compares **all 132,098 sample bytes**
+against the write-protected resident tile. Hash collisions cannot authorize a
+false share. A hit takes a reference and skips encoding; a miss creates a blob.
+The index is non-owning, removes the entry on final release, and uses a separate
+mutex with slot-before-index lock ordering. Restore always creates private
+resident pages and drops its blob reference, even for a read. This differs from
+Windows' retained read-only restored views, but preserves exact contents and
+independent lifetimes. Packed byte statistics count shared mappings once.
+Index/metadata allocation failure refuses that eviction and unprotects the tile.
+
+`terrain_dedup_probe=1` reports hashed, skipped, distinct, duplicate, zero, pair
+and largest-group counts every 120 seconds. Cold tiles use their stored hashes;
+resident tiles are write-protected during hashing; lazy zeros need no restore.
+This is a diagnostic census of hash groups, not an atomic world snapshot or an
+exact equality proof. Unlike Windows, there is no ten-second loading cadence or
+low-half diagnostic. There is no verified native loading signal. Probing can
+stall writers and defaults off. Dedup and lazy zero default on **only inside the
+opt-in terrain compression backend**; terrain compression itself still defaults
+off. No Linux load-speed or memory-saving measurement is claimed for dev.4.
+
+### Travel-time RE and guards
+
+The actual ELF's `.rodata` has the same two float values at different addresses:
+
+| Linux RVA | Stock bytes | Setting / consumers |
+| --- | --- | --- |
+| `0x43029a8` | `00 00 96 44` (1200.f) | `travel_time_limit_s`: PathFactory, destination scoring, reachable-station BFS |
+| `0x43029a4` | `00 80 bb 45` (6000.f) | `cargo_path_time_s`: PathFactory and StockListSystem |
+
+A complete `objdump -d -M intel` scan found four RIP-relative readers of 1200:
+`0x14e1779`, `0x14fe79e`, `0x1500013`, `0x1500233`; and two of 6000:
+`0x14e178d`, `0x172cc06`. Their instruction bytes respectively are
+`f3 0f 10 15 27 12 e2 02`, `f3 0f 10 2d 02 42 e0 02`,
+`f3 0f 10 05 8d 29 e0 02`, `f3 0f 10 05 6d 27 e0 02`,
+`f3 0f 10 25 0f 12 e2 02`, `f3 0f 10 05 96 5d bd 02`.
+The reader instructions are evidence, not patched sites.
+
+PathFactory.cpp assert/signature references anchor `0x14e13c0`: it loads 1200
+into xmm2, stores the stack limit at rbp-0xbb8, conditionally replaces it with
+6000 from xmm4, then passes that limit in xmm0 at `0x14e1825`.
+The destination_util.cpp function `0x14fe200` compares accumulated time against
+1200 at `0x14fe7a6`. The two destination tasks at `0x14fff50`/`0x1500170` pass
+1200 in xmm0 to `0x1558870` at `0x1500022`/`0x1500242`. That callee's source and
+signature references at `0x155953c`/`0x1559548` identify
+`simulation_util::path_finder::GetReachableStationsBFS(int,float,...)`.
+StockListSystem.cpp signatures identify `0x172c970` as `Produce`; its load at
+`0x172cc06` supplies 6000 in xmm0. These independently establish the shared
+constants' roles without importing Windows addresses or struct layouts.
+
+Only the two four-byte data cells are changed. SysV floating arguments continue
+through the stock instructions; no trampoline, object layout or ownership
+contract changes. Values <=0 leave stock; positive settings clamp to 60..86400.
+Both sites participate in the existing verify-all-before-write plan and rollback.
+A mismatch refuses initialization before publishing patches. The ELF manifest
+now has 22 sites. Live gameplay effects remain untested (launch failure below).
+
+### Not ported: static attempts and missing live proof
+
+**Alignment batching.** Signature exports identify `0x173cbe0` as the thread-pool
+loop for `TerrainAlignmentSystem::UpdateSubterrains(const std::map<CVec2i,
+std::vector<Box2>>&)`. Actual disassembly traces its caller to `0x173dae0`:
+`rdi=self` is saved in r14 at `0x173daec`, `rsi=map` in r12 at `0x173daf3`.
+It reads the leftmost node at map+0x18 (`0x173db87`), uses map+8 as sentinel
+(`0x173db8c`), and calls libstdc++ `_Rb_tree_increment` at `0x173e018`.
+Its direct caller at `0x173e443` has bytes `e8 98 f6 ff ff`. The loop call is
+`0x173e0a6 -> 0x173cbe0`; publication calls `0xcf56d0` at `0x173e16f`,
+followed by delete calls including `0x173e180` and `0x173e1a9`.
+The caller clears the tree rooted at self+0xa0 (header self+0xa8, count +0xc8).
+This is not the MSVC head/isnil layout. No fake native tree is published.
+Still required: live map nodes and full 32-byte values, vector ownership across
+thread-pool completion, and proof that publishing one batch cannot affect the
+computation of later batches. The lab launch failed before these probes could
+attach, so `alignment_batch_tiles` remains disabled with a request diagnostic.
+
+**Work/result blocks and small pager.** Source/signature anchors and disassembly
+locate Linux `terrain_util::GetBlock` at `0xdb55c0`. It squares the dimension at
+`0xdb587b`, doubles the sample count at `0xdb5881`, and calls operator new
+(`0x6dbce0`) with bytes in rdi at `0xdb589e` (`e8 3d 64 92 ff`). It stores the
+three pointers at rbp-0xa0/-0x98/-0x90 and zeros the uint16 samples in a loop.
+A delete call occurs at `0xdb5bfe -> 0x6dbcd0`. Windows' vector-constructor
+return-address filter and CRT free-IAT hook therefore cannot simply be moved.
+The native publication helper `0x173ed50` was also disassembled; it deletes at
+`0x173ee94`. Allocation escape/exception paths, all result resizes and final
+owners are not proven. Without a live load to observe them, intercepting global
+delete could hand arena pointers to an unguarded native free. `terrain_blocks`
+remains disabled with a diagnostic; its counters, small-span pager, fixed budget
+and pressure throttle are absent. The portable `BlockCodec` is retained and
+validated independently; that does not claim that the small pager is ported.
+
+**Budgets, rate control and backpressure.** The Windows implementation relies on
+GlobalMemoryStatusEx free commit, page-file-backed section creation, world-entry
+state, bulk allocation timestamps and the menu DLL's `Tpf2mpLastGameUiTick`.
+The Linux source and installed menu `.so` exports were examined: no corresponding
+export exists (game UI/frame state is local). Linux uses anonymous
+MAP_NORESERVE memory and UFFDIO_COPY, not section creation. This host reports
+`vm.overcommit_memory=0`, `overcommit_ratio=50`; CommitLimit minus Committed_AS
+is not the Windows section-allocation contract. Importing the 10/12 GiB thresholds
+without validating pressure and fault progress would misrepresent protection
+against OOM. No native load/pressure/frame measurements were possible after the
+lab failed. The Linux pager retains its fixed hot budget, two-second age and
+bounded scan; there is no loading allowance to ramp down, measured-cost/frame
+rate cap, pressure-driven cap override, restore retry or backpressure. Explicit
+Windows warm/rate settings log a diagnostic. Material paging was already absent;
+its matching policy changes remain absent too. Needed next: a native gameplay
+stamp/loading signal, validated Linux memory-pressure inputs and partial-copy
+failure/retry tests under a constrained lab process before enabling the policy.
+
+### Build, tests and live attempt
+
+`tools/linux/build.sh` passes five suites under the soldier SDK: bigmap, density,
+pager, terrain codec and the new shared block codec suite. The userfaultfd test
+actually ran, rather than skipping. New checks cover untouched page residency,
+first-read/write zeros, untouched release, eager opt-out, cold and resident
+censuses, sixteen shared pairs, private writes to twins, concurrent restores,
+write/eviction races and final blob cleanup. Travel tests cover clamping, disabled
+values, byte mismatch before writes and rollback after a failed data write.
+The block codec checks zero/ramp/random data, boundary sizes, truncation, hash
+corruption and capacity rejection. ELF build-id and all 22 patch sites pass.
+
+The lab's share/tpf2mp and mp_lockstep_1 directories were backed up with `cp -a`
+to `.before-port`. The built plugin and test config were installed only in the
+native actor. The official launcher at
+`/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` was used because this
+bigmap clone has no sandbox launcher. It failed immediately with
+`bwrap: setting up uid map: Permission denied`. Two attempts using the same lab
+mount/launch specification with system bwrap (including PRESSURE_VESSEL_BWRAP)
+reached pressure-vessel but failed to create its nested namespace. A final
+attempt with the final build through the original launcher failed identically.
+No kernel/security policy was changed. No game process, title menu, renderer,
+Vulkan device, save load or gdb session was reached; no live success is claimed.
+All attempted runs exited immediately, below the three-minute limit. No Steam
+process was restarted, no save was modified, and no input events were sent.
+
+The actor share tree was restored from its backup; the unchanged mod tree was
+compared to its backup. Recursive comparisons are empty. No launched process
+remains. Raw disassembly, launch errors, build/verification logs, actor logs/data,
+test configuration and restore comparisons are retained in this job's
+`meta/live/`. Existing actor log contents predate these failed launches and
+must not be mistaken for new gameplay observations.

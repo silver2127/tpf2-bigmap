@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-version=0.4.0-linux-dev.3
+version=0.4.0-linux-dev.4
 runtime=${1:?Usage: package.sh PATH_TO_NATIVE_PLUGINHOST}
 [ -f "$runtime" ]
 "$repo/tools/linux/build.sh"

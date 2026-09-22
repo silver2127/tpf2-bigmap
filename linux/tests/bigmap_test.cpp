@@ -7,6 +7,7 @@
 static std::map<std::string,int> config;
 static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
+static uintptr_t mismatchRva;
 static bool build=true;
 static bool minimapWarning=false;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
@@ -15,7 +16,7 @@ static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
 static void Log(const char* format,...){if(std::strstr(format,"minimap: unavailable on native Linux"))minimapWarning=true;}
 static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
-    if(mismatch)return 0;
+    if(mismatch || rva==mismatchRva)return 0;
     memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
 }
 static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
@@ -26,7 +27,7 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){minimapWarning=false;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){minimapWarning=false;mismatchRva=0;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -81,5 +82,17 @@ int main(){
     uint32_t buffer;std::memcpy(&buffer,memory[0xc7c3a0].data()+1,4);assert(buffer==65536);
     std::memcpy(&buffer,memory[0xc7c3aa].data()+5,4);assert(buffer==65536);
     std::memcpy(&buffer,memory[0xc7b6b1].data()+5,4);assert(buffer==65536);
+    Reset();config["travel_time_limit_s"]=1;config["cargo_path_time_s"]=999999;
+    assert(Tpf2mpPluginInit(&host,&info)==0);
+    float seconds;std::memcpy(&seconds,memory[0x43029a8].data(),4);assert(seconds==60.f);
+    std::memcpy(&seconds,memory[0x43029a4].data(),4);assert(seconds==86400.f);
+    Reset();config["travel_time_limit_s"]=-1;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && !memory.count(0x43029a8) && !memory.count(0x43029a4));
+    Reset();config["travel_time_limit_s"]=3600;mismatchRva=0x43029a8;
+    assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
+    Reset();config["travel_time_limit_s"]=3600;config["cargo_path_time_s"]=7200;
+    failWrite=stockWrites+2;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED);
+    std::memcpy(&seconds,memory[0x43029a8].data(),4);assert(seconds==1200.f);
+    std::memcpy(&seconds,memory[0x43029a4].data(),4);assert(seconds==6000.f);
     puts("PASS: map sizing, ratios, raster overflow, guards, safe caps and rollback");
 }
