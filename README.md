@@ -1,6 +1,11 @@
-# tpf2-bigmap
+# Big Maps (bigmap/)
 
 Maps larger than Transport Fever 2's New Game menu will build.
+
+Big Maps lived in its own repository (tpf2-bigmap) until 2026-09-22; it is now
+part of TpF2 Multiplayer and ships in the same MSI. Build it with
+`native\build.bat bigmap` (or `all`); this folder's `build.bat` still takes the
+test targets (`-pager-test`, `-codec-test`, ...).
 
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
@@ -14,33 +19,18 @@ overflow above approximately 185 km separation. See
 [placement-distance.md](docs/placement-distance.md) for the reverse-engineered
 sites and offline validation; an in-game regeneration check is still pending.
 
-A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
-and has no build-time dependency on the host tree — only the vendored
-`src/tpf2mp_plugin.h`, which is the whole ABI.
+A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code;
+its one build-time dependency on the rest of the repo is the plugin ABI,
+`native/src/plugin/tpf2mp_plugin.h`.
 
-Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
-(2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
-is byte-verified before it is patched, and the plugin refuses to patch anything
-else.
+Target: **Transport Fever 2 build 35924** (Steam, 2024-12-11, the last release).
+Every address here was measured on it, each site is byte-verified before it is
+patched, and the plugin refuses to patch anything else.
 
-The two builds share their code shape but not their addresses — the same
-function sits at a different RVA in each — so the plugin keeps a pair of
-constants per patched site and byte-verifies the one it is about to write. At
-start it reports which build it found:
-
-```
-[host] tpf2_bigmap: game build is the GOG 2024-12-12 binary -- all three sites byte-verify; using the GOG layout
-```
-
-Some features remain Steam-only because their sites were never measured on the
-GOG build, or because the replacement is a Steam code shape. They **degrade with
-a log line** rather than failing the load: the density levels, the added size
-dropdown rows, the placement/instance/material experiments, and the minimap.
-`octree_depth=12`/`13` degrades the same way — see below.
-
-To install on GOG, use **`TpF2BigMaps-<version>-gog.msi`** instead of the
-standard package: the standard one refuses a GOG game folder, because the
-installer's folder check knows only the Steam executable.
+**GOG is not supported** (since 0.2.0). The installer refuses a GOG folder, and the
+New Game menu rows and density levels exist only for the Steam binary. The GOG
+addresses 0.1.1 added for the size ladder, street raster and octree are still in
+`src/bigmap.cpp`, but nothing tests or maintains them.
 
 ---
 
@@ -238,25 +228,10 @@ and `max_tiles=2048` for **2,048-tile (524.288 km) edge capacity**, or depth 12
 and `max_tiles=1024` for 262.144 km. Both retain **128 m leaves**. The patch
 assigns compact IDs to levels 11/12 and updates the renderer's level decoder.
 It is byte-verified and tested offline against original engine insertion
-instructions, and **validated in a running game** on GOG: a 57 x 57 km map was
-created, played and reloaded with no duplicate street nodes and no assertion.
-Heightmap area
+instructions, but **not yet validated in a running game**. Heightmap area
 limits still apply, so the longest maps must be narrow. See
 [the implementation and test notes](docs/octree-depth12.md) for configuration,
 evidence and remaining live checks. Defaults retain depth 11.
-
-**Steam 35924 only.** Depths 12 and 13 replace two prologues the GOG build does
-not share, so there `octree_depth=12`/`13` fall back to the depth-11 root
-instead of refusing to load: the plugin still loads, the ceiling stays 512 tiles,
-and the log says which depth was asked for and what went in.
-
-```
-[host] tpf2_bigmap: octree: octree_depth=13 is Steam 35924 only -- this build keeps depth 11 and loads,
-                     so the edge ceiling stays 512 tiles, not 2048
-```
-
-That fallback is why the shipped config can keep `octree_depth=13` for both
-builds: Steam gets 2,048-tile edges, GOG gets the valid 512-tile root and works.
 
 Terrain LOD at the edge was **not** traced to the same limit. The only
 terrain-side 32,768 is an asymmetric legacy vertex packer (tiles −128..895),
@@ -484,11 +459,10 @@ stock.
 
 ## Install
 
-**Download `TpF2BigMaps-<version>.msi` from the
-[latest release](https://github.com/silver2127/tpf2-bigmap/releases) and run it.**
-It finds the Transport Fever 2 folder (from Steam's own uninstall entry, or from
-the folder a previous install remembered), asks you to confirm it,
-and puts these in place:
+**Install TpF2 Multiplayer** (`TpF2Multiplayer.msi` from the
+[latest release](https://github.com/silver2127/tpf2-multiplayer/releases)): Big
+Maps ships inside it. It finds the Transport Fever 2 folder Steam registered,
+asks you to confirm it, and puts these in place (besides the multiplayer files):
 
 | file | what |
 | --- | --- |
@@ -506,19 +480,6 @@ value, removed on uninstall) — that is what makes a big map load in about a
 minute instead of a quarter of an hour; the measurements are in the
 [multiplayer installer README](https://github.com/silver2127/tpf2-multiplayer/blob/main/installer/README.md#segment-heap).
 
-### GOG
-
-Use **`TpF2BigMaps-<version>-gog.msi`**. It is the same package with one
-difference — it tells the folder check that the GOG build of the game is a
-supported target — so it validates the folder exactly like the standard one
-instead of refusing it. A standard package can do the same from the command line
-with `TPF2_ALLOW_GOG=1`; without it a GOG folder is refused, because the check
-knows only the Steam executable and would rather say so than install into a game
-it cannot patch.
-
-On GOG the folder dialog starts on the Steam default, which does not exist
-there: point it at the game folder once, and every later install remembers it.
-
 Then: **New Game**. The size dropdown has rows after the stock sizes, from
 32 x 32 km up to 128 x 128 km, with *experimental map sizes* on or off, and
 *Towns*, *Number of industries* and *Industry density target* have six more levels
@@ -529,25 +490,15 @@ the way it shapes the stock ones. To set a shape yourself, add a
 `octree=1`, and the area within the street-raster budget (`street_raster=1` scales
 the cell to keep it there).
 
-### Installing alongside TpF2 Multiplayer
+### The old TpF2 Big Maps installer
 
-Both packages work in either order and can be removed in either order. They
-share the proxy and the plugin host, and both installers declare those under
-the **same component GUIDs** (`installer/PluginHost.wxs`, byte-identical in both
-repositories), so Windows Installer reference-counts them: the second install
-finds them present, the first uninstall leaves them for the other, and only the
-last one out puts the game's own `alut.dll` back. The custom actions that park
-and restore `alut.dll` check that count too, so uninstalling one product never
-restores the stock library out from under the other.
-
-Each product keeps its own config — this one in `plugins\tpf2_bigmap.cfg`, which
-the host merges over `tpf2mp.cfg` — so neither installer touches a file the
-other owns.
-
-`installer\test_coexist.ps1` proves all of it against a throwaway folder with
-the real `msiexec` transactions (both orders, both directions, the shared
-registry value tracked and restored). It needs an elevated PowerShell because
-the packages are per-machine.
+Up to 0.5.x Big Maps had its own MSI (`TpF2BigMaps-<version>.msi`), which
+coexisted with TpF2 Multiplayer by sharing the proxy and the plugin host under
+fixed component GUIDs (`installer/PluginHost.wxs`). The TpF2 Multiplayer MSI now
+lists that product's UpgradeCode and removes it when it installs, so the plugin
+has one owner; the shared components are reference-counted, so nothing is lost
+in between, and the old package's base_mod restore does not run during that
+removal (the new plugin re-patches on its next start).
 
 ### Virus-scanner findings
 
