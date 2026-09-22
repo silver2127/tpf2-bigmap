@@ -408,7 +408,15 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // protection change alone satisfied.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
             TerrainPager::SetUrgent(commitTight||pressure);
-            TerrainPager::SetThrottle(commitTight);
+            // THE THROTTLE IS FOR LOAD BURSTS (2026-09-22). It makes a fault that needs a
+            // new section sleep, up to 2 s, while the pool is over budget -- the answer to
+            // a load creating ~30,000 sections a second. On a running or paused world it
+            // only froze the game: a PC at 80 of 94 GB committed (no page file, other
+            // programs holding most of it) kept commit_tight on, and every tile the camera
+            // needed waited ~2 s (throttle_waits=1957, throttle_ms=3,862,828 on a live-join
+            // host that looked hung). Eviction stays urgent under a tight commit charge;
+            // only the sleep is limited to loading.
+            TerrainPager::SetThrottle(commitTight && (busy||bulk||loading));
             if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
                 // No loading allowance here: MEASURED 2026-09-17, with the tile
                 // pager's allowance the small pager kept 2.28 million spans
@@ -417,7 +425,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
                 // drains it to 64 MiB.
                 int smallNext=commitTight?64:g_smallHotMB;
                 SmallPager::SetBudget(size_t(smallNext)*1024*1024);
-                SmallPager::SetThrottle(commitTight);
+                SmallPager::SetThrottle(commitTight && (busy||bulk||loading));
                 if(smallNext!=smallEffectiveMB)H->log("small pager: resident target %d -> %d MiB (commit_tight=%d)",smallEffectiveMB,smallNext,int(commitTight));
                 smallEffectiveMB=smallNext;
             }

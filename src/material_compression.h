@@ -147,7 +147,8 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // and the game stuttered), hold or grow while cells fault back in.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
             MaterialPager::SetUrgent(commitTight||pressure);
-            MaterialPager::SetThrottle(commitTight);
+            // the throttle is for load bursts only (terrain_compression.h, same date)
+            MaterialPager::SetThrottle(commitTight && (busy||bulk));
             if(commitTight && next>256)next=256;
             else if(!(busy||bulk)){ static int wsFloor=0; next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2,&wsFloor); }
             { int cap=PagerCapMB(g_materialMaxMB,g_materialHotMB,physical,1); if(cap && next>cap)next=cap; }
