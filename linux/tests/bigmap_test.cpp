@@ -7,6 +7,7 @@
 static std::map<std::string,int> config;
 static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
+static uintptr_t mismatchSite;
 static bool build=true;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
@@ -14,7 +15,7 @@ static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
 static void Log(const char*,...){}
 static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
-    if(mismatch)return 0;
+    if(mismatch || rva==mismatchSite)return 0;
     memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
 }
 static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
@@ -25,7 +26,7 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;mismatchSite=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -74,5 +75,17 @@ int main(){
     uint32_t buffer;std::memcpy(&buffer,memory[0xc7c3a0].data()+1,4);assert(buffer==65536);
     std::memcpy(&buffer,memory[0xc7c3aa].data()+5,4);assert(buffer==65536);
     std::memcpy(&buffer,memory[0xc7b6b1].data()+5,4);assert(buffer==65536);
+    Reset();config["terrain_copy_fast"]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
+    assert(memory[TerrainCopySite].size()==sizeof(TerrainCopyBytes));
+    assert(memory[TerrainCopySite][0]==0xff && memory[TerrainCopySite][1]==0x25);
+    assert(bigmap_copy_return==reinterpret_cast<void*>(Base()+TerrainCopyReturn));
+    Reset();config["terrain_copy_fast"]=1;mismatchSite=TerrainCopySite;
+    assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
+    Reset();config["terrain_copy_fast"]=1;config["octree"]=0;config["street_raster"]=0;config["add_size_rows"]=0;config["max_ratio"]=5;failWrite=2;
+    assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED);
+    assert(memory[TerrainCopySite]==std::vector<uint8_t>(TerrainCopyBytes,TerrainCopyBytes+sizeof(TerrainCopyBytes)));
+    Reset();config["performance_only"]=1;config["terrain_copy_fast"]=1;config["terrain_minmax_fast"]=1;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && writes==2 && rows==0);
+    assert(!memory.count(SizeRva) && !memory.count(OctreeSite));
     puts("PASS: map sizing, ratios, raster overflow, guards, safe caps and rollback");
 }

@@ -11,6 +11,9 @@
 #include <sys/mman.h>
 #include "density.h"
 #include "terrain_pager.h"
+#include "terrain_copy.h"
+#include "terrain_cached_kernels.h"
+#include "terrain_chunk.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -196,23 +199,24 @@ bool PlanCall(uintptr_t rva,uintptr_t callee,void* target,uint8_t*& stub) {
 extern "C" __attribute__((visibility("default")))
 int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!host || !info || host->abiMajor!=TPF2MP_ABI_MAJOR || host->size<sizeof(Tpf2mpHost))return TPF2MP_ERR_ABI;
-    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.3","Native Linux large maps, sparse density and lossless terrain paging"};
+    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.6","Native Linux large maps and exact terrain load optimizations"};
+    const bool performanceOnly=H->cfgBool(Section,"performance_only",0);
     const auto baseMod=density::GamePath();
     std::string densityWhy;
     // Remove our prior labels before validating hooks, so a failed initialization
     // cannot expose unsupported town indices on this run.
-    const bool restored=density::Sync(baseMod,false,densityWhy);
+    const bool restored=performanceOnly || density::Sync(baseMod,false,densityWhy);
     if(!H->buildOk() || !H->moduleBase())return TPF2MP_ERR_BUILD;
     const bool enabled=H->cfgBool(Section,"enabled",1);
-    const bool sparse=enabled && H->cfgBool(Section,"newgame_density",1);
+    const bool sparse=enabled && !performanceOnly && H->cfgBool(Section,"newgame_density",1);
     if(sparse && !restored){H->log("density restore failed: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;}
     if(!enabled)return TPF2MP_ERR_DISABLED;
-    const int depth=H->cfgInt(Section,"octree_depth",11);
+    const int depth=performanceOnly?11:H->cfgInt(Section,"octree_depth",11);
     if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
     cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;
-    maxRatio=std::clamp(H->cfgInt(Section,"max_ratio",20),5,20);
+    maxRatio=performanceOnly?5:std::clamp(H->cfgInt(Section,"max_ratio",20),5,20);
     cellBudget=double(std::clamp(H->cfgInt(Section,"cell_budget_millions",1500),1,2000))*1e6;
-    const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
+    const bool octree=!performanceOnly && H->cfgBool(Section,"octree",1),raster=!performanceOnly && H->cfgBool(Section,"street_raster",1);
     if(!octree)cap=std::min(cap,256);
     if(!raster)cap=std::min(cap,180); // never offer overflowing generation
     tilesX=H->cfgInt(Section,"tiles_x",0);tilesY=H->cfgInt(Section,"tiles_y",0);
@@ -223,7 +227,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         if(Parse(H->cfgStr(Section,key,""),x,y)){Bound(x,y);claims[claimCount++]={s,f,x,y};}
     }
     const int defaults[]={128,160,192,224,256,320,384,448,512};
-    if(H->cfgBool(Section,"add_size_rows",1))for(int index=7;index<19;++index) {
+    if(!performanceOnly && H->cfgBool(Section,"add_size_rows",1))for(int index=7;index<19;++index) {
         int side=index<16?defaults[index-7]:0;
         for(int i=0;i<claimCount;++i)if(claims[i].size==index && claims[i].format==0)
             side=int(std::sqrt(double(claims[i].x)*claims[i].y));
@@ -234,7 +238,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         std::snprintf(fallback,sizeof(fallback),"%.2f x %.2f km",uint32_t(square)*.256,uint32_t(square>>32)*.256);
         std::snprintf(row.label,sizeof(row.label),"%s",H->cfgStr(Section,key,fallback));
     }
-    if(!H->verifyBytes(SizeRva,SizeBytes,sizeof(SizeBytes)))return TPF2MP_ERR_BUILD;
+    if(!performanceOnly && !H->verifyBytes(SizeRva,SizeBytes,sizeof(SizeBytes)))return TPF2MP_ERR_BUILD;
     auto* page=static_cast<uint8_t*>(Near(H->moduleBase()+SizeRva));if(!page)return TPF2MP_ERR_FAILED;
     uint8_t* stub=page;
     // A relocated constant keeps the stock instruction shape and register ABI.
@@ -263,14 +267,75 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(entry));
         if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
-    const bool minMax=H->cfgBool(Section,"terrain_minmax_fast",1);
+    const bool fastCopy=H->cfgBool(Section,"terrain_copy_fast",0);
+    if(H->cfgBool(Section,"terrain_chunk_cache",0)) {
+        constexpr uintptr_t site=0x173b6e0;
+        struct Contract {uintptr_t address;size_t size;uint64_t hash;};
+        for(const auto& c:{Contract{site,0x183,0x6701a1d7e9827dadull},
+            Contract{0xcf55a0,0x17,0x61932101af5b8874ull},Contract{0xcf4b60,0x13f,0xf28b0d55be90c31eull},
+            Contract{0xdb5fa0,0x4da,0xba92199a802044a4ull}}) {
+            const auto* code=reinterpret_cast<const uint8_t*>(H->moduleBase()+c.address);
+            uint64_t hash=14695981039346656037ull;
+            for(size_t i=0;i<c.size;++i)hash=(hash^code[i])*1099511628211ull;
+            if(hash!=c.hash)return TPF2MP_ERR_BUILD;
+        }
+        const uint8_t before[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38};
+        auto* trampoline=page+800;
+        memcpy(trampoline,before,sizeof(before));Jump(trampoline+sizeof(before),H->moduleBase()+site+sizeof(before));
+        uint8_t after[sizeof(before)];memset(after,0x90,sizeof(after));Jump(after,uintptr_t(terrain_chunk::Detour));
+        if(!Plan(site,before,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+        terrain_chunk::original=reinterpret_cast<terrain_chunk::Worker>(trampoline);
+        terrain_chunk::readBase=reinterpret_cast<terrain_chunk::ReadBase>(H->moduleBase()+0xcf55a0);
+        terrain_chunk::append=reinterpret_cast<terrain_chunk::Append>(H->moduleBase()+0xadb7e0);
+        terrain_chunk::verify=H->cfgBool(Section,"terrain_chunk_verify",1);
+        terrain_chunk::Cache().limit=uint64_t(std::clamp(H->cfgInt(Section,"terrain_chunk_cache_mb",1024),64,4096))*1024*1024;
+    }
+    const bool fastRefine=H->cfgBool(Section,"terrain_refine_fast",0);
+    if(fastRefine) {
+        constexpr uintptr_t site=0xd9b850;
+        const auto* code=reinterpret_cast<const uint8_t*>(H->moduleBase()+site);
+        uint64_t hash=14695981039346656037ull;
+        for(size_t i=0;i<0xb3d;++i)hash=(hash^code[i])*1099511628211ull;
+        if(hash!=0xb1513c7c66b75843ull)return TPF2MP_ERR_BUILD;
+        // Complete, position-independent prologue through push r12.
+        uint8_t after[16];std::memset(after,0x90,sizeof(after));
+        Jump(after,uintptr_t(TerrainRefineCached));
+        auto* trampoline=page+640;
+        std::memcpy(trampoline,code,16);Jump(trampoline+16,H->moduleBase()+site+16);
+        g_originalBicubicRefine=reinterpret_cast<BicubicRefineFn>(trampoline);
+        if(!Plan(site,code,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+    }
+    const bool fastAlign=H->cfgBool(Section,"terrain_align_fast",0);
+    if(fastAlign) {
+        constexpr uintptr_t site=0xda1a70;
+        const auto* code=reinterpret_cast<const uint8_t*>(H->moduleBase()+site);
+        uint64_t hash=14695981039346656037ull;
+        for(size_t i=0;i<0xc76;++i)hash=(hash^code[i])*1099511628211ull;
+        if(hash!=0x24620013235767efull)return TPF2MP_ERR_BUILD;
+        // SysV: box/size/list/result in rdi/rsi/rdx/rcx; floats in xmm0/xmm1.
+        const uint8_t before[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x49,0x89,0xd6};
+        uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));
+        Jump(after,uintptr_t(TerrainAlignCached));
+        auto* trampoline=page+704;
+        std::memcpy(trampoline,code,sizeof(before));Jump(trampoline+sizeof(before),H->moduleBase()+site+sizeof(before));
+        g_originalCalculateHeightMod=reinterpret_cast<CalculateHeightModFn>(trampoline);
+        g_terrainAlignBase=H->moduleBase();
+        if(!Plan(site,before,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+    }
+    if(fastCopy) {
+        uint8_t after[sizeof(TerrainCopyBytes)];std::memset(after,0x90,sizeof(after));
+        Jump(after,uintptr_t(TerrainCopyBridge));
+        if(!Plan(TerrainCopySite,TerrainCopyBytes,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+        bigmap_copy_return=reinterpret_cast<void*>(H->moduleBase()+TerrainCopyReturn);
+    }
+    const bool minMax=H->cfgBool(Section,"terrain_minmax_fast",performanceOnly?0:1);
     if(minMax) {
         const uint8_t before[]={0xf,0xb7,0x13,0x48,0x83,0xc3,0x2,0xf,0xb7,0xc2,0x41,0x89,0xd5,0xeb,0x16,0xf,0x1f,0x80,0x0,0x0,0x0,0x0,0x44,0xf,0xb7,0x3b,0x41,0x89,0xc5,0x48,0x83,0xc3,0x2,0x41,0xf,0xb7,0xc7,0x66,0x44,0x39,0xe8,0x72,0xa,0x66,0x39,0xc2,0xf,0x42,0xd0,0x41,0xf,0xb7,0xc5,0x49,0x39,0xde,0x75,0xdc};
         uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(TerrainMinMaxBridge));
         bigmap_minmax_return=reinterpret_cast<void*>(H->moduleBase()+0xcf588c);
         if(!Plan(0xcf5852,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
-    const bool fastSave=H->cfgBool(Section,"save_fast",1);
+    const bool fastSave=H->cfgBool(Section,"save_fast",performanceOnly?0:1);
     if(fastSave) {
         const uint8_t levelBefore[]={0x8b,0x05,0x9e,0x27,0x3c,0x04},levelAfter[]={0xb8,1,0,0,0,0x90};
         const uint8_t cmpBefore[]={0x49,0x81,0x7c,0x24,0x70,0x80,0,0,0},cmpAfter[]={0x49,0x81,0x7c,0x24,0x70,0,0,1,0};
@@ -300,12 +365,12 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         H->log("density levels refused: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;
     }
     void* trampoline=nullptr;
-    if(!H->installHook(H->moduleBase()+SizeRva,reinterpret_cast<void*>(Size),sizeof(SizeBytes),&trampoline)){if(sparse)density::Sync(baseMod,false,densityWhy);return TPF2MP_ERR_FAILED;}
+    if(!performanceOnly && !H->installHook(H->moduleBase()+SizeRva,reinterpret_cast<void*>(Size),sizeof(SizeBytes),&trampoline)){if(sparse)density::Sync(baseMod,false,densityWhy);return TPF2MP_ERR_FAILED;}
     originalSize=reinterpret_cast<SizeFn>(trampoline);
     for(int i=0;i<patchCount;++i)if(!H->patchBytes(patches[i].rva,patches[i].after,patches[i].len)) {
         // Keep code and original trampoline mapped even after rollback.
         for(int j=i;j>=0;--j)H->patchBytes(patches[j].rva,patches[j].before,patches[j].len);
-        H->patchBytes(SizeRva,SizeBytes,sizeof(SizeBytes));
+        if(!performanceOnly)H->patchBytes(SizeRva,SizeBytes,sizeof(SizeBytes));
         if(sparse)density::Sync(baseMod,false,densityWhy);
         H->log("patch failed; attempted rollback, restart before using big maps");return TPF2MP_ERR_FAILED;
     }
@@ -313,12 +378,35 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         H->log("density levels active: six sparse presets for towns, industries and industry target");
     }
     if(minMax)H->log("terrain min/max: exact SSE2 scan enabled");
+    if(fastRefine)H->log("terrain refinement: native SysV SSE2 kernel enabled");
+    if(fastAlign)H->log("terrain alignment: pooled scratch and native SSE2 blend enabled");
+    // Start diagnostics only after every guard and transactional patch succeeds.
+    if(terrain_chunk::Cache().limit) {
+        H->log("terrain chunk cache: resident 65x65 blocks, verify=%d",int(terrain_chunk::verify));
+        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto& c=terrain_chunk::Cache();
+            H->log("terrain chunks: calls=%llu hits=%llu misses=%llu entries=%llu bytes=%llu refused=%llu checked=%llu mismatches=%llu full=%llu",
+                (unsigned long long)terrain_chunk::calls.load(),(unsigned long long)c.hits.load(),(unsigned long long)c.misses.load(),
+                (unsigned long long)c.writes.load(),(unsigned long long)c.used.load(),(unsigned long long)terrain_chunk::refused.load(),
+                (unsigned long long)terrain_chunk::checked.load(),(unsigned long long)terrain_chunk::mismatches.load(),(unsigned long long)c.full.load());}}).detach();
+    }
+    if(H->cfgBool(Section,"terrain_kernel_cache",0) && (fastRefine || fastAlign)) {
+        const std::string path=std::string(H->dataDir())+"/terrain-kernels-v2";
+        const auto budget=uint64_t(std::clamp(H->cfgInt(Section,"terrain_kernel_cache_mb",2048),64,16384))*1024*1024;
+        if(terrain_cache::Cache().Open(path,budget)) {
+            H->log("terrain kernel cache: exact inputs, persistent, bounded at %llu MiB",(unsigned long long)(budget>>20));
+            std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto& c=terrain_cache::Cache();H->log("terrain cache: hits=%llu misses=%llu writes=%llu rejected=%llu bytes=%llu",(unsigned long long)c.hits.load(),(unsigned long long)c.misses.load(),(unsigned long long)c.writes.load(),(unsigned long long)c.rejected.load(),(unsigned long long)c.used.load());}}).detach();
+        }else H->log("terrain kernel cache unavailable; using exact kernels");
+    }
+    if(fastCopy)H->log("terrain row copy: wide disjoint copy enabled; overlapping rows retain scalar order");
     if(fastSave)H->log("fast saves: zstd level 1, 64 KiB input buffer; save files may be larger");
     if(terrainPager){
         H->log("terrain compression: Linux userfaultfd, lossless 1 m codec, enabled");
         std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto s=terrainPager->Get();H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu",(unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,(unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals);}}).detach();
     }
-    H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
-    H->log("Experimental port: depth 12/13 and material compression are not enabled");
+    if(performanceOnly)H->log("Performance-only mode: terrain optimizations configured independently of map controls");
+    else {
+        H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
+        H->log("Experimental port: depth 12/13 and material compression are not enabled");
+    }
     return TPF2MP_OK;
 }
