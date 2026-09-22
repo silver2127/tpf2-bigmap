@@ -7,7 +7,7 @@
 // (index = (x-x0) + (y-y0)*nx, record = records + index*40, 0x33cc60), stores
 // the entity at record+0 (0x33cc70), detaches the record's control block
 // (`lea rcx,[record+8]; call 0x33dd20` at 0x33cc90, which returns the vector
-// at control+0x10), resizes that vector to 257*257 (0x33cca5; the pager's
+// the shared_ptr at record+8 points at), resizes that vector to 257*257 (0x33cca5; the pager's
 // resize hook hands it a slot of the tile arena) and bumps record+0x20. It
 // returns void and never exposes the record, so the post-hook finds it by
 // entity: tiles are added in grid order, so a rotating cursor over the records
@@ -108,8 +108,7 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     if (!scratch) scratch = new (std::nothrow) BlockCodec::DecodeScratch;
     if (!scratch) return;
     if (!TerrainSidecar::ApplyTile(g, uint32_t(idx), *scratch)) { InterlockedIncrement64(&decodeFailed); return; }
-    const uint8_t* control = *reinterpret_cast<uint8_t* const*>(g.record(uint32_t(idx)) + 8);
-    const auto* v = reinterpret_cast<const TerrainSidecar::TileVector*>(control + 0x10);
+    const auto* v = TerrainSidecar::VectorOf(g.record(uint32_t(idx)));
     if (mark && mark(v->first)) InterlockedIncrement64(&applied);
     else InterlockedIncrement64(&unmarked);
 }

@@ -20,16 +20,21 @@
 //   grid + 0x0c int32 ny        (record rows)
 //   grid + 0x10 void* records   (nx*ny records, 40 bytes each)
 //   record + 0x00 int32 entity  (the tile entity id AddTile stored; not a liveness flag)
-//   record + 0x08 void* control (shared block; nullptr == no tile)
-//   control + 0x10 {uint16* first, * last, * end}   the height cache vector
+//   record + 0x08 std::shared_ptr<std::vector<uint16_t>>: +0x08 the vector object
+//                 itself {uint16* first, * last, * end} (nullptr == no tile), +0x10 its
+//                 control block (the object - 0x10: make_shared)
 //   record + 0x20 int32 version
 //
-// record+8 is NOT the vector: it points at a control block shared between the
-// two CTerrain versions, and the std::vector<uint16_t> sits at control+0x10.
+// MEASURED 2026-09-21 in the running game (the dedicated server, /proc/<pid>/mem):
+// all 8,712 records hold a 66,049-sample vector at *(record+8)+0, and
+// *(record+8) - *(record+0x10) == 0x10 on every one. The two CTerrain versions
+// point at the SAME vector objects (copy-on-write). An earlier reading put the
+// vector at *(record+8)+0x10: that is the vector's `end` and the next object's
+// bytes, so no tile was ever eligible and no sidecar could be written.
 // AddTile (0x33cb60) at 0x33cc90 does `lea rcx,[record+8]; call 0x33dd20`
-// (detach/make-writable, returns the vector = control+0x10) then resize to
-// Side*Side. A tile is eligible when its control block exists and that vector
-// holds exactly Side*Side samples (66,049 for the 1 m cache).
+// (detach/make-writable on the shared_ptr, returns the vector) then resizes it to
+// Side*Side. A tile is eligible when the pointer is set and that vector holds
+// exactly Side*Side samples (66,049 for the 1 m cache).
 //
 // ApplyTile WRITES the vector. It is called only from the pass owner's AddTile
 // post-hook, i.e. straight after AddTile has already detached (0x33dd20) and
@@ -120,11 +125,10 @@ inline long IndexOfRecord(const Grid& g, const uint8_t* record) {
 }
 inline Grid GridOf(void* cterrain) { return Grid{*reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(cterrain) + 0x18)}; }
 struct TileVector { uint16_t* first; uint16_t* last; uint16_t* end; };
-// record+8 -> control block; the vector is at control+0x10. nullptr control
+// record+8 -> the vector object itself (the shared_ptr's pointer). A nullptr
 // (no tile) yields a null vector, which Eligible rejects.
 inline TileVector* VectorOf(uint8_t* record) {
-    uint8_t* control = *reinterpret_cast<uint8_t**>(record + 8);
-    return control ? reinterpret_cast<TileVector*>(control + 0x10) : nullptr;
+    return *reinterpret_cast<TileVector**>(record + 8);
 }
 inline bool Eligible(const TileVector* v) { return v && v->first && size_t(v->last - v->first) == Samples; }
 
