@@ -458,7 +458,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            char serve[256];TerrainServeStatus(serve,sizeof serve);
+            char serve[448];TerrainServeStatus(serve,sizeof serve);
             if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld block_calls=%lld block_sized=%lld result_resizes=%lld%s",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
