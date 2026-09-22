@@ -48,7 +48,8 @@ struct FakeTerrain {
     void addTile(uint32_t i, int entity) {
         caches[i].assign(Samples, 0);
         *reinterpret_cast<int32_t*>(record(i) + 0) = entity;
-        *reinterpret_cast<uint8_t**>(record(i) + 8) = controls[i].data();
+        *reinterpret_cast<uint8_t**>(record(i) + 8) = controls[i].data() + 0x10;   // shared_ptr: the vector object
+        *reinterpret_cast<uint8_t**>(record(i) + 0x10) = controls[i].data();       // ...and its control block
         auto* v = vec(i); v->first = caches[i].data(); v->last = v->end = v->first + Samples;
         *reinterpret_cast<int32_t*>(record(i) + 0x20) += 1;
     }
@@ -75,7 +76,8 @@ int main() {
     for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) if (pick() % 10 < 7) {
         save.fill(i, i * 3 + 11);
         *reinterpret_cast<int32_t*>(save.record(i) + 0) = int32_t(1000 + i);
-        *reinterpret_cast<uint8_t**>(save.record(i) + 8) = save.controls[i].data();
+        *reinterpret_cast<uint8_t**>(save.record(i) + 8) = save.controls[i].data() + 0x10;
+        *reinterpret_cast<uint8_t**>(save.record(i) + 0x10) = save.controls[i].data();
         auto* v = save.vec(i); v->first = save.caches[i].data(); v->last = v->end = v->first + Samples;
         stored[i] = true;
     }

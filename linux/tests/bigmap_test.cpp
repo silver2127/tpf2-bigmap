@@ -56,9 +56,9 @@ int main(){
     assert(minimapWarning && writes==stockWrites && memory.size()==stockMemory.size());
     // Near jump destinations vary because each initialization allocates a page.
     for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
-    for(const char* key:{"terrain_sidecar","terrain_cache_max_mb","material_cache_max_mb","simulate_physical_mb"}) {
+    for(const char* key:{"terrain_sidecar","terrain_sidecar_write","terrain_sidecar_max_tiles","terrain_cache_max_mb","material_cache_max_mb","simulate_physical_mb"}) {
         Reset();config[key]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
-        assert((std::string(key)=="terrain_sidecar" ? sidecarWarning : capsWarning));
+        assert((std::string(key).find("terrain_sidecar")==0 ? sidecarWarning : capsWarning));
         assert(writes==stockWrites && memory.size()==stockMemory.size());
         for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
     }

@@ -527,3 +527,98 @@ identically to backups. No lab game process remains. Actor logs/data were
 copied for completeness, but pre-existing gameplay logs are not evidence of
 this run. Disassembly, launch/build/test logs, memory evidence, process check
 and empty restoration diffs are in this job's `meta/live/`.
+
+## Windows integration 9180629 (partial)
+
+Integrated 2026-09-22: the final seven Windows commits `5ca9f16` through
+`918062927018b3397450e83ddc5ec5210a914153`, following `26bced4` above.
+Resolved and staged `src/terrain_sidecar.h`; the merge remains uncommitted.
+The original baseline is unchanged as historical context.
+
+| Commits | Native disposition |
+| --- | --- |
+| `5ca9f16` | README memory measurements and scanner notes retained as Windows documentation. |
+| `3e20ce3`, `757d35d` | Windows release 0.5.3, vendored DLLs, MSI library discovery and CI retained. Linux installs into the shared host prefix (`--prefix` supported), not the game folder; no Windows DLL is substituted for a native host. |
+| `7053712` | Portable UTF-8 sidecar I/O, fingerprint stamping and sibling discovery ported and tested. Engine save/load capture, backend path resolution and orphan sweeping remain unported. |
+| `80a6c63` | Live-terrain selection remains unported pending ownership proof. |
+| `3c9fc62` | Shared grid reader and synthetic tests now dereference record+8 directly as the vector, agreeing with Linux disassembly below. |
+| `9180629` | Windows load-only fault sleep retained; native pager has no commit throttle or equivalent loading signal. |
+
+### Portable code and regression coverage
+
+The conflict joined Windows wide UTF-8 path handling with the prior POSIX CRT
+port. Windows keeps `MultiByteToWideChar`, `_wfopen_s`, `_wremove` and its
+FindFirstFileW search. Linux opens UTF-8 path bytes directly, removes files via
+`remove`, and uses `opendir`/`readdir` to search sibling `.terr` headers. POSIX
+suffix matching is case-sensitive. Discovery prefers the requested file and
+leaves the path unchanged on failure or insufficient output capacity. File
+format/version and codec are unchanged; `Refingerprint` checks the header hash
+before stamping. Neither the shared grid nor these helpers is used by the live
+native plugin yet.
+
+The seventh CTest suite, `sidecar_io`, tests non-ASCII directories, unstamped
+rejection, stamping and exact restoration, discovery under a different name,
+foreign/zero fingerprints, bounded buffers, corrupt headers and removal. Its
+vector object is independent of the control block, catching accidental extra
+indirection. The existing 824-tile sidecar test retains the corrected 0x28-byte
+synthetic control allocation and now uses the incoming shared_ptr layout.
+Explicit `terrain_sidecar_write=1` or nonzero `terrain_sidecar_max_tiles` requests
+now produce the same unsupported diagnostic as `terrain_sidecar=1`; native
+config tests verify no added patches or writes for each request.
+
+### Static RE: save/load ABI and terrain layout
+
+Signature/source exports and actual build 35924 ELF disassembly establish the
+following **investigation sites, not installed hooks**. No guarded patch was
+added; the manifest remains 22 sites.
+
+| Linux RVA | Evidence / contract |
+| --- | --- |
+| `0xc7ec00` SaveGame | Serializer.cpp signature matches the nine explicit Windows parameters. Entry bytes `f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55 41 54`. At `0xc7ec2a`, `4c 8b 65 10` loads SaveGameId from rbp+0x10 (entry rsp+8), **argument 7**, not Windows' hidden-return argument 8. Flag is rbp+0x18; monitor rbp+0x20. Epilogue at `0xc7fd9d` loads edx and `0xc7fda3` loads rax, returning the aggregate in registers. A Windows void-pointer/hidden-return detour would corrupt this ABI. |
+| `0xc7ca40` LoadGame | Serializer.cpp unique_ptr-return signature. `0xc7ca55: 49 89 cd` saves rcx in r13; `0xc7caeb..0xc7caf3` reads id+0x28 length and id+0x20 data for the logged save name. The result pointer is saved from rdi at `0xc7ca7e`, context from rsi at `0xc7ca96`, modRep from rdx at `0xc7caa8`. SaveGameId is argument 4 in **rcx**, not Windows r9. |
+| `0x3341ef0` GetSavegameInfo | StandardSaveGameBackend.cpp signature. Hidden result rdi, backend rsi, id rdx (saved as r14 at `0x3341efc`). Reads path data/length at id+0/+8, name at +0x20/+0x28, namespace at +0x40. Empty path calls `0x33467f0` with backend+8 and id+0x40 at `0x3341f52..0x3341f5b`; returned entry directory is read at +0x28/+0x30. `.sav` is appended via char-string `_M_append` at `0x3342076`; its literal is `0x3f249c8`. This is native libstdc++ narrow string handling, not MSVC wstring SSO. |
+| `0x18ba890`, `0x18ba270` | Both save and load call the first then the second. First: `endbr64; mov rax,[rip+0x41984e5]; ret`, global cell `0x5a52d80`. Second: `f3 0f 1e fa 48 8b 3f 48 8b 07 ff 60 20`, forwarding through impl vtable+0x20, **not Windows +0x18**. Concrete backend identity/lifetime still needs live proof. |
+| `0xcf75e4..0xcf7608` | Rechecked AddTile: ownership count comes from record+0x10, vector directly from record+8, samples from vector+0, end from vector+8. Detached copy stores control+0x10 as record+8 at `0xcf77ce` (`4d 89 6c 24 08`) and the control as record+0x10 at `0xcf77d3` (`4d 89 74 24 10`). The corrected Windows reader agrees with this Linux layout; the earlier documentation's purported Windows-only extra indirection was the upstream bug. |
+
+### Not ported and remaining proof
+
+SaveGame/LoadGame hooks, current-terrain capture and serving still require live
+proof of both terrain versions' lifetimes, synchronization during SaveGame,
+private writable vectors after AddTile, publication suppression and pass-end
+release. Native alignment batching/serving prerequisites remain absent. Windows
+SEH probing of potentially freed pointers is not portable ownership validation;
+we do not retain or dereference stale native candidates. Backend selection and
+completed-save/error handling must also be proven before enabling temporary-file
+capture, rename or automatic orphan deletion. Static functions above were found,
+but the attempted lab launch failed before gdb could attach.
+
+The native UFFD backend was reviewed for `9180629`: faults restore with
+UFFDIO_COPY and contain no budget/commit-pressure sleep. Its 10 ms sleep belongs
+to the eviction policy worker. There is no material or small pager. Therefore
+Linux does not currently have the gameplay-freezing throttle this commit fixes.
+Porting the full adaptive policy remains outstanding: the menu library still
+exports no Tpf2mpLastGameUiTick, and Linux anonymous overcommit (mode 0, ratio
+50) does not implement Windows section/free-commit accounting. The failed lab
+launch prevents load/frame and constrained-memory recovery measurements. No
+Windows thresholds, loading guesses or unverified hook addresses were enabled.
+
+### Validation and live attempt
+
+`tools/linux/build.sh` passes all **seven** soldier SDK CTest suites, including
+actual userfaultfd execution (not skipped). ELF verification passes the build-id
+and all 22 guarded sites. Host ASan/UBSan runs of both sidecar tests pass. Windows
+DLL tests, MSI and CI were not executed on Linux.
+
+Both actor directories were compared with their existing `.before-port` backups
+and freshly copied with `cp -a`. The final plugin and Linux config were installed
+in the actor's `share/tpf2mp/data/plugins/`. The official launcher from
+`/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` (absent in this clone)
+was run with the native lab root. It failed immediately with
+`bwrap: setting up uid map: Permission denied`, including the final-build retry.
+No title menu, Vulkan device, save, gameplay or gdb session was reached. No
+input events were sent, Steam was untouched and no save was modified. No live
+performance or correctness result is claimed. Both directories compare equal
+to their backups after restoration; no lab executable remains running.
+Disassembly, test logs, launch error and restoration comparisons are retained
+in this integration job's `meta/live/`; copied actor logs/data are pre-existing
+and do not establish new gameplay observations.

@@ -7,7 +7,7 @@
 // (index = (x-x0) + (y-y0)*nx, record = records + index*40, 0x33cc60), stores
 // the entity at record+0 (0x33cc70), detaches the record's control block
 // (`lea rcx,[record+8]; call 0x33dd20` at 0x33cc90, which returns the vector
-// at control+0x10), resizes that vector to 257*257 (0x33cca5; the pager's
+// the shared_ptr at record+8 points at), resizes that vector to 257*257 (0x33cca5; the pager's
 // resize hook hands it a slot of the tile arena) and bumps record+0x20. It
 // returns void and never exposes the record, so the post-hook finds it by
 // entity: tiles are added in grid order, so a rotating cursor over the records
@@ -59,6 +59,20 @@ static long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     }
     return -1;
 }
+// Every CTerrain this load populated (a load holds two versions briefly and frees one).
+// The SaveGame hook validates each and captures the live one: the alignment system's
+// last-seen pointer alone was the FREED version on an idle world (2026-09-21, the
+// dedicated server's first save: "the last seen CTerrain is not this world's").
+static void* seenTerrains[4] = {};
+static SRWLOCK seenLock = SRWLOCK_INIT;
+static void NoteTerrain(void* t) {
+    for (void* s : seenTerrains) if (s == t) return;          // the common case, no lock
+    AcquireSRWLockExclusive(&seenLock);
+    bool have = false; for (void* s : seenTerrains) if (s == t) have = true;
+    if (!have) { for (int i = 3; i > 0; --i) seenTerrains[i] = seenTerrains[i - 1]; seenTerrains[0] = t; }
+    ReleaseSRWLockExclusive(&seenLock);
+}
+static void ForgetTerrains() { AcquireSRWLockExclusive(&seenLock); for (void*& s : seenTerrains) s = nullptr; ReleaseSRWLockExclusive(&seenLock); }
 static SRWLOCK beginLock = SRWLOCK_INIT;
 static volatile LONG64 beginMs = 0;   // wall time of the sidecar's open + verify, in the first AddTile of the load
 // The LoadGame hook armed a fingerprint (TerrainSidecar::ArmForLoad); the
@@ -83,6 +97,7 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     original(terrain, entity, a2, a3);
     InterlockedIncrement64(&calls);
     if (!g_terrainServe || !terrain) return;
+    NoteTerrain(terrain);
     BeginIfArmed(terrain);
     if (!TerrainSidecar::Loaded()) return;
     TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
@@ -93,8 +108,7 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     if (!scratch) scratch = new (std::nothrow) BlockCodec::DecodeScratch;
     if (!scratch) return;
     if (!TerrainSidecar::ApplyTile(g, uint32_t(idx), *scratch)) { InterlockedIncrement64(&decodeFailed); return; }
-    const uint8_t* control = *reinterpret_cast<uint8_t* const*>(g.record(uint32_t(idx)) + 8);
-    const auto* v = reinterpret_cast<const TerrainSidecar::TileVector*>(control + 0x10);
+    const auto* v = TerrainSidecar::VectorOf(g.record(uint32_t(idx)));
     if (mark && mark(v->first)) InterlockedIncrement64(&applied);
     else InterlockedIncrement64(&unmarked);
 }
@@ -122,11 +136,14 @@ static bool InstallTerrainServe() {
     H->log("terrain sidecar: a loaded sidecar's tiles are applied at AddTile and the load's publication into them is skipped");
     return true;
 }
+// Set by terrain_sidecar_io.h when its hooks install: the save/load hook counters.
+static int (*g_sidecarIoStatus)(char* out, size_t cap) = nullptr;
 // One line for the pager's 30 s log, empty when nothing happened.
 static int TerrainServeStatus(char* out, size_t cap) {
     using namespace TerrainServe;
-    if (!calls) { if (cap) out[0] = 0; return 0; }
-    return snprintf(out, cap, " sidecar: add_tile=%lld applied=%lld unmarked=%lld absent=%lld not_found=%lld decode_failed=%lld probes=%lld copies_skipped=%lld",
+    char io[128] = ""; if (g_sidecarIoStatus) g_sidecarIoStatus(io, sizeof io);
+    if (!calls) return snprintf(out, cap, "%s", io);
+    return snprintf(out, cap, "%s", io) < 0 ? 0 : snprintf(out + strlen(out), cap - strlen(out), " sidecar: add_tile=%lld applied=%lld unmarked=%lld absent=%lld not_found=%lld decode_failed=%lld probes=%lld copies_skipped=%lld",
         calls, applied, unmarked, absent, notFound, decodeFailed, probes, g_terrainServedCopiesSkipped);
 }
 extern "C" __declspec(dllexport) void BigmapTestServeDetour(void* terrain, int entity, TerrainServe::AddTileFn fn, bool (*markFn)(const void*)) {

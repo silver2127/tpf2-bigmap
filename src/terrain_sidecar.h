@@ -20,16 +20,21 @@
 //   grid + 0x0c int32 ny        (record rows)
 //   grid + 0x10 void* records   (nx*ny records, 40 bytes each)
 //   record + 0x00 int32 entity  (the tile entity id AddTile stored; not a liveness flag)
-//   record + 0x08 void* control (shared block; nullptr == no tile)
-//   control + 0x10 {uint16* first, * last, * end}   the height cache vector
+//   record + 0x08 std::shared_ptr<std::vector<uint16_t>>: +0x08 the vector object
+//                 itself {uint16* first, * last, * end} (nullptr == no tile), +0x10 its
+//                 control block (the object - 0x10: make_shared)
 //   record + 0x20 int32 version
 //
-// record+8 is NOT the vector: it points at a control block shared between the
-// two CTerrain versions, and the std::vector<uint16_t> sits at control+0x10.
+// MEASURED 2026-09-21 in the running game (the dedicated server, /proc/<pid>/mem):
+// all 8,712 records hold a 66,049-sample vector at *(record+8)+0, and
+// *(record+8) - *(record+0x10) == 0x10 on every one. The two CTerrain versions
+// point at the SAME vector objects (copy-on-write). An earlier reading put the
+// vector at *(record+8)+0x10: that is the vector's `end` and the next object's
+// bytes, so no tile was ever eligible and no sidecar could be written.
 // AddTile (0x33cb60) at 0x33cc90 does `lea rcx,[record+8]; call 0x33dd20`
-// (detach/make-writable, returns the vector = control+0x10) then resize to
-// Side*Side. A tile is eligible when its control block exists and that vector
-// holds exactly Side*Side samples (66,049 for the 1 m cache).
+// (detach/make-writable on the shared_ptr, returns the vector) then resizes it to
+// Side*Side. A tile is eligible when the pointer is set and that vector holds
+// exactly Side*Side samples (66,049 for the 1 m cache).
 //
 // ApplyTile WRITES the vector. It is called only from the pass owner's AddTile
 // post-hook, i.e. straight after AddTile has already detached (0x33dd20) and
@@ -49,8 +54,18 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN   // keeps rpcndr.h's `#define small char` out of whoever includes this
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <strings.h>
+#include <dirent.h>
+#include <string>
 #endif
 #include "small_codec.h"
 #include "terrain_codec.h"   // Side, Samples
@@ -77,6 +92,35 @@ constexpr uint32_t Magic = 0x52524554;      // 'TERR'
 constexpr uint32_t Version = 1;
 constexpr size_t Side = TerrainCodec::Side;         // 257
 constexpr size_t Samples = TerrainCodec::Samples;   // 66,049
+
+// Paths are UTF-8, as the engine hands them over (its save directory is a
+// UTF-8 std::string); the CRT's narrow fopen would read them in the ANSI code
+// page and miss a profile folder with a non-ASCII name. POSIX paths use
+// UTF-8 bytes directly; Windows retains its wide-path implementation.
+#ifdef _WIN32
+inline bool WidePath(const char* utf8, wchar_t* out, int cap) {
+    if (!utf8 || !utf8[0]) return false;
+    return MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, cap) > 0;
+}
+inline FILE* OpenFile(const char* utf8, const wchar_t* mode) {
+    wchar_t w[1040]; FILE* f = nullptr;
+    if (!WidePath(utf8, w, 1040) || _wfopen_s(&f, w, mode)) return nullptr;
+    return f;
+}
+inline void RemoveFile(const char* utf8) { wchar_t w[1040]; if (WidePath(utf8, w, 1040)) _wremove(w); }
+#else
+inline FILE* OpenFile(const char* utf8, const wchar_t* mode) {
+    // Only ASCII CRT mode strings cross this interface, never path text.
+    char narrow[8] = {};
+    size_t i = 0;
+    for (; mode[i]; ++i) {
+        if (i + 1 >= sizeof narrow || mode[i] > 127) return nullptr;
+        narrow[i] = char(mode[i]);
+    }
+    return std::fopen(utf8, narrow);
+}
+inline void RemoveFile(const char* utf8) { std::remove(utf8); }
+#endif
 
 #pragma pack(push, 1)
 struct FileHeader {
@@ -118,11 +162,10 @@ inline long IndexOfRecord(const Grid& g, const uint8_t* record) {
 }
 inline Grid GridOf(void* cterrain) { return Grid{*reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(cterrain) + 0x18)}; }
 struct TileVector { uint16_t* first; uint16_t* last; uint16_t* end; };
-// record+8 -> control block; the vector is at control+0x10. nullptr control
+// record+8 -> the vector object itself (the shared_ptr's pointer). A nullptr
 // (no tile) yields a null vector, which Eligible rejects.
 inline TileVector* VectorOf(uint8_t* record) {
-    uint8_t* control = *reinterpret_cast<uint8_t**>(record + 8);
-    return control ? reinterpret_cast<TileVector*>(control + 0x10) : nullptr;
+    return *reinterpret_cast<TileVector**>(record + 8);
 }
 inline bool Eligible(const TileVector* v) { return v && v->first && size_t(v->last - v->first) == Samples; }
 
@@ -145,11 +188,11 @@ inline long Write(const Grid& grid, uint64_t fingerprint, const char* path,
     if (!grid.base || !grid.records()) return -1;
     const int32_t nx = grid.nx(), ny = grid.ny();
     if (nx <= 0 || ny <= 0 || int64_t(nx) * ny > (int64_t(1) << 24)) return -1;
-    FILE* f = nullptr;
-    if (OpenFile(&f, path, "wb") || !f) return -1;
+    FILE* f = OpenFile(path, L"wb");
+    if (!f) return -1;
     FileHeader hdr{Magic, Version, fingerprint, nx, ny, 0, 0};
     // Header rewritten at the end with the true tile count and hash.
-    if (fwrite(&hdr, sizeof hdr, 1, f) != 1) { fclose(f); remove(path); return -1; }
+    if (fwrite(&hdr, sizeof hdr, 1, f) != 1) { fclose(f); RemoveFile(path); return -1; }
     std::vector<uint8_t> blob(Samples * 2 + 128);
     uint32_t tiles = 0; uint64_t compressed = 0; bool ok = true;
     const uint32_t count = uint32_t(nx) * uint32_t(ny);
@@ -167,7 +210,7 @@ inline long Write(const Grid& grid, uint64_t fingerprint, const char* path,
         if (fseek(f, 0, SEEK_SET) || fwrite(&hdr, sizeof hdr, 1, f) != 1) ok = false;
     }
     if (fclose(f) != 0) ok = false;
-    if (!ok) { remove(path); return -1; }
+    if (!ok) { RemoveFile(path); return -1; }
     if (compressedBytesOut) *compressedBytesOut = compressed;
     return long(tiles);
 }
@@ -181,8 +224,8 @@ inline long Write(const Grid& grid, uint64_t fingerprint, const char* path,
 inline long Apply(const Grid& grid, uint64_t fingerprint, const char* path,
                   BlockCodec::DecodeScratch* scratch) {
     if (!grid.base || !grid.records()) return 0;
-    FILE* f = nullptr;
-    if (OpenFile(&f, path, "rb") || !f) return 0;
+    FILE* f = OpenFile(path, L"rb");
+    if (!f) return 0;
     FileHeader hdr{};
     if (fread(&hdr, sizeof hdr, 1, f) != 1) { fclose(f); return 0; }
     if (hdr.magic != Magic || hdr.version != Version || hdr.headerHash != HashHeader(hdr)) { fclose(f); return 0; }
@@ -240,8 +283,8 @@ static LoadState g_load;
 inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* /*verify*/ = nullptr) {
     g_load = LoadState{};
     if (!grid.base || !grid.records()) return 0;
-    FILE* f = nullptr;
-    if (OpenFile(&f, path, "rb") || !f) return 0;
+    FILE* f = OpenFile(path, L"rb");
+    if (!f) return 0;
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     if (sz < long(sizeof(FileHeader))) { fclose(f); return 0; }
     std::vector<uint8_t> buf; buf.resize(size_t(sz));
@@ -291,8 +334,8 @@ inline void EndApply() { g_load = LoadState{}; }
 // means the stored caches are correct, and any other save (even the same map
 // with different roads) hashes differently and is rejected.
 inline uint64_t HashFile(const char* path) {
-    FILE* f = nullptr;
-    if (OpenFile(&f, path, "rb") || !f) return 0;
+    FILE* f = OpenFile(path, L"rb");
+    if (!f) return 0;
     uint64_t h = 0xCBF29CE484222325ull; uint64_t total = 0;
     uint8_t buf[1 << 16];
     for (;;) {
@@ -308,6 +351,91 @@ inline uint64_t HashFile(const char* path) {
     h ^= total; h ^= h >> 33; h *= 0xC2B2AE3D27D4EB4Full; h ^= h >> 29;
     return h ? h : 1;                  // never 0 for a real file
 }
+// A sidecar is written BEFORE its save exists (inside SaveGame, while the world
+// is frozen), so it is first written with fingerprint 0 and stamped afterwards
+// with the hash of the .sav the engine produced. False if the file is not a
+// sidecar or cannot be rewritten.
+inline bool Refingerprint(const char* path, uint64_t fingerprint) {
+    FILE* f = OpenFile(path, L"r+b");
+    if (!f) return false;
+    FileHeader hdr{};
+    bool ok = fread(&hdr, sizeof hdr, 1, f) == 1 && hdr.magic == Magic && hdr.version == Version && hdr.headerHash == HashHeader(hdr);
+    if (ok) {
+        hdr.fingerprint = fingerprint; hdr.headerHash = HashHeader(hdr);
+        ok = !fseek(f, 0, SEEK_SET) && fwrite(&hdr, sizeof hdr, 1, f) == 1;
+    }
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+// The fingerprint a sidecar file carries, 0 if it is not a valid sidecar.
+#ifdef _WIN32
+inline uint64_t FingerprintOf(const wchar_t* widePath) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, widePath, L"rb") || !f) return 0;
+    FileHeader hdr{};
+    bool ok = fread(&hdr, sizeof hdr, 1, f) == 1 && hdr.magic == Magic && hdr.version == Version && hdr.headerHash == HashHeader(hdr);
+    fclose(f);
+    return ok ? hdr.fingerprint : 0;
+}
+// The sidecar for a save is normally "<save>.terr". Multiplayer loads a COPY of
+// the host's save under another name (mp_shared.sav), and the copy has the same
+// bytes and so the same fingerprint: when the named file is absent or carries
+// another fingerprint, look through the save's folder for one that matches.
+// Reads 32 bytes per candidate. Leaves `path` alone when nothing matches.
+inline bool FindByFingerprint(uint64_t fingerprint, char* path, size_t cap) {
+    wchar_t w[1040];
+    if (!fingerprint || !WidePath(path, w, 1040)) return false;
+    if (FingerprintOf(w) == fingerprint) return true;
+    wchar_t* slash = wcsrchr(w, L'\\'); wchar_t* fwd = wcsrchr(w, L'/');
+    if (fwd && (!slash || fwd > slash)) slash = fwd;
+    if (!slash) return false;
+    slash[1] = 0;
+    wchar_t pattern[1040]; wcscpy_s(pattern, w); wcscat_s(pattern, L"*.terr");
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        wchar_t cand[1040]; wcscpy_s(cand, w); wcscat_s(cand, fd.cFileName);
+        if (FingerprintOf(cand) == fingerprint) {
+            found = WideCharToMultiByte(CP_UTF8, 0, cand, -1, path, int(cap), nullptr, nullptr) > 0;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+#else
+inline uint64_t FingerprintOf(const char* path) {
+    FILE* f = OpenFile(path, L"rb");
+    if (!f) return 0;
+    FileHeader hdr{};
+    bool ok = fread(&hdr, sizeof hdr, 1, f) == 1 && hdr.magic == Magic &&
+              hdr.version == Version && hdr.headerHash == HashHeader(hdr);
+    fclose(f);
+    return ok ? hdr.fingerprint : 0;
+}
+inline bool FindByFingerprint(uint64_t fingerprint, char* path, size_t cap) {
+    if (!fingerprint || !path || !cap || !memchr(path, 0, cap) || !path[0]) return false;
+    if (FingerprintOf(path) == fingerprint) return true;
+    const char* slash = strrchr(path, '/');
+    if (!slash) return false; // Same folder-qualified lookup contract as Windows.
+    const std::string dir(path, size_t(slash - path) + 1);
+    DIR* d = opendir(dir.c_str());
+    if (!d) return false;
+    bool found = false;
+    while (const dirent* entry = readdir(d)) {
+        const size_t n = strlen(entry->d_name);
+        if (n < 5 || strcmp(entry->d_name + n - 5, ".terr")) continue;
+        const std::string candidate = dir + entry->d_name;
+        if (candidate.size() + 1 > cap || FingerprintOf(candidate.c_str()) != fingerprint) continue;
+        memcpy(path, candidate.c_str(), candidate.size() + 1);
+        found = true;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+#endif
 inline void SidecarPath(const char* savPath, char* out, size_t cap) {
     // "<save>.sav" -> "<save>.terr"; otherwise "<path>.terr".
     size_t n = strlen(savPath);
@@ -328,6 +456,7 @@ static bool g_pending = false;         // a fingerprint is armed; BeginApply not
 inline void ArmForLoad(const char* savPath) {
     g_saveFingerprint = HashFile(savPath);
     SidecarPath(savPath, g_sidecarPath, sizeof g_sidecarPath);
+    if (g_saveFingerprint && g_sidecarPath[0]) FindByFingerprint(g_saveFingerprint, g_sidecarPath, sizeof g_sidecarPath);
     g_pending = g_saveFingerprint && g_sidecarPath[0];
 }
 // Called with the CTerrain the pass will populate, before its first AddTile

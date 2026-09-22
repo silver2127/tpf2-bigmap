@@ -408,7 +408,15 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // protection change alone satisfied.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
             TerrainPager::SetUrgent(commitTight||pressure);
-            TerrainPager::SetThrottle(commitTight);
+            // THE THROTTLE IS FOR LOAD BURSTS (2026-09-22). It makes a fault that needs a
+            // new section sleep, up to 2 s, while the pool is over budget -- the answer to
+            // a load creating ~30,000 sections a second. On a running or paused world it
+            // only froze the game: a PC at 80 of 94 GB committed (no page file, other
+            // programs holding most of it) kept commit_tight on, and every tile the camera
+            // needed waited ~2 s (throttle_waits=1957, throttle_ms=3,862,828 on a live-join
+            // host that looked hung). Eviction stays urgent under a tight commit charge;
+            // only the sleep is limited to loading.
+            TerrainPager::SetThrottle(commitTight && (busy||bulk||loading));
             if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
                 // No loading allowance here: MEASURED 2026-09-17, with the tile
                 // pager's allowance the small pager kept 2.28 million spans
@@ -417,7 +425,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
                 // drains it to 64 MiB.
                 int smallNext=commitTight?64:g_smallHotMB;
                 SmallPager::SetBudget(size_t(smallNext)*1024*1024);
-                SmallPager::SetThrottle(commitTight);
+                SmallPager::SetThrottle(commitTight && (busy||bulk||loading));
                 if(smallNext!=smallEffectiveMB)H->log("small pager: resident target %d -> %d MiB (commit_tight=%d)",smallEffectiveMB,smallNext,int(commitTight));
                 smallEffectiveMB=smallNext;
             }
@@ -458,7 +466,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            char serve[256];TerrainServeStatus(serve,sizeof serve);
+            char serve[448];TerrainServeStatus(serve,sizeof serve);
             if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld block_calls=%lld block_sized=%lld result_resizes=%lld%s",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
