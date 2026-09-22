@@ -413,3 +413,117 @@ remains. Raw disassembly, launch errors, build/verification logs, actor logs/dat
 test configuration and restore comparisons are retained in this job's
 `meta/live/`. Existing actor log contents predate these failed launches and
 must not be mistaken for new gameplay observations.
+
+## Windows integration 26bced4 (partial)
+
+Integrated 2026-09-22: twenty Windows commits `dc7264d` through
+`26bced4b98893809bf9bd7960a0acec7b9ab244a`, based on the preceding `bd0d85f`
+integration. No merge conflicts. Seven pending Windows commits remain outside
+this batch. Windows implementations, release assets and MSI CI are retained;
+the merge is staged and uncommitted.
+
+| Commits | Native disposition |
+| --- | --- |
+| `dc7264d`, `915aec1` | Alignment handle, pass timing and test merge; native batching remains unported. |
+| `e62e43b`, `0511bb5`, `96340f9`, `059f2f1`, `da9d033`, `ff2fd60` | Shared sidecar file API now compiles and is tested on Linux; engine grid adapter and save/load integration are not enabled. |
+| `1c3c713`, `4d696f3` | Windows RE/measurements merge as documentation, not native evidence. |
+| `5bf8aaf`, `8e42635` | AddTile serving, publication suppression and pass-end release remain unported. |
+| `f7c6395`, `585921b`, `a448c32` | Windows releases retained. Native minimap remains off/unavailable; pager policy portion remains unported. |
+| `2d03251`, `7407127`, `ce3feb7`, `24a020a` | Adaptive caps, simulated memory, throttle hysteresis and working-set floor remain unported. |
+| `26bced4` | Windows MSI/draft-release workflow retained unchanged; no publishing performed. |
+
+### Portable sidecar validation
+
+`src/terrain_sidecar.h` uses scoped `OpenFile`/`CompareExtension` helpers:
+MSVC keeps `fopen_s`/`_stricmp`; Linux uses `fopen`/`strcasecmp`. Test exports
+retain `dllexport` on Windows. The file format, fingerprint, streaming index,
+lazy per-tile decode and fallback contract remain unchanged. No Windows game
+address is used by the native plugin. This header's raw `GridOf`/`VectorOf`
+still describe the **Windows** layout; it is compiled only by an offline native
+test, not included by the native plugin.
+
+Both incoming synthetic tests allocated only 0x20 bytes for a control block
+with a 24-byte vector at +0x10: writing `end` overran it by eight bytes. They
+now allocate 0x28. The sidecar test is a sixth CTest suite, with assertions
+explicitly enabled in Release. It restores 824 tiles exactly, checks holes,
+wrong-sized caches, mismatched fingerprints/dimensions, truncation, corrupted
+blobs, per-tile fallback, windowed indices, and changed-save rejection. The
+same test also passes host ASan/UBSan. This validates the shared file API with
+synthetic Windows-layout objects, not Linux game ownership.
+
+### Static RE: Linux differs at the shared pointer
+
+Examined the actual build 35924 ELF (build-id remains
+`3a0e156390b0e6f1e372051c24802c8493ae454a`) with objdump and the signature
+exports. These are investigation sites, **not new patches**:
+
+| Site | Evidence |
+| --- | --- |
+| `0x173db00` | `48 8b 7f 08`, loads system+8 into rdi, followed at `0x173db13` by call to signature-identified `CTerrain::GetTileCache` (`0xcf5960`). Confirms the alignment system's terrain field statically. |
+| `0xcf71d0` | AddTile candidate: `endbr64; push rbp; mov rbp,rsp; push r15`; `0xcf71da: 49 89 ff` saves SysV this/rdi in r15, `0xcf71e8: 41 89 f5` saves entity/esi in r13d. Its profiling string at `0x3f25667` is `CTerrain`. |
+| `0xcf73f2..0xcf7419` | Loads terrain+0x18 grid, subtracts grid origin, multiplies by width, scales record index by 40, stores entity (`45 89 2c 24`) in record+0. This links the candidate to AddTile independently of its generic profiling label. |
+| `0xcf75e4..0xcf7608` | Loads record+0x10 shared ownership control, tests reference count at control+8 against 1, then loads **record+8 directly as the vector**, with last at vector+8 and first at vector+0. |
+| `0xcf774a`, `0xcf77ce`, `0xcf77d3` | Detached copy: vector is new control+0x10 (`4d 8d 6e 10`); stores that vector pointer at record+8 (`4d 89 6c 24 08`) and control separately at record+0x10 (`4d 89 74 24 10`). |
+| `0xcf7696` | Existing guarded default-append call, vector in rdi and extra sample count in rsi. AddTile increments record version at `0xcf762f`. |
+| `0xcf4f78..0xcf4f8d` | Independent detach/read path checks record+0x10 refcount, then reads record+8 and dereferences the vector's first pointer. Corroborates that adding Windows' extra +0x10 here would be wrong. |
+
+The prior native map traversal evidence at `0x173dae0` was rechecked. The
+publication call at `0x173e16f` still targets `0xcf56d0`. No assumption that
+Windows and Linux shared_ptr layouts agree is made. No hook or byte manifest
+entry was added; all 22 existing guarded sites remain verified.
+
+### Not ported: attempts and remaining evidence
+
+**Alignment/sidecar runtime:** the Linux AddTile/vector and terrain-field
+investigation above made progress, but the lab could not start (below). Live
+private ownership after AddTile, worker completion, both terrain versions'
+creation order, save-time ownership and lifetime across loads remain unproven.
+The Linux publication/copy paths must be traced before suppressing any writes;
+a persistent served flag must not suppress later gameplay edits. The native
+batching prerequisite remains absent, including the timing and pass-end callback.
+No live system pointer is retained. Save-path resolution and completed-save
+triggers also remain absent. In this exact incoming Windows snapshot,
+`ArmForLoad` and `WriteForSave` have definitions but **no production callers**;
+future Windows wiring is outside this batch. No end-to-end sidecar load claim
+is made for either platform here.
+
+**Memory policy:** inspected both Windows workers and Linux's UFFD backend.
+Windows uses section/free-commit accounting and a gameplay tick; Linux uses
+anonymous MAP_NORESERVE/UFFDIO_COPY, retains a fixed resident target and has no
+material pager. The installed menu library's dynamic exports still provide no
+`Tpf2mpLastGameUiTick`. This host's overcommit mode is 0, ratio 50; measured
+MemTotal/MemAvailable/CommitLimit/Committed_AS are retained in the evidence.
+CommitLimit minus Committed_AS is not a validated replacement for Windows free
+section commit. The failed live launch prevented loading, frame/fault feedback,
+constrained-memory progress and recovery measurements. Importing the formulas
+alone would not validate throttle safety. Sized headroom, caps, simulation,
+hysteresis, working-set floor and associated material policy stay disabled.
+Needed: native pressure inputs, loading/frame signals, recoverable UFFD copy
+failures and live constrained-process measurements. No Linux memory or load-time
+improvement is claimed.
+
+Explicit `terrain_sidecar=1`, nonzero `terrain_cache_max_mb`,
+`material_cache_max_mb` or `simulate_physical_mb` now log native diagnostics.
+Tests assert that these requests add no patch sites or writes. Linux defaults
+remain minimap=0, sidecar=0 and fixed terrain_cache_hot_mb=1024; compression is
+still opt-in. Zero cap/simulation settings do not enable an automatic policy.
+
+### Validation and live attempt
+
+`tools/linux/build.sh`: six suites pass, including the real userfaultfd pager
+test (not skipped). `tools/linux/verify_game.py`: build-id and all 22 sites pass.
+Host ASan/UBSan sidecar test passes. Windows DLL/serve/alignment tests and the
+MSI workflow were not executed on this Linux host.
+
+Backed up both actor share/tpf2mp and mod directories with `cp -a` to
+`.before-port`, installed the built plugin and Linux configuration in the
+native actor, then ran the official tpf2-multiplayer lab launcher (this clone
+has no launcher). It exited immediately with `bwrap: setting up uid map:
+Permission denied`. No title menu, renderer/Vulkan device, save load, gameplay
+or gdb attachment was reached. No input was sent, save modified, or Steam
+process touched. The failure was well within the three-minute time box.
+The share directory was restored; both restored share and unchanged mod compare
+identically to backups. No lab game process remains. Actor logs/data were
+copied for completeness, but pre-existing gameplay logs are not evidence of
+this run. Disassembly, launch/build/test logs, memory evidence, process check
+and empty restoration diffs are in this job's `meta/live/`.

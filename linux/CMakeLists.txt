@@ -42,3 +42,10 @@ if(BUILD_TESTING)
   target_compile_options(test_small_codec PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME small_codec COMMAND test_small_codec)
 endif()
+
+if(BUILD_TESTING)
+  # Synthetic Windows-layout grid: tests the shared file API, not Linux hooks.
+  add_executable(test_terrain_sidecar ../tools/test_terrain_sidecar.cpp)
+  target_compile_options(test_terrain_sidecar PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME terrain_sidecar COMMAND test_terrain_sidecar)
+endif()

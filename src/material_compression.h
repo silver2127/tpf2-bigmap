@@ -13,6 +13,7 @@
 #include "material_pager.h"
 #include "terrain_compression.h"
 static int g_materialCompress=0, g_materialHotMB=256, g_materialWarmMB=1024;
+static int g_materialMaxMB=0;   // material_cache_max_mb: hard cap on the resident target, 0 = auto (a quarter of the terrain cap), -1 = none
 static volatile LONG g_materialCompressActive=0;
 struct MaterialOwnedVector {uint8_t *first,*last,*end;};
 using MaterialResizeFn=void(__fastcall*)(MaterialOwnedVector*,size_t);
@@ -124,9 +125,13 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // smaller of free RAM and free commit, and back off hard when commit is
             // nearly exhausted (a 512x512 desert preview hit std::bad_alloc at the
             // 114.6 GB commit limit while tiles were held uncompressed).
-            bool haveStatus=GlobalMemoryStatusEx(&m)!=0;
+            bool haveStatus=PagerMemoryStatus(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
-            bool commitTight=haveStatus && m.ullAvailPageFile<10ull*1024*1024*1024;
+            static const uint64_t physical=InstalledPhysicalBytes();
+            static CommitTightState tightState;    // sticky: see CommitTightSticky
+            bool commitTight=haveStatus && CommitTightSticky(tightState,m.ullAvailPageFile<CommitTightBytes(physical),m.ullAvailPageFile,
+                                                            CommitTightBytes(physical),(uint64_t(g_materialHotMB>256?g_materialHotMB-256:0)<<20)+(1ull<<30),now);
+            bool pressure=haveStatus && m.ullAvailPhys<PagerHeadroom(physical);
             bool busy=InterlockedCompareExchange(&g_worldEntryActive,0,0)!=0;
             // Initial generation, edit boxes and a full repaint allocate or
             // restore cells in bursts; keep the warm allowance for 15 s after.
@@ -136,17 +141,18 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // fixed 4 GiB allowance the loading thread spent 69-71% of two profile
             // windows restoring tiles (85 s); with growth 41-53% (73 s). The earlier
             // RAM-only cap hit std::bad_alloc at the commit limit on a 512x512 preview.
-            int next=TerrainBudgetMB(g_materialHotMB,g_materialWarmMB,busy,bulk,available,(s.live*MaterialPager::SlotBytes)>>20);
+            int next=TerrainBudgetMB(g_materialHotMB,g_materialWarmMB,busy,bulk,available,(s.live*MaterialPager::SlotBytes)>>20,physical);
             // Same steady-state rules as the terrain pager: ramp down instead of
             // snapping (MEASURED 2026-09-17: the snap evicted 93,000 cells in 30 s
             // and the game stuttered), hold or grow while cells fault back in.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
-            MaterialPager::SetUrgent(commitTight);
+            MaterialPager::SetUrgent(commitTight||pressure);
             MaterialPager::SetThrottle(commitTight);
             if(commitTight && next>256)next=256;
-            else if(!(busy||bulk))next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available);
+            else if(!(busy||bulk)){ static int wsFloor=0; next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2,&wsFloor); }
+            { int cap=PagerCapMB(g_materialMaxMB,g_materialHotMB,physical,1); if(cap && next>cap)next=cap; }
             MaterialPager::SetBudget(size_t(next)*1024*1024);
-            if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d)",effectiveMB,next,int(busy),int(bulk),int(commitTight));
+            if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d pressure=%d free=%llu MiB)",effectiveMB,next,int(busy),int(bulk),int(commitTight),int(pressure),(unsigned long long)(m.ullAvailPhys>>20));
             effectiveMB=next;
             // Adaptive eviction rate: this pager's own cost, the terrain worker's
             // frame-stall count (one meter for the process).

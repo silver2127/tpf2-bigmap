@@ -203,6 +203,8 @@ static bool g_octreeOn = true;
 #include "save_fast.h"
 #include "travel_time.h"
 #include "alignment_batch.h"
+#include "terrain_sidecar.h"
+#include "terrain_serve.h"
 #include "instance_shrink.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
@@ -1234,6 +1236,9 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
+    g_terrainMaxMB = H->cfgInt("tpf2_bigmap", "terrain_cache_max_mb", 0);
+    g_simPhysicalMB = H->cfgInt("tpf2_bigmap", "simulate_physical_mb", 0);
+    if (g_simPhysicalMB > 0) H->log("[tpf2_bigmap] SIMULATING a %d MiB machine for the pager policy (simulate_physical_mb; rig-only)", g_simPhysicalMB);
     g_terrainCowShare = H->cfgBool("tpf2_bigmap", "terrain_cow_share", 0) != 0;
     g_terrainDedupProbe = H->cfgBool("tpf2_bigmap", "terrain_dedup_probe", 0) != 0;
     g_terrainDedup = H->cfgBool("tpf2_bigmap", "terrain_dedup", 0) != 0;
@@ -1246,6 +1251,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
     g_materialHotMB = H->cfgInt("tpf2_bigmap", "material_cache_hot_mb", 0);
     g_materialWarmMB = H->cfgInt("tpf2_bigmap", "material_cache_warm_mb", -1);
+    g_materialMaxMB = H->cfgInt("tpf2_bigmap", "material_cache_max_mb", 0);
     // Auto budgets (hot 0, warm -1) are resolved at install; both imply a warm
     // allowance, so world-entry tracking must be on for them too.
     g_worldEntryTrackBusy = (g_terrainCompress==1 && (g_terrainWarmMB<0 || g_terrainWarmMB>g_terrainHotMB)) ||
@@ -1253,9 +1259,10 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
     g_travelTimeLimit = H->cfgInt("tpf2_bigmap", "travel_time_limit_s", 0);
     g_alignmentBatch = H->cfgInt("tpf2_bigmap", "alignment_batch_tiles", 512);
+    g_terrainServe = H->cfgBool("tpf2_bigmap", "terrain_sidecar", 1) != 0;
     g_cargoPathTime = H->cfgInt("tpf2_bigmap", "cargo_path_time_s", 0);
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
-    g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 0) != 0;
+    g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 1) != 0;
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;
@@ -1368,6 +1375,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallSaveFast();
     installed += InstallTravelTime();
     installed += InstallAlignmentBatch();
+    installed += InstallTerrainServe();
     installed += InstallInstanceShrink();
     installed += InstallMinimap();
 

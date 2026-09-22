@@ -9,6 +9,9 @@ presets for towns and industries. Linux dev.3 adds opt-in lossless terrain RAM
 compression, faster saves and an exact SIMD terrain scan. Linux dev.4 adds lazy zero terrain tiles, compressed-content deduplication and
 travel-time controls. Alignment batching, block/material paging, adaptive memory
 policy and depth 12/13 remain unported; see [integration evidence](docs/linux/PORT.md#windows-integration-bd0d85f-linux-dev4-partial).
+The Windows integration through `26bced4` adds native offline sidecar-format
+validation; live sidecar serving and the newer adaptive pager policy remain
+unported. See [current integration evidence](docs/linux/PORT.md#windows-integration-26bced4-partial).
 The Windows minimap from `cdfee2a` is not yet available on native Linux;
 see the [integration evidence](docs/linux/PORT.md#minimap-integration-cdfee2a-partial).
 
@@ -559,6 +562,14 @@ checkout's build outputs instead (dev only). `build_msi.ps1` refuses to build if
 `PluginHost.wxs` has drifted from the multiplayer copy (line endings aside). WiX v7 asks you to accept its
 [OSMF EULA](https://wixtoolset.org/osmf/); `-AcceptWixEula` passes it
 per-invocation and nothing accepts it for you.
+
+GitHub Actions runs the same script (`.github/workflows/build-msi.yml`): every push to `dev` or `main` and
+every pull request builds `TpF2BigMaps-<version>.msi` and `SHA256SUMS.txt` on a `windows-2022` runner from the
+vendored shared binaries and keeps them as the run's artifact; a `v*` tag (which must equal `installer\VERSION`)
+also creates a draft GitHub release with them attached, ready to be edited and published. The runner has no
+multiplayer checkout beside this one, so the workflow compares `PluginHost.wxs` with the copy at the release
+named in `installer\vendor\VENDORED.md` instead. The workflow passes `-AcceptWixEula`, which is the
+repository owner accepting the WiX terms for those builds.
 
 ## Verifying it worked
 

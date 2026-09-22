@@ -9,12 +9,12 @@ static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
 static uintptr_t mismatchRva;
 static bool build=true;
-static bool minimapWarning=false;
+static bool minimapWarning=false, sidecarWarning=false, capsWarning=false;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
 static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
-static void Log(const char* format,...){if(std::strstr(format,"minimap: unavailable on native Linux"))minimapWarning=true;}
+static void Log(const char* format,...){if(std::strstr(format,"minimap: unavailable on native Linux"))minimapWarning=true; if(std::strstr(format,"terrain sidecar: unavailable"))sidecarWarning=true; if(std::strstr(format,"pager caps/simulation: unavailable"))capsWarning=true;}
 static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
     if(mismatch || rva==mismatchRva)return 0;
     memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
@@ -27,7 +27,7 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){minimapWarning=false;mismatchRva=0;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){minimapWarning=sidecarWarning=capsWarning=false;mismatchRva=0;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -56,6 +56,12 @@ int main(){
     assert(minimapWarning && writes==stockWrites && memory.size()==stockMemory.size());
     // Near jump destinations vary because each initialization allocates a page.
     for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
+    for(const char* key:{"terrain_sidecar","terrain_cache_max_mb","material_cache_max_mb","simulate_physical_mb"}) {
+        Reset();config[key]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
+        assert((std::string(key)=="terrain_sidecar" ? sidecarWarning : capsWarning));
+        assert(writes==stockWrites && memory.size()==stockMemory.size());
+        for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
+    }
     assert(Size(6,0,nullptr)==Pack(96,96));
     assert(Size(7,0,nullptr)==Pack(128,128));
     assert(Size(15,0,nullptr)==Pack(510,510));

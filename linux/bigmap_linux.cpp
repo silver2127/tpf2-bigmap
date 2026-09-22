@@ -209,6 +209,10 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!enabled)return TPF2MP_ERR_DISABLED;
     if(H->cfgBool(Section,"minimap",0))
         H->log("minimap: unavailable on native Linux; image binding and terrain accessor are not verified (docs/linux/PORT.md)");
+    if(H->cfgBool(Section,"terrain_sidecar",0))
+        H->log("terrain sidecar: unavailable on native Linux; AddTile ownership, publication and save/load lifetime await live verification (docs/linux/PORT.md)");
+    if(H->cfgInt(Section,"terrain_cache_max_mb",0)!=0 || H->cfgInt(Section,"material_cache_max_mb",0)!=0 || H->cfgInt(Section,"simulate_physical_mb",0)!=0)
+        H->log("pager caps/simulation: unavailable on native Linux; fixed terrain_cache_hot_mb remains the resident target (docs/linux/PORT.md)");
     if(H->cfgBool(Section,"terrain_blocks",0) || H->cfgInt(Section,"alignment_batch_tiles",0)>0)
         H->log("alignment blocks/batching: unavailable on native Linux; allocation ownership and batch lifetime await live verification (docs/linux/PORT.md)");
     if(H->cfgInt(Section,"terrain_cache_evict_per_s",0)>0 || H->cfgInt(Section,"terrain_cache_warm_mb",0)>0)

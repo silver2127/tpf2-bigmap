@@ -293,3 +293,31 @@ RAM minus 12 GiB and never below the configured warm allowance
 (`TerrainBudgetMB`, both pagers). Compression then happens after loading on the
 below-normal eviction threads. Tested offline (`test_terrain_compression.py`
 budget cases); load time with this policy not yet measured.
+
+## 2026-09-17: headroom sized to the machine (0.5.1)
+
+A 32 GiB machine ran a loaded 207,360-tile save at 19.4 GB in the game with
+awful performance. Cause: the flat 12 GiB reserve above (MEASURED on this
+94 GiB, no-page-file box) is more than a 32 GiB machine has free once the
+save is in, so `TerrainBudgetSteady`'s ceiling fell to the hot budget
+(1 GiB), the pager evicted everything else, and the engine faulted the
+evicted tiles back in through a decode each; the flat 10 GiB commit-tight
+threshold also held on a machine with a system-managed page file, which
+throttled the pagers on top.
+
+Changes (`terrain_compression.h`, both pagers):
+
+- `PagerHeadroom(physical)` = RAM/7 clamped to 2..12 GiB replaces the flat
+  12 GiB in the loading reserve and the steady ceiling; `CommitTightBytes` =
+  RAM/8 clamped to 2..10 GiB replaces the flat 10 GiB.
+- The steady ceiling budgets from *room* = free RAM plus the pager's own
+  target (what it could own), reserving a quarter of the room or the
+  headroom, and hands the terrain pager 3/4 of the rest, the material pager
+  1/2. Counting free RAM alone let a full pager starve itself.
+- Pressure: free RAM under the headroom shrinks the target by 1/8 per second
+  and sets the urgent eviction flag, regardless of the decode feedback.
+
+Offline (`test_terrain_compression.py`): a 32 GiB machine after a load with
+12 GiB held and 4 GiB free settles at 9,652 MiB instead of 1,092. Not yet
+measured on a 32 GiB machine; the `resident target` log lines carry
+`pressure=` and `free=` for that.
