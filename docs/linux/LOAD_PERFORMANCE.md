@@ -205,3 +205,11 @@ initialization was visibly slower than the private warmed test setup, so the
 Deployed plugin SHA-256:
 `51c2893b7e9001a44721af9caa4f43b01d17ee79ca5dcfc6b99e17fcfd881b95`.
 A client-join check remains for when the separate test machine is online.
+
+## Completed-block follow-up
+
+The resident completed-block experiment is documented in
+[`TERRAIN_CHUNK_CACHE.md`](TERRAIN_CHUNK_CACHE.md). It avoids per-kernel disk
+files and skips refinement plus alignment on exact-input hits. A 3 GiB budget
+held this map, but cached reloads of 59.511 / 73.065 seconds versus a 66.252-second
+control did not establish a repeatable gain. It remains disabled in production.

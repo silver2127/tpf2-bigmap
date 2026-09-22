@@ -13,6 +13,7 @@
 #include "terrain_pager.h"
 #include "terrain_copy.h"
 #include "terrain_cached_kernels.h"
+#include "terrain_chunk.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -198,7 +199,7 @@ bool PlanCall(uintptr_t rva,uintptr_t callee,void* target,uint8_t*& stub) {
 extern "C" __attribute__((visibility("default")))
 int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(!host || !info || host->abiMajor!=TPF2MP_ABI_MAJOR || host->size<sizeof(Tpf2mpHost))return TPF2MP_ERR_ABI;
-    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.5","Native Linux large maps and exact terrain load optimizations"};
+    H=host;*info={"tpf2_bigmap","0.4.0-linux-dev.6","Native Linux large maps and exact terrain load optimizations"};
     const bool performanceOnly=H->cfgBool(Section,"performance_only",0);
     const auto baseMod=density::GamePath();
     std::string densityWhy;
@@ -267,6 +268,28 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
     const bool fastCopy=H->cfgBool(Section,"terrain_copy_fast",0);
+    if(H->cfgBool(Section,"terrain_chunk_cache",0)) {
+        constexpr uintptr_t site=0x173b6e0;
+        struct Contract {uintptr_t address;size_t size;uint64_t hash;};
+        for(const auto& c:{Contract{site,0x183,0x6701a1d7e9827dadull},
+            Contract{0xcf55a0,0x17,0x61932101af5b8874ull},Contract{0xcf4b60,0x13f,0xf28b0d55be90c31eull},
+            Contract{0xdb5fa0,0x4da,0xba92199a802044a4ull}}) {
+            const auto* code=reinterpret_cast<const uint8_t*>(H->moduleBase()+c.address);
+            uint64_t hash=14695981039346656037ull;
+            for(size_t i=0;i<c.size;++i)hash=(hash^code[i])*1099511628211ull;
+            if(hash!=c.hash)return TPF2MP_ERR_BUILD;
+        }
+        const uint8_t before[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38};
+        auto* trampoline=page+800;
+        memcpy(trampoline,before,sizeof(before));Jump(trampoline+sizeof(before),H->moduleBase()+site+sizeof(before));
+        uint8_t after[sizeof(before)];memset(after,0x90,sizeof(after));Jump(after,uintptr_t(terrain_chunk::Detour));
+        if(!Plan(site,before,after,sizeof(after)))return TPF2MP_ERR_BUILD;
+        terrain_chunk::original=reinterpret_cast<terrain_chunk::Worker>(trampoline);
+        terrain_chunk::readBase=reinterpret_cast<terrain_chunk::ReadBase>(H->moduleBase()+0xcf55a0);
+        terrain_chunk::append=reinterpret_cast<terrain_chunk::Append>(H->moduleBase()+0xadb7e0);
+        terrain_chunk::verify=H->cfgBool(Section,"terrain_chunk_verify",1);
+        terrain_chunk::Cache().limit=uint64_t(std::clamp(H->cfgInt(Section,"terrain_chunk_cache_mb",1024),64,4096))*1024*1024;
+    }
     const bool fastRefine=H->cfgBool(Section,"terrain_refine_fast",0);
     if(fastRefine) {
         constexpr uintptr_t site=0xd9b850;
@@ -357,6 +380,15 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(minMax)H->log("terrain min/max: exact SSE2 scan enabled");
     if(fastRefine)H->log("terrain refinement: native SysV SSE2 kernel enabled");
     if(fastAlign)H->log("terrain alignment: pooled scratch and native SSE2 blend enabled");
+    // Start diagnostics only after every guard and transactional patch succeeds.
+    if(terrain_chunk::Cache().limit) {
+        H->log("terrain chunk cache: resident 65x65 blocks, verify=%d",int(terrain_chunk::verify));
+        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto& c=terrain_chunk::Cache();
+            H->log("terrain chunks: calls=%llu hits=%llu misses=%llu entries=%llu bytes=%llu refused=%llu checked=%llu mismatches=%llu full=%llu",
+                (unsigned long long)terrain_chunk::calls.load(),(unsigned long long)c.hits.load(),(unsigned long long)c.misses.load(),
+                (unsigned long long)c.writes.load(),(unsigned long long)c.used.load(),(unsigned long long)terrain_chunk::refused.load(),
+                (unsigned long long)terrain_chunk::checked.load(),(unsigned long long)terrain_chunk::mismatches.load(),(unsigned long long)c.full.load());}}).detach();
+    }
     if(H->cfgBool(Section,"terrain_kernel_cache",0) && (fastRefine || fastAlign)) {
         const std::string path=std::string(H->dataDir())+"/terrain-kernels-v2";
         const auto budget=uint64_t(std::clamp(H->cfgInt(Section,"terrain_kernel_cache_mb",2048),64,16384))*1024*1024;
