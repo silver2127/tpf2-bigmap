@@ -218,15 +218,18 @@ b2 0b              mov  dl, 0xb            ; depth 11
 ceiling remains **512 tiles (131 km)** with 128 m leaves. The default patch is
 applied only when the configuration asks for a size over 256 tiles.
 
-**Experimental actual depths 12 and 13 are available.** Set `octree_depth=13`
+**Actual depths 12 and 13 are available, and tested.** Set `octree_depth=13`
 and `max_tiles=2048` for **2,048-tile (524.288 km) edge capacity**, or depth 12
 and `max_tiles=1024` for 262.144 km. Both retain **128 m leaves**. The patch
 assigns compact IDs to levels 11/12 and updates the renderer's level decoder.
 It is byte-verified and tested offline against original engine insertion
-instructions, but **not yet validated in a running game**. Heightmap area
-limits still apply, so the longest maps must be narrow. See
-[the implementation and test notes](docs/octree-depth12.md) for configuration,
-evidence and remaining live checks. Defaults retain depth 11.
+instructions, and the higher depths have been **tested in play and work fine**:
+large maps at depth 13 created, played, saved and reloaded on Steam, in single
+player and in multiplayer, with no duplicate street nodes and no assertion.
+Heightmap area limits still apply, so the longest maps must be narrow. Every
+multiplayer peer needs the same `octree_depth`. See
+[the implementation and test notes](docs/octree-depth12.md) for configuration
+and evidence. Defaults retain depth 11.
 
 Terrain LOD at the edge was **not** traced to the same limit. The only
 terrain-side 32,768 is an asymmetric legacy vertex packer (tiles −128..895),
