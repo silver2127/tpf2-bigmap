@@ -171,3 +171,530 @@ Windows block-copy optimization is not part of this change.
 - Testing used the isolated native lab with the multiplayer Lua mod retained,
   but no second peer. Multiplayer synchronization and long-session stability
   remain untested for these additions.
+
+## Minimap integration cdfee2a (partial)
+
+Windows source integrated: `cdfee2a12511b05a2a7f67bc67ca3a818e140feb`
+(2026-09-16). The Windows implementation, Lua GUI, embedding tool and tests
+merge unchanged. **The native Linux minimap is not implemented.** Linux does
+not install the GUI script or intercept its image tokens. `minimap=0` remains
+the default; `minimap=1` logs an explicit unsupported-feature diagnostic and
+leaves the existing large-map features available. No new game patches are
+installed, and the existing twenty-site verification manifest is unchanged.
+
+### Static investigation
+
+The Linux signature/xref exports and actual build 35924 ELF were examined with
+Capstone. All following addresses are investigation evidence, not enabled hook
+sites. They must not be treated as a completed port or substituted into the
+Windows implementation.
+
+| Linux RVA | Established evidence |
+| --- | --- |
+| `0xcf5f20` | Signature identifies `CTerrain::BaseGetVertices(CVec2i) const`. `rdi` is terrain, `rsi` packs x/y. At `0xcf5f38`, `48 8b 57 18` loads terrain+0x18. Instructions at `0xcf5f4b..0xcf5f6e` subtract header x/y at +0/+4, multiply by header width +8, load cells at +0x10, use a 40-byte cell stride and check entity -1. |
+| `0x1046540` | Signature identifies `CGameUI::CreateConstructionMenu`; SysV this is rdi. Entry bytes `f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55`. At `0x10465dc`, `48 8b 87 50 04 00 00` loads UI+0x450. This alone does not establish the accessor's vtable or the returned state layout. |
+| `0x30b26c0` | Signature identifies raw `ImageView::SetImage(int,int,int,const vector<unsigned char>&,bool)`. Prologue saves channels from esi, width from edx, height from ecx, vector from r8 and bool from r9d. It loads the vector's begin pointer and passes it to `0x34c65a0` at `0x30b281e`. Texture upload/copy lifetime has not been established through that callee. |
+| `0x30b2ab0` | Nearby candidate examined for the image-path overload. It saves this from rdi, argument pointer from rsi and flag from edx. However, at `0x30b2b6e..0x30b2bb2` it reads string data/length at argument+0/+8 **and** +0x20/+0x28, then a field at +0x40. Thus it is not proven to accept the single-string argument used by the Windows detour. Do not hook it with a libstdc++ string-only prototype. |
+
+The adjacent raw-image constructor at `0x30b2950` calls `0x30b26c0`.
+Terrain code near `0xcf6474..0xcf6495` reads levels at +0x28 and resolution
+at +0x2c/+0x30, consistent with part of the Windows sampling layout, but this
+is insufficient to certify the entire terrain sampler. Searching TerrainPtr
+signatures also led to the ImportHeightmap callback at `0x10a1190`; its
+0x450 field is a widget double, not evidence for CGameUI's terrain accessor.
+
+### Not ported / evidence still required
+
+- Resolve the Lua `ImageView:setImage` binding to the actual Linux string
+  overload and prove its argument ownership and delegation to the image
+  resource overload. The candidate above failed the single-string check.
+- Trace UI+0x450 through the Linux accessor and current game state to terrain;
+  prove the virtual slot and terrain offset instead of importing Windows
+  vtable slot 1/state+0x20. Check replacement across loading another world.
+- Complete the terrain origin/height-scale/water-field evidence and raw texture
+  upload lifetime before calling the sampler or freeing uploaded pixel data.
+- Then implement Linux guarded hooks, script synchronization and native renderer
+  integration, with synthetic ABI/render tests. The merged Windows renderer
+  and Windows ctypes/DLL tests are not a native Linux implementation.
+
+Validation for this partial integration: `tools/linux/build.sh` and
+`python3 tools/linux/verify_game.py GAME_ELF`. The native config test checks
+that requesting the unsupported minimap logs a warning and writes only the same existing patch sites and lengths as the default configuration. No live game
+validation was attempted, as required by this job.
+
+## Minimap company map integration d99c054 (shared code only)
+
+Windows source integrated: `d99c0549793721d9dc17c67ec28a1f9161ac0398`
+(2026-09-16, "minimap: company colours and names from the multiplayer mod's
+map"). The commit changes only the shared Lua GUI
+(`mod/minimap/bigmap_minimap.lua`) and the Windows minimap test
+(`tools/test_minimap.py`). Both merge unchanged. The GUI now reads
+`mp_company_map.txt` (`me=<cid>`, then `<cid>=<player>=<percent-escaped name>`)
+beside `mp_company_cfg.txt` and uses the creation-order guess only when that
+file is absent.
+
+The commit has no platform-specific code: no hook, byte pattern, address or
+struct offset. So there is nothing to reverse engineer, no Linux patch site is
+added and the twenty-site manifest is unchanged. As recorded for `cdfee2a`
+above, native Linux still does not install the minimap GUI or implement its
+renderer, so this change has no effect on Linux yet. It will apply unchanged
+once the minimap is ported.
+
+Validation: `tools/linux/build.sh` (four CTest suites pass) and
+`tools/linux/verify_game.py` (build-id and 20 sites pass). The merged script
+parses under system Lua 5.2 (`luac -p`). A standalone run of the new
+map-file parser on the test's sample file gave the expected player-to-company
+mapping, local company and unescaped names. `tools/test_minimap.py` was not run
+because it loads the Windows `out/tpf2_bigmap.dll` and needs `pefile`/`lupa`.
+
+## Windows integration bd0d85f (Linux dev.4, partial)
+
+Integrated on 2026-09-22: the oldest twenty Windows commits, `6121934` through
+`bd0d85f2b01f9564f6a9b77aecef684d7e0026af`. The original baseline above remains
+historical; this is an incremental merge into `linux-native`. No conflicts were
+present. Windows sources and tests are preserved. The merge is staged, not
+committed. The remaining 27 Windows commits are outside this integration.
+
+| Windows commits | Native disposition |
+| --- | --- |
+| `6121934`, `a75f83e`, `ae3027e` | Native terrain deduplication and diagnostic hash-group census; Windows measurement documentation merged unchanged. |
+| `4b39aad`, `a0805be`, `5271b75`, `48946d2`, `c4aa846`, `09fd641`, `35317e7` | Working-set/loading budgets, section retry, commit pressure and adaptive eviction policy remain unported; investigation below. |
+| `101d36e` | Both travel-time controls ported to verified Linux data cells. |
+| `9431584` | Lazy zero terrain allocations through userfaultfd missing-page handling. |
+| `8f4e6a9`, `52ede02`, `cce148a`, `0d2c47e`, `b528366` | Block routing, block diagnostics, small pager and commit backpressure remain unported. Shared block codec builds and is tested natively. |
+| `c76db05`, `30cb13a`, `bd0d85f` | Batching implementation and corrected 32-byte values retained for Windows; Linux tree/lifetime investigation below. Windows measurements are not Linux results. |
+
+### Native pager changes
+
+`terrain_lazy_zero=1` leaves a newly allocated slot missing, with explicit zero
+metadata and no blob. Its first read or write copies one zero-filled stride using
+UFFDIO_COPY, then removes write protection and wakes the faulting threads.
+Untouched release does not restore pages. `terrain_lazy_zero=0` retains eager
+UFFDIO_ZEROPAGE initialization. Both preserve the existing CTerrain allocation
+and release ABI; no new game allocation hooks or offsets are introduced.
+
+`terrain_dedup=1` indexes immutable packed blobs by the codec hash. Before sharing,
+the policy worker decodes a candidate and compares **all 132,098 sample bytes**
+against the write-protected resident tile. Hash collisions cannot authorize a
+false share. A hit takes a reference and skips encoding; a miss creates a blob.
+The index is non-owning, removes the entry on final release, and uses a separate
+mutex with slot-before-index lock ordering. Restore always creates private
+resident pages and drops its blob reference, even for a read. This differs from
+Windows' retained read-only restored views, but preserves exact contents and
+independent lifetimes. Packed byte statistics count shared mappings once.
+Index/metadata allocation failure refuses that eviction and unprotects the tile.
+
+`terrain_dedup_probe=1` reports hashed, skipped, distinct, duplicate, zero, pair
+and largest-group counts every 120 seconds. Cold tiles use their stored hashes;
+resident tiles are write-protected during hashing; lazy zeros need no restore.
+This is a diagnostic census of hash groups, not an atomic world snapshot or an
+exact equality proof. Unlike Windows, there is no ten-second loading cadence or
+low-half diagnostic. There is no verified native loading signal. Probing can
+stall writers and defaults off. Dedup and lazy zero default on **only inside the
+opt-in terrain compression backend**; terrain compression itself still defaults
+off. No Linux load-speed or memory-saving measurement is claimed for dev.4.
+
+### Travel-time RE and guards
+
+The actual ELF's `.rodata` has the same two float values at different addresses:
+
+| Linux RVA | Stock bytes | Setting / consumers |
+| --- | --- | --- |
+| `0x43029a8` | `00 00 96 44` (1200.f) | `travel_time_limit_s`: PathFactory, destination scoring, reachable-station BFS |
+| `0x43029a4` | `00 80 bb 45` (6000.f) | `cargo_path_time_s`: PathFactory and StockListSystem |
+
+A complete `objdump -d -M intel` scan found four RIP-relative readers of 1200:
+`0x14e1779`, `0x14fe79e`, `0x1500013`, `0x1500233`; and two of 6000:
+`0x14e178d`, `0x172cc06`. Their instruction bytes respectively are
+`f3 0f 10 15 27 12 e2 02`, `f3 0f 10 2d 02 42 e0 02`,
+`f3 0f 10 05 8d 29 e0 02`, `f3 0f 10 05 6d 27 e0 02`,
+`f3 0f 10 25 0f 12 e2 02`, `f3 0f 10 05 96 5d bd 02`.
+The reader instructions are evidence, not patched sites.
+
+PathFactory.cpp assert/signature references anchor `0x14e13c0`: it loads 1200
+into xmm2, stores the stack limit at rbp-0xbb8, conditionally replaces it with
+6000 from xmm4, then passes that limit in xmm0 at `0x14e1825`.
+The destination_util.cpp function `0x14fe200` compares accumulated time against
+1200 at `0x14fe7a6`. The two destination tasks at `0x14fff50`/`0x1500170` pass
+1200 in xmm0 to `0x1558870` at `0x1500022`/`0x1500242`. That callee's source and
+signature references at `0x155953c`/`0x1559548` identify
+`simulation_util::path_finder::GetReachableStationsBFS(int,float,...)`.
+StockListSystem.cpp signatures identify `0x172c970` as `Produce`; its load at
+`0x172cc06` supplies 6000 in xmm0. These independently establish the shared
+constants' roles without importing Windows addresses or struct layouts.
+
+Only the two four-byte data cells are changed. SysV floating arguments continue
+through the stock instructions; no trampoline, object layout or ownership
+contract changes. Values <=0 leave stock; positive settings clamp to 60..86400.
+Both sites participate in the existing verify-all-before-write plan and rollback.
+A mismatch refuses initialization before publishing patches. The ELF manifest
+now has 22 sites. Live gameplay effects remain untested (launch failure below).
+
+### Not ported: static attempts and missing live proof
+
+**Alignment batching.** Signature exports identify `0x173cbe0` as the thread-pool
+loop for `TerrainAlignmentSystem::UpdateSubterrains(const std::map<CVec2i,
+std::vector<Box2>>&)`. Actual disassembly traces its caller to `0x173dae0`:
+`rdi=self` is saved in r14 at `0x173daec`, `rsi=map` in r12 at `0x173daf3`.
+It reads the leftmost node at map+0x18 (`0x173db87`), uses map+8 as sentinel
+(`0x173db8c`), and calls libstdc++ `_Rb_tree_increment` at `0x173e018`.
+Its direct caller at `0x173e443` has bytes `e8 98 f6 ff ff`. The loop call is
+`0x173e0a6 -> 0x173cbe0`; publication calls `0xcf56d0` at `0x173e16f`,
+followed by delete calls including `0x173e180` and `0x173e1a9`.
+The caller clears the tree rooted at self+0xa0 (header self+0xa8, count +0xc8).
+This is not the MSVC head/isnil layout. No fake native tree is published.
+Still required: live map nodes and full 32-byte values, vector ownership across
+thread-pool completion, and proof that publishing one batch cannot affect the
+computation of later batches. The lab launch failed before these probes could
+attach, so `alignment_batch_tiles` remains disabled with a request diagnostic.
+
+**Work/result blocks and small pager.** Source/signature anchors and disassembly
+locate Linux `terrain_util::GetBlock` at `0xdb55c0`. It squares the dimension at
+`0xdb587b`, doubles the sample count at `0xdb5881`, and calls operator new
+(`0x6dbce0`) with bytes in rdi at `0xdb589e` (`e8 3d 64 92 ff`). It stores the
+three pointers at rbp-0xa0/-0x98/-0x90 and zeros the uint16 samples in a loop.
+A delete call occurs at `0xdb5bfe -> 0x6dbcd0`. Windows' vector-constructor
+return-address filter and CRT free-IAT hook therefore cannot simply be moved.
+The native publication helper `0x173ed50` was also disassembled; it deletes at
+`0x173ee94`. Allocation escape/exception paths, all result resizes and final
+owners are not proven. Without a live load to observe them, intercepting global
+delete could hand arena pointers to an unguarded native free. `terrain_blocks`
+remains disabled with a diagnostic; its counters, small-span pager, fixed budget
+and pressure throttle are absent. The portable `BlockCodec` is retained and
+validated independently; that does not claim that the small pager is ported.
+
+**Budgets, rate control and backpressure.** The Windows implementation relies on
+GlobalMemoryStatusEx free commit, page-file-backed section creation, world-entry
+state, bulk allocation timestamps and the menu DLL's `Tpf2mpLastGameUiTick`.
+The Linux source and installed menu `.so` exports were examined: no corresponding
+export exists (game UI/frame state is local). Linux uses anonymous
+MAP_NORESERVE memory and UFFDIO_COPY, not section creation. This host reports
+`vm.overcommit_memory=0`, `overcommit_ratio=50`; CommitLimit minus Committed_AS
+is not the Windows section-allocation contract. Importing the 10/12 GiB thresholds
+without validating pressure and fault progress would misrepresent protection
+against OOM. No native load/pressure/frame measurements were possible after the
+lab failed. The Linux pager retains its fixed hot budget, two-second age and
+bounded scan; there is no loading allowance to ramp down, measured-cost/frame
+rate cap, pressure-driven cap override, restore retry or backpressure. Explicit
+Windows warm/rate settings log a diagnostic. Material paging was already absent;
+its matching policy changes remain absent too. Needed next: a native gameplay
+stamp/loading signal, validated Linux memory-pressure inputs and partial-copy
+failure/retry tests under a constrained lab process before enabling the policy.
+
+### Build, tests and live attempt
+
+`tools/linux/build.sh` passes five suites under the soldier SDK: bigmap, density,
+pager, terrain codec and the new shared block codec suite. The userfaultfd test
+actually ran, rather than skipping. New checks cover untouched page residency,
+first-read/write zeros, untouched release, eager opt-out, cold and resident
+censuses, sixteen shared pairs, private writes to twins, concurrent restores,
+write/eviction races and final blob cleanup. Travel tests cover clamping, disabled
+values, byte mismatch before writes and rollback after a failed data write.
+The block codec checks zero/ramp/random data, boundary sizes, truncation, hash
+corruption and capacity rejection. ELF build-id and all 22 patch sites pass.
+
+The lab's share/tpf2mp and mp_lockstep_1 directories were backed up with `cp -a`
+to `.before-port`. The built plugin and test config were installed only in the
+native actor. The official launcher at
+`/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` was used because this
+bigmap clone has no sandbox launcher. It failed immediately with
+`bwrap: setting up uid map: Permission denied`. Two attempts using the same lab
+mount/launch specification with system bwrap (including PRESSURE_VESSEL_BWRAP)
+reached pressure-vessel but failed to create its nested namespace. A final
+attempt with the final build through the original launcher failed identically.
+No kernel/security policy was changed. No game process, title menu, renderer,
+Vulkan device, save load or gdb session was reached; no live success is claimed.
+All attempted runs exited immediately, below the three-minute limit. No Steam
+process was restarted, no save was modified, and no input events were sent.
+
+The actor share tree was restored from its backup; the unchanged mod tree was
+compared to its backup. Recursive comparisons are empty. No launched process
+remains. Raw disassembly, launch errors, build/verification logs, actor logs/data,
+test configuration and restore comparisons are retained in this job's
+`meta/live/`. Existing actor log contents predate these failed launches and
+must not be mistaken for new gameplay observations.
+
+## Windows integration 26bced4 (partial)
+
+Integrated 2026-09-22: twenty Windows commits `dc7264d` through
+`26bced4b98893809bf9bd7960a0acec7b9ab244a`, based on the preceding `bd0d85f`
+integration. No merge conflicts. Seven pending Windows commits remain outside
+this batch. Windows implementations, release assets and MSI CI are retained;
+the merge is staged and uncommitted.
+
+| Commits | Native disposition |
+| --- | --- |
+| `dc7264d`, `915aec1` | Alignment handle, pass timing and test merge; native batching remains unported. |
+| `e62e43b`, `0511bb5`, `96340f9`, `059f2f1`, `da9d033`, `ff2fd60` | Shared sidecar file API now compiles and is tested on Linux; engine grid adapter and save/load integration are not enabled. |
+| `1c3c713`, `4d696f3` | Windows RE/measurements merge as documentation, not native evidence. |
+| `5bf8aaf`, `8e42635` | AddTile serving, publication suppression and pass-end release remain unported. |
+| `f7c6395`, `585921b`, `a448c32` | Windows releases retained. Native minimap remains off/unavailable; pager policy portion remains unported. |
+| `2d03251`, `7407127`, `ce3feb7`, `24a020a` | Adaptive caps, simulated memory, throttle hysteresis and working-set floor remain unported. |
+| `26bced4` | Windows MSI/draft-release workflow retained unchanged; no publishing performed. |
+
+### Portable sidecar validation
+
+`src/terrain_sidecar.h` uses scoped `OpenFile`/`CompareExtension` helpers:
+MSVC keeps `fopen_s`/`_stricmp`; Linux uses `fopen`/`strcasecmp`. Test exports
+retain `dllexport` on Windows. The file format, fingerprint, streaming index,
+lazy per-tile decode and fallback contract remain unchanged. No Windows game
+address is used by the native plugin. This header's raw `GridOf`/`VectorOf`
+still describe the **Windows** layout; it is compiled only by an offline native
+test, not included by the native plugin.
+
+Both incoming synthetic tests allocated only 0x20 bytes for a control block
+with a 24-byte vector at +0x10: writing `end` overran it by eight bytes. They
+now allocate 0x28. The sidecar test is a sixth CTest suite, with assertions
+explicitly enabled in Release. It restores 824 tiles exactly, checks holes,
+wrong-sized caches, mismatched fingerprints/dimensions, truncation, corrupted
+blobs, per-tile fallback, windowed indices, and changed-save rejection. The
+same test also passes host ASan/UBSan. This validates the shared file API with
+synthetic Windows-layout objects, not Linux game ownership.
+
+### Static RE: Linux differs at the shared pointer
+
+Examined the actual build 35924 ELF (build-id remains
+`3a0e156390b0e6f1e372051c24802c8493ae454a`) with objdump and the signature
+exports. These are investigation sites, **not new patches**:
+
+| Site | Evidence |
+| --- | --- |
+| `0x173db00` | `48 8b 7f 08`, loads system+8 into rdi, followed at `0x173db13` by call to signature-identified `CTerrain::GetTileCache` (`0xcf5960`). Confirms the alignment system's terrain field statically. |
+| `0xcf71d0` | AddTile candidate: `endbr64; push rbp; mov rbp,rsp; push r15`; `0xcf71da: 49 89 ff` saves SysV this/rdi in r15, `0xcf71e8: 41 89 f5` saves entity/esi in r13d. Its profiling string at `0x3f25667` is `CTerrain`. |
+| `0xcf73f2..0xcf7419` | Loads terrain+0x18 grid, subtracts grid origin, multiplies by width, scales record index by 40, stores entity (`45 89 2c 24`) in record+0. This links the candidate to AddTile independently of its generic profiling label. |
+| `0xcf75e4..0xcf7608` | Loads record+0x10 shared ownership control, tests reference count at control+8 against 1, then loads **record+8 directly as the vector**, with last at vector+8 and first at vector+0. |
+| `0xcf774a`, `0xcf77ce`, `0xcf77d3` | Detached copy: vector is new control+0x10 (`4d 8d 6e 10`); stores that vector pointer at record+8 (`4d 89 6c 24 08`) and control separately at record+0x10 (`4d 89 74 24 10`). |
+| `0xcf7696` | Existing guarded default-append call, vector in rdi and extra sample count in rsi. AddTile increments record version at `0xcf762f`. |
+| `0xcf4f78..0xcf4f8d` | Independent detach/read path checks record+0x10 refcount, then reads record+8 and dereferences the vector's first pointer. Corroborates that adding Windows' extra +0x10 here would be wrong. |
+
+The prior native map traversal evidence at `0x173dae0` was rechecked. The
+publication call at `0x173e16f` still targets `0xcf56d0`. No assumption that
+Windows and Linux shared_ptr layouts agree is made. No hook or byte manifest
+entry was added; all 22 existing guarded sites remain verified.
+
+### Not ported: attempts and remaining evidence
+
+**Alignment/sidecar runtime:** the Linux AddTile/vector and terrain-field
+investigation above made progress, but the lab could not start (below). Live
+private ownership after AddTile, worker completion, both terrain versions'
+creation order, save-time ownership and lifetime across loads remain unproven.
+The Linux publication/copy paths must be traced before suppressing any writes;
+a persistent served flag must not suppress later gameplay edits. The native
+batching prerequisite remains absent, including the timing and pass-end callback.
+No live system pointer is retained. Save-path resolution and completed-save
+triggers also remain absent. In this exact incoming Windows snapshot,
+`ArmForLoad` and `WriteForSave` have definitions but **no production callers**;
+future Windows wiring is outside this batch. No end-to-end sidecar load claim
+is made for either platform here.
+
+**Memory policy:** inspected both Windows workers and Linux's UFFD backend.
+Windows uses section/free-commit accounting and a gameplay tick; Linux uses
+anonymous MAP_NORESERVE/UFFDIO_COPY, retains a fixed resident target and has no
+material pager. The installed menu library's dynamic exports still provide no
+`Tpf2mpLastGameUiTick`. This host's overcommit mode is 0, ratio 50; measured
+MemTotal/MemAvailable/CommitLimit/Committed_AS are retained in the evidence.
+CommitLimit minus Committed_AS is not a validated replacement for Windows free
+section commit. The failed live launch prevented loading, frame/fault feedback,
+constrained-memory progress and recovery measurements. Importing the formulas
+alone would not validate throttle safety. Sized headroom, caps, simulation,
+hysteresis, working-set floor and associated material policy stay disabled.
+Needed: native pressure inputs, loading/frame signals, recoverable UFFD copy
+failures and live constrained-process measurements. No Linux memory or load-time
+improvement is claimed.
+
+Explicit `terrain_sidecar=1`, nonzero `terrain_cache_max_mb`,
+`material_cache_max_mb` or `simulate_physical_mb` now log native diagnostics.
+Tests assert that these requests add no patch sites or writes. Linux defaults
+remain minimap=0, sidecar=0 and fixed terrain_cache_hot_mb=1024; compression is
+still opt-in. Zero cap/simulation settings do not enable an automatic policy.
+
+### Validation and live attempt
+
+`tools/linux/build.sh`: six suites pass, including the real userfaultfd pager
+test (not skipped). `tools/linux/verify_game.py`: build-id and all 22 sites pass.
+Host ASan/UBSan sidecar test passes. Windows DLL/serve/alignment tests and the
+MSI workflow were not executed on this Linux host.
+
+Backed up both actor share/tpf2mp and mod directories with `cp -a` to
+`.before-port`, installed the built plugin and Linux configuration in the
+native actor, then ran the official tpf2-multiplayer lab launcher (this clone
+has no launcher). It exited immediately with `bwrap: setting up uid map:
+Permission denied`. No title menu, renderer/Vulkan device, save load, gameplay
+or gdb attachment was reached. No input was sent, save modified, or Steam
+process touched. The failure was well within the three-minute time box.
+The share directory was restored; both restored share and unchanged mod compare
+identically to backups. No lab game process remains. Actor logs/data were
+copied for completeness, but pre-existing gameplay logs are not evidence of
+this run. Disassembly, launch/build/test logs, memory evidence, process check
+and empty restoration diffs are in this job's `meta/live/`.
+
+## Windows integration 9180629 (partial)
+
+Integrated 2026-09-22: the final seven Windows commits `5ca9f16` through
+`918062927018b3397450e83ddc5ec5210a914153`, following `26bced4` above.
+Resolved and staged `src/terrain_sidecar.h`; the merge remains uncommitted.
+The original baseline is unchanged as historical context.
+
+| Commits | Native disposition |
+| --- | --- |
+| `5ca9f16` | README memory measurements and scanner notes retained as Windows documentation. |
+| `3e20ce3`, `757d35d` | Windows release 0.5.3, vendored DLLs, MSI library discovery and CI retained. Linux installs into the shared host prefix (`--prefix` supported), not the game folder; no Windows DLL is substituted for a native host. |
+| `7053712` | Portable UTF-8 sidecar I/O, fingerprint stamping and sibling discovery ported and tested. Engine save/load capture, backend path resolution and orphan sweeping remain unported. |
+| `80a6c63` | Live-terrain selection remains unported pending ownership proof. |
+| `3c9fc62` | Shared grid reader and synthetic tests now dereference record+8 directly as the vector, agreeing with Linux disassembly below. |
+| `9180629` | Windows load-only fault sleep retained; native pager has no commit throttle or equivalent loading signal. |
+
+### Portable code and regression coverage
+
+The conflict joined Windows wide UTF-8 path handling with the prior POSIX CRT
+port. Windows keeps `MultiByteToWideChar`, `_wfopen_s`, `_wremove` and its
+FindFirstFileW search. Linux opens UTF-8 path bytes directly, removes files via
+`remove`, and uses `opendir`/`readdir` to search sibling `.terr` headers. POSIX
+suffix matching is case-sensitive. Discovery prefers the requested file and
+leaves the path unchanged on failure or insufficient output capacity. File
+format/version and codec are unchanged; `Refingerprint` checks the header hash
+before stamping. Neither the shared grid nor these helpers is used by the live
+native plugin yet.
+
+The seventh CTest suite, `sidecar_io`, tests non-ASCII directories, unstamped
+rejection, stamping and exact restoration, discovery under a different name,
+foreign/zero fingerprints, bounded buffers, corrupt headers and removal. Its
+vector object is independent of the control block, catching accidental extra
+indirection. The existing 824-tile sidecar test retains the corrected 0x28-byte
+synthetic control allocation and now uses the incoming shared_ptr layout.
+Explicit `terrain_sidecar_write=1` or nonzero `terrain_sidecar_max_tiles` requests
+now produce the same unsupported diagnostic as `terrain_sidecar=1`; native
+config tests verify no added patches or writes for each request.
+
+### Static RE: save/load ABI and terrain layout
+
+Signature/source exports and actual build 35924 ELF disassembly establish the
+following **investigation sites, not installed hooks**. No guarded patch was
+added; the manifest remains 22 sites.
+
+| Linux RVA | Evidence / contract |
+| --- | --- |
+| `0xc7ec00` SaveGame | Serializer.cpp signature matches the nine explicit Windows parameters. Entry bytes `f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55 41 54`. At `0xc7ec2a`, `4c 8b 65 10` loads SaveGameId from rbp+0x10 (entry rsp+8), **argument 7**, not Windows' hidden-return argument 8. Flag is rbp+0x18; monitor rbp+0x20. Epilogue at `0xc7fd9d` loads edx and `0xc7fda3` loads rax, returning the aggregate in registers. A Windows void-pointer/hidden-return detour would corrupt this ABI. |
+| `0xc7ca40` LoadGame | Serializer.cpp unique_ptr-return signature. `0xc7ca55: 49 89 cd` saves rcx in r13; `0xc7caeb..0xc7caf3` reads id+0x28 length and id+0x20 data for the logged save name. The result pointer is saved from rdi at `0xc7ca7e`, context from rsi at `0xc7ca96`, modRep from rdx at `0xc7caa8`. SaveGameId is argument 4 in **rcx**, not Windows r9. |
+| `0x3341ef0` GetSavegameInfo | StandardSaveGameBackend.cpp signature. Hidden result rdi, backend rsi, id rdx (saved as r14 at `0x3341efc`). Reads path data/length at id+0/+8, name at +0x20/+0x28, namespace at +0x40. Empty path calls `0x33467f0` with backend+8 and id+0x40 at `0x3341f52..0x3341f5b`; returned entry directory is read at +0x28/+0x30. `.sav` is appended via char-string `_M_append` at `0x3342076`; its literal is `0x3f249c8`. This is native libstdc++ narrow string handling, not MSVC wstring SSO. |
+| `0x18ba890`, `0x18ba270` | Both save and load call the first then the second. First: `endbr64; mov rax,[rip+0x41984e5]; ret`, global cell `0x5a52d80`. Second: `f3 0f 1e fa 48 8b 3f 48 8b 07 ff 60 20`, forwarding through impl vtable+0x20, **not Windows +0x18**. Concrete backend identity/lifetime still needs live proof. |
+| `0xcf75e4..0xcf7608` | Rechecked AddTile: ownership count comes from record+0x10, vector directly from record+8, samples from vector+0, end from vector+8. Detached copy stores control+0x10 as record+8 at `0xcf77ce` (`4d 89 6c 24 08`) and the control as record+0x10 at `0xcf77d3` (`4d 89 74 24 10`). The corrected Windows reader agrees with this Linux layout; the earlier documentation's purported Windows-only extra indirection was the upstream bug. |
+
+### Not ported and remaining proof
+
+SaveGame/LoadGame hooks, current-terrain capture and serving still require live
+proof of both terrain versions' lifetimes, synchronization during SaveGame,
+private writable vectors after AddTile, publication suppression and pass-end
+release. Native alignment batching/serving prerequisites remain absent. Windows
+SEH probing of potentially freed pointers is not portable ownership validation;
+we do not retain or dereference stale native candidates. Backend selection and
+completed-save/error handling must also be proven before enabling temporary-file
+capture, rename or automatic orphan deletion. Static functions above were found,
+but the attempted lab launch failed before gdb could attach.
+
+The native UFFD backend was reviewed for `9180629`: faults restore with
+UFFDIO_COPY and contain no budget/commit-pressure sleep. Its 10 ms sleep belongs
+to the eviction policy worker. There is no material or small pager. Therefore
+Linux does not currently have the gameplay-freezing throttle this commit fixes.
+Porting the full adaptive policy remains outstanding: the menu library still
+exports no Tpf2mpLastGameUiTick, and Linux anonymous overcommit (mode 0, ratio
+50) does not implement Windows section/free-commit accounting. The failed lab
+launch prevents load/frame and constrained-memory recovery measurements. No
+Windows thresholds, loading guesses or unverified hook addresses were enabled.
+
+### Validation and live attempt
+
+`tools/linux/build.sh` passes all **seven** soldier SDK CTest suites, including
+actual userfaultfd execution (not skipped). ELF verification passes the build-id
+and all 22 guarded sites. Host ASan/UBSan runs of both sidecar tests pass. Windows
+DLL tests, MSI and CI were not executed on Linux.
+
+Both actor directories were compared with their existing `.before-port` backups
+and freshly copied with `cp -a`. The final plugin and Linux config were installed
+in the actor's `share/tpf2mp/data/plugins/`. The official launcher from
+`/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` (absent in this clone)
+was run with the native lab root. It failed immediately with
+`bwrap: setting up uid map: Permission denied`, including the final-build retry.
+No title menu, Vulkan device, save, gameplay or gdb session was reached. No
+input events were sent, Steam was untouched and no save was modified. No live
+performance or correctness result is claimed. Both directories compare equal
+to their backups after restoration; no lab executable remains running.
+Disassembly, test logs, launch error and restoration comparisons are retained
+in this integration job's `meta/live/`; copied actor logs/data are pre-existing
+and do not establish new gameplay observations.
+
+## Windows integration 926113b
+
+Integrated 2026-09-23: Windows merge commit
+`926113b78bcfacb3e487a98298d6d6ae32e9f53e` (PR #5, GOG support for 0.5.2),
+including its merged branch commits and the Program Files (x86) batch fix.
+This is one first-parent integration after `9180629`; later pending Windows
+commits are excluded. No conflicts were present. The merge stays staged and
+uncommitted. The baseline above remains historical.
+
+### Native disposition
+
+Windows GOG now falls back from requested octree depth 12/13 to its verified
+11 root. Native Linux had the corresponding refusal despite already having a
+verified depth-11 implementation. It now accepts requests 11, 12 and 13;
+12/13 log the fallback when octree expansion is enabled. Other values still
+fail before any patch writes. Native defaults remain 11/512.
+
+The existing single `cap` calculation limits the menu, explicit dimensions and
+configured size claims to the installed root: at most 512 tiles, at most 256
+with octree disabled, at most 180 with raster disabled, and any smaller user
+cap. Heightmap constraints remain applied. No depth-12/13 Linux hook is added;
+a save requiring those roots is still unsupported. Unknown ELF builds and
+byte mismatches still fail closed. Windows sources, GOG MSI property and custom
+action DLL, vendor provenance, deployment shadow guard and batch quoting fix
+are retained unchanged. Linux's build script never deploys; its installer uses
+the native shared prefix and preserves existing configuration and host. There
+is no native game-folder DLL deployment or MSI/registry counterpart to add.
+The Windows README's GOG observations are upstream results, not Linux tests.
+
+### Static evidence
+
+Rechecked the actual lab ELF and all 22 manifest sites. At `0xa84230`,
+`49 8b 7e 48` loads the octree receiver into SysV rdi; at `0xa84234`,
+`f3 0f 10 05 48 7c 40 03` loads the original extent into xmm0; at `0xa8423c`,
+`be 0a 00 00 00` sets depth 10 in esi. The call at `0xa84241` is
+`e8 3a 23 c2 00`, targeting `0x16a6580`. The existing verified 13-byte patch
+redirects the extent to private 65536.f and sets esi=11. Fallback uses precisely
+that patch, with no new address, byte pattern, struct offset or ABI assumption.
+The original menu and resize anchors are documented above. Disassembly and
+build-id/site verification output are archived in this job's `meta/live/`.
+
+### Validation and live attempt
+
+`tools/linux/build.sh` passes all seven CTest suites, including the real UFFD
+pager test. Expanded native config tests cover depths 11/12/13, smaller user
+caps, disabled octree/raster, bounded menu and explicit dimensions, invalid
+values, identical patch site/length sets and the emitted depth-11 immediate.
+A mismatch specifically at the octree site refuses depths 12 and 13 with zero
+writes. The independent verifier passes the GNU build-id and all 22 sites.
+Native installer checks pass checksums, standalone host loading, upgrade config
+preservation, multiplayer coexistence and uninstall/save preservation. An initial
+installer-test invocation omitted its required package argument and exited before
+running tests; rerunning against a fixture of the built files passed. Windows
+DLL tests, batch execution and MSI installation were not run on Linux.
+
+Both native actor directories were backed up with `cp -a` to
+`.before-port-926113b`. Installed the built plugin and Linux config with only
+`octree_depth=13` and `max_tiles=2048` changed, then used the official launcher
+at `/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` (absent in this
+clone). It failed immediately: `bwrap: setting up uid map: Permission denied`.
+No game, title menu, Vulkan device, save load, gameplay or gdb session was
+reached; no live fallback success is claimed. No input, Steam operation or
+save modification was performed. Both directories were restored and recursive
+comparisons are empty; no TransportFever2 process remains. Launch output,
+test config, disassembly, tests, restoration/process checks and copied actor
+logs/data are in `meta/live/`. Copied actor gameplay data predates this attempt.
+
+### Not ported
+
+No newly applicable behavior from this integration remains unported. GOG PE
+addresses and MSI acceptance apply to Windows only; native support remains the
+identified Steam ELF. Actual native depth-12/13 roots and previously recorded
+minimap/sidecar/adaptive-policy gaps remain outside this incremental change.
+The live startup check is blocked by the lab's namespace failure, not reported
+as a successful runtime validation.

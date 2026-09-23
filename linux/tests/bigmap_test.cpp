@@ -7,14 +7,16 @@
 static std::map<std::string,int> config;
 static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
+static uintptr_t mismatchRva;
 static bool build=true;
+static bool minimapWarning=false, sidecarWarning=false, capsWarning=false, depthWarning=false;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
 static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
-static void Log(const char*,...){}
+static void Log(const char* format,...){if(std::strstr(format,"keeping depth 11"))depthWarning=true; if(std::strstr(format,"minimap: unavailable on native Linux"))minimapWarning=true; if(std::strstr(format,"terrain sidecar: unavailable"))sidecarWarning=true; if(std::strstr(format,"pager caps/simulation: unavailable"))capsWarning=true;}
 static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
-    if(mismatch)return 0;
+    if(mismatch || rva==mismatchRva)return 0;
     memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
 }
 static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
@@ -25,7 +27,7 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){minimapWarning=sidecarWarning=capsWarning=depthWarning=false;mismatchRva=0;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -45,9 +47,46 @@ int main(){
     assert(Tpf2mpPluginInit(nullptr,&info)==TPF2MP_ERR_ABI);
     Reset();build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();config["enabled"]=0;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_DISABLED && writes==0);
-    Reset();config["octree_depth"]=13;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED && writes==0);
+    for(int depth:{-1,0,10,14}) {
+        Reset();config["octree_depth"]=depth;
+        assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED && writes==0);
+    }
     Reset();mismatch=1;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && rows==9 && cap==512);
+    assert(!minimapWarning);
+    const int stockWrites=writes;const auto stockMemory=memory;
+    // Unsupported extended depths load the verified root, never a larger menu.
+    for(int depth:{11,12,13})for(int enabled:{0,1})for(int limit:{128,2048}) {
+        Reset();config["octree_depth"]=depth;config["octree"]=enabled;
+        config["max_tiles"]=limit;config["tiles_x"]=2048;config["tiles_y"]=32;
+        assert(Tpf2mpPluginInit(&host,&info)==0);
+        const int expected=std::min(limit,enabled?512:256);
+        assert(cap==expected && depthWarning==(enabled && depth!=11));
+        assert(tilesX<=expected && tilesY<=expected);
+        for(int i=0;i<rows;++i)assert(extra[i].side<=expected);
+        if(enabled) {
+            assert(writes==stockWrites && memory.size()==stockMemory.size());
+            assert(memory.at(OctreeSite).at(9)==11);
+            for(const auto& site:stockMemory)
+                assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
+        } else assert(!memory.count(OctreeSite));
+    }
+    for(int depth:{12,13}) {
+        Reset();config["octree_depth"]=depth;mismatchRva=OctreeSite;
+        assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
+        Reset();config["octree_depth"]=depth;config["street_raster"]=0;
+        assert(Tpf2mpPluginInit(&host,&info)==0 && cap==180);
+    }
+    Reset();config["minimap"]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
+    assert(minimapWarning && writes==stockWrites && memory.size()==stockMemory.size());
+    // Near jump destinations vary because each initialization allocates a page.
+    for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
+    for(const char* key:{"terrain_sidecar","terrain_sidecar_write","terrain_sidecar_max_tiles","terrain_cache_max_mb","material_cache_max_mb","simulate_physical_mb"}) {
+        Reset();config[key]=1;assert(Tpf2mpPluginInit(&host,&info)==0);
+        assert((std::string(key).find("terrain_sidecar")==0 ? sidecarWarning : capsWarning));
+        assert(writes==stockWrites && memory.size()==stockMemory.size());
+        for(const auto& site:stockMemory)assert(memory.count(site.first) && memory.at(site.first).size()==site.second.size());
+    }
     assert(Size(6,0,nullptr)==Pack(96,96));
     assert(Size(7,0,nullptr)==Pack(128,128));
     assert(Size(15,0,nullptr)==Pack(510,510));
@@ -74,5 +113,17 @@ int main(){
     uint32_t buffer;std::memcpy(&buffer,memory[0xc7c3a0].data()+1,4);assert(buffer==65536);
     std::memcpy(&buffer,memory[0xc7c3aa].data()+5,4);assert(buffer==65536);
     std::memcpy(&buffer,memory[0xc7b6b1].data()+5,4);assert(buffer==65536);
+    Reset();config["travel_time_limit_s"]=1;config["cargo_path_time_s"]=999999;
+    assert(Tpf2mpPluginInit(&host,&info)==0);
+    float seconds;std::memcpy(&seconds,memory[0x43029a8].data(),4);assert(seconds==60.f);
+    std::memcpy(&seconds,memory[0x43029a4].data(),4);assert(seconds==86400.f);
+    Reset();config["travel_time_limit_s"]=-1;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && !memory.count(0x43029a8) && !memory.count(0x43029a4));
+    Reset();config["travel_time_limit_s"]=3600;mismatchRva=0x43029a8;
+    assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
+    Reset();config["travel_time_limit_s"]=3600;config["cargo_path_time_s"]=7200;
+    failWrite=stockWrites+2;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED);
+    std::memcpy(&seconds,memory[0x43029a8].data(),4);assert(seconds==1200.f);
+    std::memcpy(&seconds,memory[0x43029a4].data(),4);assert(seconds==6000.f);
     puts("PASS: map sizing, ratios, raster overflow, guards, safe caps and rollback");
 }

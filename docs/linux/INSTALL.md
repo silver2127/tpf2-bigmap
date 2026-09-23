@@ -4,7 +4,7 @@ For Steam Transport Fever 2 Linux build 35924. This is a native `.so` plugin,
 not a Wine/Proton DLL. The package includes the shared native plugin host;
 multiplayer is not required.
 
-1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.3.tar.gz`.
+1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.4.tar.gz`.
 2. In the extracted directory, run `bash install.sh` without sudo.
 3. Use the Steam launch-options line printed by the installer. If multiplayer
    is installed, keep its existing launch options: it loads this plugin too.
@@ -98,6 +98,21 @@ GPU drivers and long sessions need further testing. See PORT.md for details.
 One 128x128-tile save settled at 4.98 GiB RSS versus 7.78 GiB with dev.2, using a
 1 GiB terrain budget. Loading peaks were about 9.8 GiB in both runs. This is a
 single-machine comparison, not a guaranteed saving or a frame-rate benchmark.
+
+## Incremental memory changes and travel controls (dev.4)
+
+Inside the opt-in terrain pager, `terrain_lazy_zero=1` delays terrain pages until
+first access and `terrain_dedup=1` shares identical compressed content. Set either
+to 0 to opt out. `terrain_dedup_probe=1` logs a hash-group census every 120 seconds;
+it defaults off and can briefly block writers while hashing resident tiles.
+The pager still uses a fixed hot budget. Windows adaptive budgets, pressure
+backpressure, alignment batching and small/material paging are not available.
+
+`travel_time_limit_s` and `cargo_path_time_s` default to 0 (stock 1200 and 6000
+seconds). Positive values clamp to 60..86400 game seconds. Restart after changing
+them. Both are byte-verified native data patches. Dev.4 passes offline tests;
+its lab launch failed before reaching the game, so the older gameplay and memory
+measurements above do not validate these additions. See PORT.md for evidence.
 
 ## Remove
 

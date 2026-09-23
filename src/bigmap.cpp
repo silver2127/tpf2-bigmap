@@ -198,8 +198,14 @@ static bool g_octreeOn = true;
 #include "terrain_align_fast.h"
 #include "terrain_cache.h"
 #include "terrain_compression.h"
+#include "terrain_blocks.h"
 #include "material_compression.h"
 #include "save_fast.h"
+#include "travel_time.h"
+#include "alignment_batch.h"
+#include "terrain_sidecar.h"
+#include "terrain_serve.h"
+#include "terrain_sidecar_io.h"
 #include "instance_shrink.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
@@ -426,10 +432,14 @@ static int g_logEvery    = 1;
 // A rectangle's long axis may use all of it -- its
 // area (the street-raster product, handled by the raster hook / warned
 // below) is a separate limit. max_tiles stays an explicit lower cap.
+// Depths 12/13 cannot be installed on the GOG build, so the ceiling there is
+// the patched box (EffectiveOctreeDepth drops them to 11). A menu that offered
+// 2,048 tiles over a 512-tile root would hand the user a broken world.
 static int EffectiveMaxTiles()
 {
-    int octCap = g_octreeOn ? (g_octreeDepth == 13 ? 2048 :
-                              g_octreeDepth == 12 ? 1024 : OCTREE_PATCH_TILES)
+    const int depth = EffectiveOctreeDepth();
+    int octCap = g_octreeOn ? (depth == 13 ? 2048 :
+                              depth == 12 ? 1024 : OCTREE_PATCH_TILES)
                             : OCTREE_STOCK_TILES;
     return (g_maxTiles > 0 && g_maxTiles < octCap) ? g_maxTiles : octCap;
 }
@@ -471,6 +481,19 @@ void BigmapTestOctreeSize(int depth, int maxTiles, int enabled, int* tx, int* ty
     *tx = Sanitise(*tx); *ty = Sanitise(*ty);
     BoundHeightmap(tx, ty);
     g_octreeDepth = oldDepth; g_maxTiles = oldMax; g_octreeOn = oldOn;
+}
+
+extern "C" __declspec(dllexport)
+int BigmapTestOctreeCeiling(int gog, int depth, int maxTiles, int enabled)
+{
+    int oldDepth = g_octreeDepth, oldMax = g_maxTiles;
+    bool oldOn = g_octreeOn, oldGog = g_gog;
+    g_gog = gog != 0; g_octreeDepth = depth; g_maxTiles = maxTiles;
+    g_octreeOn = enabled != 0;
+    const int cap = EffectiveMaxTiles();
+    g_gog = oldGog; g_octreeDepth = oldDepth;
+    g_maxTiles = oldMax; g_octreeOn = oldOn;
+    return cap;
 }
 
 // A std::string holding `s` in its inline buffer (SSO: at most 15 chars).
@@ -868,6 +891,10 @@ static bool WriteWholeFile(const wchar_t* path, const char* data, size_t len)
     return ok;
 }
 
+// The in-game minimap: native terrain texture behind a Lua ImageView. Uses
+// ReadWholeFile / WriteWholeFile above for its game script.
+#include "minimap.h"
+
 // The stock text with the inserts, malloc'd; nullptr (and `why`) when an anchor
 // is missing, repeated or out of order.
 static char* PatchBaseModText(const char* stock, size_t len, size_t* outLen, char* why, size_t whyLen)
@@ -1033,6 +1060,9 @@ void WINAPI BigmapRestoreStockBaseMod(HWND, HINSTANCE, LPSTR, int)
     if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\res\\config\\base_mod.lua", self) < 0) return;
     char why[320];
     SyncBaseMod(path, false, why, sizeof why);
+    // The minimap game script goes too (only if it is ours).
+    wchar_t script[MAX_PATH];
+    if (MinimapScriptPathIn(self, script, MAX_PATH)) SyncMinimapScript(script, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,16 +1254,35 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
+    g_terrainMaxMB = H->cfgInt("tpf2_bigmap", "terrain_cache_max_mb", 0);
+    g_simPhysicalMB = H->cfgInt("tpf2_bigmap", "simulate_physical_mb", 0);
+    if (g_simPhysicalMB > 0) H->log("[tpf2_bigmap] SIMULATING a %d MiB machine for the pager policy (simulate_physical_mb; rig-only)", g_simPhysicalMB);
     g_terrainCowShare = H->cfgBool("tpf2_bigmap", "terrain_cow_share", 0) != 0;
+    g_terrainDedupProbe = H->cfgBool("tpf2_bigmap", "terrain_dedup_probe", 0) != 0;
+    g_terrainDedup = H->cfgBool("tpf2_bigmap", "terrain_dedup", 0) != 0;
+    g_terrainLazyZero = H->cfgBool("tpf2_bigmap", "terrain_lazy_zero", 1) != 0;
+    g_terrainBlocks = H->cfgBool("tpf2_bigmap", "terrain_blocks", 0) != 0;
+    g_smallHotMB = H->cfgInt("tpf2_bigmap", "small_cache_hot_mb", 1024);
+    if (g_smallHotMB < 64) g_smallHotMB = 64;
+    g_terrainEvictPerSec = H->cfgInt("tpf2_bigmap", "terrain_cache_evict_per_s", 4000);
+    g_materialEvictPerSec = H->cfgInt("tpf2_bigmap", "material_cache_evict_per_s", 4000);
     g_materialCompress = H->cfgInt("tpf2_bigmap", "material_cache_compress", 0);
     g_materialHotMB = H->cfgInt("tpf2_bigmap", "material_cache_hot_mb", 0);
     g_materialWarmMB = H->cfgInt("tpf2_bigmap", "material_cache_warm_mb", -1);
+    g_materialMaxMB = H->cfgInt("tpf2_bigmap", "material_cache_max_mb", 0);
     // Auto budgets (hot 0, warm -1) are resolved at install; both imply a warm
     // allowance, so world-entry tracking must be on for them too.
     g_worldEntryTrackBusy = (g_terrainCompress==1 && (g_terrainWarmMB<0 || g_terrainWarmMB>g_terrainHotMB)) ||
                             (g_materialCompress==1 && (g_materialWarmMB<0 || g_materialWarmMB>g_materialHotMB));
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
+    g_travelTimeLimit = H->cfgInt("tpf2_bigmap", "travel_time_limit_s", 0);
+    g_alignmentBatch = H->cfgInt("tpf2_bigmap", "alignment_batch_tiles", 512);
+    g_terrainServe = H->cfgBool("tpf2_bigmap", "terrain_sidecar", 1) != 0;
+    g_sidecarWrite = H->cfgBool("tpf2_bigmap", "terrain_sidecar_write", 1) != 0;
+    g_sidecarMaxTiles = H->cfgInt("tpf2_bigmap", "terrain_sidecar_max_tiles", 0);
+    g_cargoPathTime = H->cfgInt("tpf2_bigmap", "cargo_path_time_s", 0);
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
+    g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 1) != 0;
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;
@@ -1320,6 +1369,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
                    "binary -- every RVA here was measured on those two, so "
                    "refusing to patch (re-run the recon if the game updated)");
             SyncGameBaseMod(false);   // no density levels on an unknown build: stock file back
+            SyncGameMinimapScript(false);   // nor a minimap button whose hooks cannot install
             return TPF2MP_ERR_BUILD;
         }
     }
@@ -1340,9 +1390,15 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallTerrainAlignFast();
     installed += InstallTerrainCache();
     installed += InstallTerrainCompression();
+    installed += InstallTerrainBlocks();
     installed += InstallMaterialCompression();
     installed += InstallSaveFast();
+    installed += InstallTravelTime();
+    installed += InstallAlignmentBatch();
+    installed += InstallTerrainServe();
+    installed += InstallSidecarIo();
     installed += InstallInstanceShrink();
+    installed += InstallMinimap();
 
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {
@@ -1398,10 +1454,20 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
         }
         uintptr_t rva = g_gog ? RVA_OCTREE_GOG : RVA_OCTREE;
         const uint8_t* exp = g_gog ? EXPECTED_OCTREE_GOG : EXPECTED_OCTREE;
+        const int depth = EffectiveOctreeDepth();
+        if (g_octreeOn && depth != g_octreeDepth) {
+            // Depth 12/13 rewrite two Steam-35924 prologues this build does not
+            // have. Refusing to load only punished GOG users whose config asked
+            // for it -- the shipped cfg does -- so keep the widening that does
+            // byte-verify here and say what the shorter root costs.
+            H->log("octree: octree_depth=%d is Steam 35924 only -- this build keeps "
+                   "depth 11 and loads, so the edge ceiling stays %d tiles, not %d",
+                   g_octreeDepth, OCTREE_PATCH_TILES, g_octreeDepth == 13 ? 2048 : 1024);
+        }
         if (!g_octreeOn) {
             H->log("octree: disabled (octree=0); maps over %d tiles will grow "
                    "duplicate street nodes past +-32,768 m", OCTREE_STOCK_TILES);
-        } else if (g_octreeDepth >= 12) {
+        } else if (depth >= 12) {
             // Explicit opt-in also applies on load, even with a small menu
             // ladder: saved worlds do not pass through GetNumTilesNew.
             if (!InstallOctDepth12(rva, exp)) {
