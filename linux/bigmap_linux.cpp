@@ -219,11 +219,15 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(H->cfgInt(Section,"terrain_cache_evict_per_s",0)>0 || H->cfgInt(Section,"terrain_cache_warm_mb",0)>0)
         H->log("terrain policy: Linux retains a fixed hot budget; Windows loading/commit/frame-adaptive policy is not ported (docs/linux/PORT.md)");
     const int depth=H->cfgInt(Section,"octree_depth",11);
-    if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
+    if(depth<11 || depth>13){H->log("Linux octree_depth must be 11, 12 or 13; refusing invalid depth %d",depth);return TPF2MP_ERR_FAILED;}
+    // Like Windows GOG, use only the root this build can actually install.
+    // The existing cap and all menu/override bounds use that depth-11 root.
     cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;
     maxRatio=std::clamp(H->cfgInt(Section,"max_ratio",20),5,20);
     cellBudget=double(std::clamp(H->cfgInt(Section,"cell_budget_millions",1500),1,2000))*1e6;
     const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
+    if(octree && depth!=11)
+        H->log("octree: octree_depth=%d is unavailable on native Linux -- keeping depth 11; edge ceiling stays 512 tiles, not %d",depth,depth==13?2048:1024);
     if(!octree)cap=std::min(cap,256);
     if(!raster)cap=std::min(cap,180); // never offer overflowing generation
     tilesX=H->cfgInt(Section,"tiles_x",0);tilesY=H->cfgInt(Section,"tiles_y",0);

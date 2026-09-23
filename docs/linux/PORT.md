@@ -622,3 +622,79 @@ to their backups after restoration; no lab executable remains running.
 Disassembly, test logs, launch error and restoration comparisons are retained
 in this integration job's `meta/live/`; copied actor logs/data are pre-existing
 and do not establish new gameplay observations.
+
+## Windows integration 926113b
+
+Integrated 2026-09-23: Windows merge commit
+`926113b78bcfacb3e487a98298d6d6ae32e9f53e` (PR #5, GOG support for 0.5.2),
+including its merged branch commits and the Program Files (x86) batch fix.
+This is one first-parent integration after `9180629`; later pending Windows
+commits are excluded. No conflicts were present. The merge stays staged and
+uncommitted. The baseline above remains historical.
+
+### Native disposition
+
+Windows GOG now falls back from requested octree depth 12/13 to its verified
+11 root. Native Linux had the corresponding refusal despite already having a
+verified depth-11 implementation. It now accepts requests 11, 12 and 13;
+12/13 log the fallback when octree expansion is enabled. Other values still
+fail before any patch writes. Native defaults remain 11/512.
+
+The existing single `cap` calculation limits the menu, explicit dimensions and
+configured size claims to the installed root: at most 512 tiles, at most 256
+with octree disabled, at most 180 with raster disabled, and any smaller user
+cap. Heightmap constraints remain applied. No depth-12/13 Linux hook is added;
+a save requiring those roots is still unsupported. Unknown ELF builds and
+byte mismatches still fail closed. Windows sources, GOG MSI property and custom
+action DLL, vendor provenance, deployment shadow guard and batch quoting fix
+are retained unchanged. Linux's build script never deploys; its installer uses
+the native shared prefix and preserves existing configuration and host. There
+is no native game-folder DLL deployment or MSI/registry counterpart to add.
+The Windows README's GOG observations are upstream results, not Linux tests.
+
+### Static evidence
+
+Rechecked the actual lab ELF and all 22 manifest sites. At `0xa84230`,
+`49 8b 7e 48` loads the octree receiver into SysV rdi; at `0xa84234`,
+`f3 0f 10 05 48 7c 40 03` loads the original extent into xmm0; at `0xa8423c`,
+`be 0a 00 00 00` sets depth 10 in esi. The call at `0xa84241` is
+`e8 3a 23 c2 00`, targeting `0x16a6580`. The existing verified 13-byte patch
+redirects the extent to private 65536.f and sets esi=11. Fallback uses precisely
+that patch, with no new address, byte pattern, struct offset or ABI assumption.
+The original menu and resize anchors are documented above. Disassembly and
+build-id/site verification output are archived in this job's `meta/live/`.
+
+### Validation and live attempt
+
+`tools/linux/build.sh` passes all seven CTest suites, including the real UFFD
+pager test. Expanded native config tests cover depths 11/12/13, smaller user
+caps, disabled octree/raster, bounded menu and explicit dimensions, invalid
+values, identical patch site/length sets and the emitted depth-11 immediate.
+A mismatch specifically at the octree site refuses depths 12 and 13 with zero
+writes. The independent verifier passes the GNU build-id and all 22 sites.
+Native installer checks pass checksums, standalone host loading, upgrade config
+preservation, multiplayer coexistence and uninstall/save preservation. An initial
+installer-test invocation omitted its required package argument and exited before
+running tests; rerunning against a fixture of the built files passed. Windows
+DLL tests, batch execution and MSI installation were not run on Linux.
+
+Both native actor directories were backed up with `cp -a` to
+`.before-port-926113b`. Installed the built plugin and Linux config with only
+`octree_depth=13` and `max_tiles=2048` changed, then used the official launcher
+at `/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` (absent in this
+clone). It failed immediately: `bwrap: setting up uid map: Permission denied`.
+No game, title menu, Vulkan device, save load, gameplay or gdb session was
+reached; no live fallback success is claimed. No input, Steam operation or
+save modification was performed. Both directories were restored and recursive
+comparisons are empty; no TransportFever2 process remains. Launch output,
+test config, disassembly, tests, restoration/process checks and copied actor
+logs/data are in `meta/live/`. Copied actor gameplay data predates this attempt.
+
+### Not ported
+
+No newly applicable behavior from this integration remains unported. GOG PE
+addresses and MSI acceptance apply to Windows only; native support remains the
+identified Steam ELF. Actual native depth-12/13 roots and previously recorded
+minimap/sidecar/adaptive-policy gaps remain outside this incremental change.
+The live startup check is blocked by the lab's namespace failure, not reported
+as a successful runtime validation.
