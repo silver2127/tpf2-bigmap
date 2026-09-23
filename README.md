@@ -1,14 +1,16 @@
-# Big Maps (bigmap/)
+# tpf2-bigmap
 
 Maps larger than Transport Fever 2's New Game menu will build.
 
-Big Maps lived in its own repository (tpf2-bigmap) until 2026-09-22; it is now
-part of TpF2 Multiplayer and ships in the same MSI. Build it with
-`native\build.bat bigmap` (or `all`); this folder's `build.bat` still takes the
-test targets (`-pager-test`, `-codec-test`, ...).
-
-Every memory and load-time optimization, with its switch and how it works, is
-listed under [Performance optimizations](#performance-optimizations).
+**Big Maps is developed in
+[tpf2-multiplayer](https://github.com/silver2127/tpf2-multiplayer/tree/dev/bigmap),
+under `bigmap/`, and this repository is kept in sync with it automatically.** Every
+change made there lands here too, so this is the place to get Big Maps on its own,
+without multiplayer. TpF2 Multiplayer 0.7 and later already include Big Maps.
+Please open issues and pull requests against `dev` in tpf2-multiplayer: a change
+made only here is overwritten by the next sync. The exception is the standalone
+installer (`installer/`, `.github/`, `tools/vendor_host.ps1`,
+`tools/test_config_msi.py`), which lives only in this repository.
 
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
@@ -22,9 +24,9 @@ overflow above approximately 185 km separation. See
 [placement-distance.md](docs/placement-distance.md) for the reverse-engineered
 sites and offline validation; an in-game regeneration check is still pending.
 
-A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code;
-its one build-time dependency on the rest of the repo is the plugin ABI,
-`native/src/plugin/tpf2mp_plugin.h`.
+A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
+and has no build-time dependency on the host tree, only `src/tpf2mp_plugin.h`,
+the whole ABI, which the sync copies from tpf2-multiplayer.
 
 Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
 (2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
@@ -496,10 +498,14 @@ stock.
 
 ## Install
 
-**Install TpF2 Multiplayer** (`TpF2Multiplayer.msi` from the
-[latest release](https://github.com/silver2127/tpf2-multiplayer/releases)): Big
-Maps ships inside it. It finds the Transport Fever 2 folder Steam registered,
-asks you to confirm it, and puts these in place (besides the multiplayer files):
+**Download `TpF2BigMaps-<version>.msi` from the
+[latest release](https://github.com/silver2127/tpf2-bigmap/releases) and run it.**
+It finds the Transport Fever 2 folder (from Steam's own uninstall entry, or from
+the folder a previous install remembered), asks you to confirm it,
+and puts these in place:
+
+If you play with TpF2 Multiplayer 0.7 or later, you already have Big Maps: do not
+install this package as well. Installing TpF2 Multiplayer removes it.
 
 | file | what |
 | --- | --- |
@@ -540,15 +546,16 @@ the way it shapes the stock ones. To set a shape yourself, add a
 `octree=1`, and the area within the street-raster budget (`street_raster=1` scales
 the cell to keep it there).
 
-### The old TpF2 Big Maps installer
+### With TpF2 Multiplayer
 
-Up to 0.5.x Big Maps had its own MSI (`TpF2BigMaps-<version>.msi`), which
-coexisted with TpF2 Multiplayer by sharing the proxy and the plugin host under
-fixed component GUIDs (`installer/PluginHost.wxs`). The TpF2 Multiplayer MSI now
-lists that product's UpgradeCode and removes it when it installs, so the plugin
-has one owner; the shared components are reference-counted, so nothing is lost
-in between, and the old package's base_mod restore does not run during that
-removal (the new plugin re-patches on its next start).
+TpF2 Multiplayer 0.7 and later ship Big Maps themselves and remove this package
+when they install (its UpgradeCode is listed in their MSI), so the plugin has one
+owner. Before 0.7 the two packages coexisted: they shared the proxy and the
+plugin host under the **same component GUIDs** (`installer/PluginHost.wxs`), so
+Windows Installer reference-counted them and only the last one out put the game's
+own `alut.dll` back. `installer\test_coexist.ps1` proves that against a
+throwaway folder with the real `msiexec` transactions (it needs an elevated
+PowerShell, because the packages are per-machine).
 
 ### Virus-scanner findings
 
