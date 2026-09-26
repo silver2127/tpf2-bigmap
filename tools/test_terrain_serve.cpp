@@ -144,6 +144,53 @@ int main() {
     BigmapTestServeDetour(live5.cterrain, 1000, FakeAddTile, Mark);
     assert(!Loaded() && !TerrainSidecar::g_pending);
     BigmapTestServeCounters(c); assert(c[1] == before[1] && c[5] == before[5]);
+    // 7. Threads (a player's crash dump, 2026-09-26): the game runs the alignment
+    //    pass on many threads and each finishing pass releases the file, while
+    //    AddTile threads may still decode from it. Exactly one release wins, and
+    //    a decode either completes intact or finds nothing loaded.
+    {
+        std::vector<FakeTerrain*> readers;
+        for (int t = 0; t < 4; ++t) {
+            auto* ft = new FakeTerrain(nx, ny);
+            for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) ft->addTile(i, int(1000 + i));
+            readers.push_back(ft);
+        }
+        for (int round = 0; round < 200; ++round) {
+            assert(BeginApply(GridOf(live3.cterrain), 0x5EED, path, dec) == written);
+            volatile LONG go = 0, released = 0, intact = 0;
+            std::vector<HANDLE> threads;
+            struct Reader { FakeTerrain* t; volatile LONG* go; volatile LONG* intact; const FakeTerrain* save; };
+            struct Ender { volatile LONG* go; volatile LONG* released; };
+            std::vector<Reader> rs; std::vector<Ender> es;
+            rs.reserve(readers.size()); es.reserve(8);
+            for (auto* ft : readers) rs.push_back({ft, &go, &intact, &save});
+            for (int e = 0; e < 8; ++e) es.push_back({&go, &released});
+            for (auto& r : rs) threads.push_back(CreateThread(nullptr, 0, [](void* p) -> DWORD {
+                auto* r = static_cast<Reader*>(p);
+                auto* scratch = new BlockCodec::DecodeScratch;
+                while (!*r->go) YieldProcessor();
+                for (uint32_t i = 0; i < uint32_t(r->t->caches.size()); ++i)
+                    if (ApplyTile(GridOf(r->t->cterrain), i, *scratch)) {
+                        assert(r->t->caches[i] == r->save->caches[i]);
+                        InterlockedIncrement(r->intact);
+                    }
+                delete scratch;
+                return 0;
+            }, &r, 0, nullptr));
+            for (auto& e : es) threads.push_back(CreateThread(nullptr, 0, [](void* p) -> DWORD {
+                auto* e = static_cast<Ender*>(p);
+                while (!*e->go) YieldProcessor();
+                if (EndApply()) InterlockedIncrement(e->released);
+                return 0;
+            }, &e, 0, nullptr));
+            InterlockedExchange(&go, 1);
+            WaitForMultipleObjects(DWORD(threads.size()), threads.data(), TRUE, INFINITE);
+            for (HANDLE h : threads) CloseHandle(h);
+            assert(released == 1 && !Loaded());
+            assert(!EndApply());
+        }
+        for (auto* ft : readers) delete ft;
+    }
     remove(path);
     // 6. Byte anchors in the real executable.
     FILE* f = nullptr; fopen_s(&f, "C:\\tools\\bin\\TransportFever2.exe", "rb"); assert(f);
@@ -154,6 +201,6 @@ int main() {
     check(TerrainServe::kRecordStoreRva, TerrainServe::kRecordStoreBytes, sizeof TerrainServe::kRecordStoreBytes);
     check(TerrainServe::kDetachRva, TerrainServe::kDetachBytes, sizeof TerrainServe::kDetachBytes);
     fclose(f);
-    printf("PASS: %ld of %d tiles served at AddTile in grid order (one probe each) and shuffled, absent/unloaded/unknown-entity cases, byte anchors\n", written, nx * ny);
+    printf("PASS: %ld of %d tiles served at AddTile in grid order (one probe each) and shuffled, absent/unloaded/unknown-entity cases, one release under threads, byte anchors\n", written, nx * ny);
     return 0;
 }
