@@ -127,11 +127,12 @@ static bool InstallTerrainServe() {
     }
     mark = TerrainPager::SetServed;
     g_terrainServedCheck = TerrainPager::IsServed;
+    // Every thread whose batched alignment pass finishes lands here, several at
+    // once: only the one that releases the file reports it (TerrainSidecar::g_loadLock).
     g_alignmentPassDone = []() {
-        if (!TerrainSidecar::Loaded()) return;
-        if (H) H->log("terrain sidecar: load done, %lld tiles served (%lld unmarked, %lld absent, %lld not found, %lld copies skipped, open+verify %lld ms); releasing the file",
+        if (!TerrainSidecar::EndApply()) return;
+        if (H) H->log("terrain sidecar: load done, %lld tiles served (%lld unmarked, %lld absent, %lld not found, %lld copies skipped, open+verify %lld ms); file released",
             applied, unmarked, absent, notFound, g_terrainServedCopiesSkipped, beginMs);
-        TerrainSidecar::EndApply();
     };
     H->log("terrain sidecar: a loaded sidecar's tiles are applied at AddTile and the load's publication into them is skipped");
     return true;
