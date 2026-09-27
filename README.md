@@ -28,6 +28,17 @@ A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
 and has no build-time dependency on the host tree, only `src/tpf2mp_plugin.h`,
 the whole ABI, which the sync copies from tpf2-multiplayer.
 
+
+**Native Linux:** the Steam/GOG executable layouts and MSI instructions below
+describe the Windows plugin. For the native Steam ELF, use the
+[Linux installer](../docs/linux/INSTALL.md) and consult the
+[Linux port evidence and limits](docs/linux/PORT.md#octree-depth-1213-experimental).
+Native defaults remain depth 11 / 512 tiles. Upstream reports successful
+depth-13 play, save/reload and multiplayer with a native Linux dedicated server;
+these results were not repeated in this local integration. Native placement
+limits still apply (see the port evidence). The upstream GOG run below
+exercised its depth-11 fallback. Every peer needs the same `octree_depth`.
+
 Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
 (2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
 is byte-verified before it is patched, and the plugin refuses to patch anything
@@ -647,6 +658,16 @@ Both stock and added size rows are supported; map-edge and heightmap limits
 still apply. See [map-ratios.md](docs/map-ratios.md) for dimensions and validation.
 
 ## Performance optimizations
+
+**Native Linux scope:** the tables below describe Windows switches, shipped
+defaults and measurements. The [native configuration](linux/tpf2_bigmap.cfg)
+ships `terrain_cache_compress=1` (userfaultfd), `terrain_minmax_fast=1`
+(scan only, without the Windows block-copy optimization) and `save_fast=1`.
+Native alignment batching is experimental and ships `alignment_batch_tiles=0`.
+The other listed optimizations are not implemented as native features; see
+[Linux port evidence and limits](docs/linux/PORT.md). The gains and multiplayer
+claims below are upstream reports, not new native benchmarks or cross-platform
+validation.
 
 A big map strains the stock engine in two ways. It runs out of memory, because
 per-tile structures are sized for maps a tenth as large. It also loads slowly,
