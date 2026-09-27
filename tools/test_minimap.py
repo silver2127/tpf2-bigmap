@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXE = r'C:\tools\bin\TransportFever2.exe'
 SCRIPT = ROOT / 'mod/minimap/bigmap_minimap.lua'
 STYLE = ROOT / 'mod/minimap/bigmap_minimap_style.lua'
+ICON = ROOT / 'mod/minimap/minimap_button@2x.tga'
 MARKER = b'-- tpf2_bigmap minimap'
 
 
@@ -62,6 +63,8 @@ sync_style.argtypes = [C.c_wchar_p, C.c_int]
 style_text = dll.BigmapTestMinimapStyleText
 style_text.argtypes = [C.c_char_p, C.c_uint64]
 style_text.restype = C.c_uint64
+sync_icon = dll.BigmapTestSyncMinimapIcon
+sync_icon.argtypes = [C.c_wchar_p, C.c_int]
 install = dll.BigmapTestInstallMinimap
 install.argtypes = [C.POINTER(Host), C.c_int, C.c_int, C.c_wchar_p]
 
@@ -493,6 +496,25 @@ def check_script_sync(tmp):
     assert sync_style(str(path), 1) == 0 and not (tmp / 'style_sheet').exists()   # not in game_script: none
     print('PASS: style sheet: embedded copy equals the source; written beside game_script, up to date, removed; '
           'a foreign file is never touched; no game_script folder, no style sheet')
+
+    # The button's icon: res/textures/ui/bigmap/, a folder of its own; the folder
+    # goes only when empty, and ui/ (the game's) never.
+    isrc = ICON.read_bytes()
+    ui = tmp / 'res' / 'textures' / 'ui'
+    ui.mkdir(parents=True)
+    icon = ui / 'bigmap' / 'minimap_button@2x.tga'
+    assert sync_icon(str(script), 1) == 3 and icon.read_bytes() == isrc      # written, folder made
+    assert sync_icon(str(script), 1) == 2                                    # up to date
+    icon.write_bytes(b'an old icon')
+    assert sync_icon(str(script), 1) == 3 and icon.read_bytes() == isrc      # rewritten
+    assert sync_icon(str(script), 0) == 1 and not (ui / 'bigmap').exists()   # removed with its folder
+    assert sync_icon(str(script), 0) == 0 and ui.exists()                    # absent; ui/ stays
+    assert sync_icon(str(script), 1) == 3
+    (ui / 'bigmap' / 'somebody_else.tga').write_bytes(b'x')
+    assert sync_icon(str(script), 0) == 1 and (ui / 'bigmap' / 'somebody_else.tga').exists()
+    assert sync_icon(str(path), 1) == 0                                      # not in game_script: none
+    print('PASS: button icon: embedded copy equals the TGA; written into its own folder, up to date, rewritten, '
+          'removed with the folder when empty; another file in it is kept')
 
 
 # ---- installer --------------------------------------------------------------
@@ -1086,7 +1108,7 @@ def check_lua_variant(text, scale, centre, sw, sh, auto, cfg_scale, guess, owner
     rect, size, relief = (C.c_double * 4)(), (C.c_int * 2)(), C.c_double()
     assert parse(R.token.encode(), rect, size, C.byref(relief)), R.token
     assert list(rect) == [-32768, -16384, 32768, 16384] and list(size) == [1024, 512] and relief.value == 4, R.token
-    assert R.buttonIcon == 'ui/button/medium/terrain@2x.tga', R.buttonIcon
+    assert R.buttonIcon == 'ui/bigmap/minimap_button@2x.tga', R.buttonIcon
     assert R.windowVisible
     cr, ir = list(R.cr.values()), list(R.ir.values())
     assert abs(ir[0] - cr[0]) <= tol and abs(ir[1] - cr[1]) <= tol, (cr, ir, logs)
