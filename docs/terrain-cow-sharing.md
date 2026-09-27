@@ -111,6 +111,64 @@ byte-identical. The lever is therefore **content dedup, not copy-on-write**, and
 next test, no new machinery: hash both versions' tiles during a load and report
 how many collide. Only build dedup if that number is near 65,536.
 
+## 0d. MEASURED (September 17, 256x256 load): the two versions ARE identical, and dedup is built
+
+`terrain_dedup_probe=1` (this commit) hashes every live tile from the pager
+worker and counts hash groups. One load of `New Game6464`, probes every 10 s
+while loading:
+
+| live | hashed (resident / cold) | distinct | zero tiles | pairs | largest group | note |
+|---|---|---|---|---|---|---|
+| 24,775 | 24,767 (16,120 / 8,647) | 1 | 24,767 | 0 | 24,767 | first version allocating, nothing filled yet |
+| 131,072 | 131,072 (71,376 / 59,696) | 1 | 131,072 | 0 | 131,072 | both versions allocated, all still zero |
+| 131,072 | 131,072 (72,386 / 58,686) | 9,965 | 112,678 | 8,430 | 112,678 | filling: the filled tiles already come in pairs |
+| **131,072** | **131,072 (43,619 / 87,453)** | **65,432** | **719** | **64,922** | 719 | **both versions full: every filled tile has exactly one twin** |
+| 131,072 | 119,042 (17,007 / 102,035) | 65,536 | 0 | 53,506 | 2 | second version being released mid-probe, still pure pairs |
+| 65,536 | 65,536 (9,347 / 56,189) | 65,536 | 0 | 0 | 1 | after the load: one version, every tile distinct |
+
+So the lever named at the end of 0c is real: 65,536 of the 131,072 tiles held
+during a load are byte-for-byte copies of the other version, and outside the
+load window nothing is duplicated (later probes during play: 0-2 pairs).
+
+**Built: `terrain_dedup=1`** (`src/pager_impl.inl`, `Evict`). An eviction
+hashes the tile before encoding (the codec's own 64-bit hash plus a second,
+independent one) and looks the pair up in an index of stored blobs. A hit
+shares the existing blob through the Clone mechanism (one immutable blob,
+reference counted, dropped by the first write) and skips the encode; a miss
+encodes and registers the new blob. The index is open addressing over blob
+pointers with tombstones, rebuilt from the slot table when half full. The
+blob leaves the index with its last owner. Both pager tests pass, including
+eight writers allocating twins against a forced evictor.
+
+What it saves: the second twin of every pair costs a hash (~60 us) instead of
+an encode, and its compressed bytes are kept once. In the run above the pager
+encoded 59,696 tiles while both versions existed; with the index, every twin
+whose partner was already cold is a hit. What it does NOT save: resident
+backing. A twin is evicted when the budget says so, exactly as before; the
+8.25 GiB of the second version stays resident on a machine whose loading
+allowance keeps it. Freeing it early would mean evicting twins regardless of
+budget, which needs a hash per candidate and re-decodes if the engine reads
+the released version; not built.
+
+**Measured in the game (September 17, `LONGMAPSAVE`, 103,680 tiles per
+version, 207,360 live during the load, 94 GiB machine with the commit charge at
+its limit for most of the load):**
+
+| point | evictions | real encodes | reused (blob kept) | dedup hits |
+|---|---|---|---|---|
+| mid-load, 207,360 live, dedup ON | 165,646 | 13,732 | 0 | 151,928 |
+| same map, same point, dedup OFF (16:38 run) | 135,637 | 135,637 | 0 | - |
+| load complete, 103,680 live, dedup ON | 498,951 | 104,780 | 130,993 | 263,192 |
+
+Over the whole load only 21% of evictions encoded anything; 53% shared a blob
+that already existed. Early in the load most hits are the still-unfilled
+zero tiles the loading policy evicts (one blob for all of them); later they are
+the second twins. `failures=0`, `dedup_rebuilds=0`. Load time was not timed on
+this run (the load ran with `commit_tight=1` flapping the resident target
+between 256 MiB and 8 GiB every second, which dominates it; that back-off is
+older than this change). Compressed bytes at the end: 1,093 MiB for 45,402 cold
+tiles.
+
 ## 1. What the engine actually does (DERIVED from the machine code)
 
 The height cache of one tile is a `std::vector<uint16_t>` (66,049 samples,

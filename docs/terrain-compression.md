@@ -7,6 +7,52 @@ both rail segments intact. Extended gameplay remains untested.
 This is separate from the discontinued 2 m experiment. Source heightmaps,
 derived 257x257 samples, physical tile dimensions and octree depth are unchanged.
 
+For the native branch in this repository, see [PORT.md](linux/PORT.md#windows-integration-b755f65-partial).
+Compression now defaults on, but the pager still uses its fixed 1024 MiB budget
+and round-robin scan with a two-second grace period. The upstream server
+measurements below are not tests of this branch. The new 30-second log reports
+faults/s (including initial zero-page faults) and evictions/s; adaptive sizing
+and recency eviction remain outstanding.
+
+## Native Linux: ON by default for everyone (the owner's call, 2026-09-22)
+
+The Linux port (`bigmap/linux/`, the userfaultfd pager) shipped
+`terrain_cache_compress=0` as an opt-in, because `UFFD_USER_MODE_ONLY` cannot
+serve a kernel-origin fault on an evicted tile. Without it the native game holds
+every tile raw: the dedicated server (31 GB) was OOM-killed at 29.3 GB loading a
+~52,000-tile map that Windows holds at 8-10 GB. The owner: "turn it on for
+everyone".
+
+- `bigmap/linux/tpf2_bigmap.cfg`: `terrain_cache_compress=1`, and the code's
+  built-in default for a missing key is 1 too.
+- It stays a cfg switch (`terrain_cache_compress=0` turns it off) and still falls
+  back to stock paths when userfaultfd setup fails.
+- The Linux docs (`bigmap/docs/linux/PORT.md`, `INSTALL.md`) say it is on by
+  default, name the kernel-fault risk and how to turn it off if a graphics driver
+  or mod trips it (SIGBUS in the log).
+- Released within 0.7: no version change. Compression changes no simulation
+  result, so peers with and without it stay in sync.
+
+### The Linux pager thrashes a running big map (measured 2026-09-22)
+
+On the dedicated server with the ~52,000-tile map and the automatic budget (about
+1 GiB hot; 1.9 GiB resident), the running game faulted **~790 tiles a second**
+(23,700 faults in 30 s) and evicted as many again, and the engine stretched its
+200 ms batch to 400 ms: the session ran at half speed, 30+ units behind a joiner.
+The Linux policy evicts round-robin ("not an LRU cache: ordinary reads of
+resident pages do not refresh their age", `bigmap/docs/linux/PORT.md`), so it keeps
+evicting the tiles the simulation touches every step. FOR THE LINUX PORT:
+
+- Evict by recency, like the Windows pager: a tile faulted in (or written) is
+  young; the scan skips young tiles and takes the oldest cold ones. Without a
+  cheap access bit (userfaultfd sees only faults), age = time since its last
+  fault-in; a tile that faulted twice within a few seconds is hot and stays.
+- The automatic hot budget (RAM / 30) is far too small for a running big map;
+  size it from the machine and the live tile count like Windows'
+  `AutoTerrainBudgets` headroom, and count faults per second in the 30 s status
+  line so thrashing is visible.
+- Stopgap on the server: `terrain_cache_hot_mb=6144` in its cfg.
+
 ## Format 3 and pager capacity (September 15, built and tested offline, NOT deployed)
 
 Three changes, all in `src/terrain_codec.h` and `src/terrain_pager.h`:
@@ -293,3 +339,31 @@ RAM minus 12 GiB and never below the configured warm allowance
 (`TerrainBudgetMB`, both pagers). Compression then happens after loading on the
 below-normal eviction threads. Tested offline (`test_terrain_compression.py`
 budget cases); load time with this policy not yet measured.
+
+## 2026-09-17: headroom sized to the machine (0.5.1)
+
+A 32 GiB machine ran a loaded 207,360-tile save at 19.4 GB in the game with
+awful performance. Cause: the flat 12 GiB reserve above (MEASURED on this
+94 GiB, no-page-file box) is more than a 32 GiB machine has free once the
+save is in, so `TerrainBudgetSteady`'s ceiling fell to the hot budget
+(1 GiB), the pager evicted everything else, and the engine faulted the
+evicted tiles back in through a decode each; the flat 10 GiB commit-tight
+threshold also held on a machine with a system-managed page file, which
+throttled the pagers on top.
+
+Changes (`terrain_compression.h`, both pagers):
+
+- `PagerHeadroom(physical)` = RAM/7 clamped to 2..12 GiB replaces the flat
+  12 GiB in the loading reserve and the steady ceiling; `CommitTightBytes` =
+  RAM/8 clamped to 2..10 GiB replaces the flat 10 GiB.
+- The steady ceiling budgets from *room* = free RAM plus the pager's own
+  target (what it could own), reserving a quarter of the room or the
+  headroom, and hands the terrain pager 3/4 of the rest, the material pager
+  1/2. Counting free RAM alone let a full pager starve itself.
+- Pressure: free RAM under the headroom shrinks the target by 1/8 per second
+  and sets the urgent eviction flag, regardless of the decode feedback.
+
+Offline (`test_terrain_compression.py`): a 32 GiB machine after a load with
+12 GiB held and 4 GiB free settles at 9,652 MiB instead of 1,092. Not yet
+measured on a 32 GiB machine; the `resident target` log lines carry
+`pressure=` and `free=` for that.

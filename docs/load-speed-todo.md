@@ -49,11 +49,12 @@ the title menu (frame loop or overlay busy-wait; not load-specific).
   hook does fire (gameplay) every single share was written, 710/710, making it
   pure overhead. Peak was 38.96 GB against 39.02 GB with it off.
   See `docs/terrain-cow-sharing.md` section 0c.
-- [ ] **Content dedup of identical tiles** (replaces the item above). Both
-  CTerrain versions allocate 65,536 tiles each from the same save data, so they
-  are probably byte-identical. `terrain_codec.h` already computes a 64-bit
-  content hash. Cheap test first: hash both versions' tiles during one load and
-  count collisions; build dedup only if that is near 65,536.
+- [x] **Content dedup of identical tiles** (replaces the item above). MEASURED
+  September 17 with `terrain_dedup_probe`: at 131,072 live tiles, 64,922 exact
+  pairs and 719 still-unfilled zero tiles; after the load, 65,536 distinct.
+  Built as `terrain_dedup` (evictions share an identical stored blob instead of
+  encoding); see `docs/terrain-cow-sharing.md` section 0d. In-game hit count and
+  load time not yet measured.
 - [x] **`0x30a55c` identified**: the middle pdata chunk of the uint16 height
   block copy `0x30a540` (row-by-row, one word per iteration, 132 KB per tile
   copy). Replaced with a per-row memcpy in `terrain_minmax_fast`.

@@ -124,12 +124,18 @@ static void BuildTerrainMinMaxPatch(uint8_t* p, uintptr_t scan) {
 // 316590, 32ea60.
 using TerrainBlockCopyFn = void (__fastcall*)(const uint16_t*, uint16_t*, int, int, int, int, int, int, int, int);
 static TerrainBlockCopyFn g_originalTerrainBlockCopy = nullptr;
+// Set by terrain_serve.h: true when `dst` lies in a tile whose content came
+// from the terrain sidecar, so the load's publication into it is skipped
+// (the sidecar IS the published result). Null when the sidecar is off.
+static bool (*g_terrainServedCheck)(const void* dst) = nullptr;
+static volatile LONG64 g_terrainServedCopiesSkipped = 0;
 
 static void __fastcall TerrainBlockCopyDetour(const uint16_t* src, uint16_t* dst, int srcStride,
     int dstStride, int srcX, int srcY, int w, int h, int dstX, int dstY)
 {
     // Stock touches no memory for h <= 0 (skips) or w <= 0 (empty rows).
     if (h <= 0 || w <= 0) return;
+    if (g_terrainServedCheck && g_terrainServedCheck(dst)) { InterlockedIncrement64(&g_terrainServedCopiesSkipped); return; }
     // Bounds that keep every offset below exact in int64 (|offset| < 2^53).
     if (h > (1 << 20) || w > (1 << 20)) {
         g_originalTerrainBlockCopy(src, dst, srcStride, dstStride, srcX, srcY, w, h, dstX, dstY);

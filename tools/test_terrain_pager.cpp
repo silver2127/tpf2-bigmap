@@ -1,4 +1,4 @@
-// Real Windows memory mappings and real concurrent access violations, isolated
+﻿// Real Windows memory mappings and real concurrent access violations, isolated
 // from the game. Optional argv[1]: offline 257x257 uint16 terrain sample file.
 #include "../src/terrain_pager.h"
 #include <cstdio>
@@ -288,6 +288,201 @@ int main(int argc,char** argv) {
         printf("cow sharing: shares=%u privatized=%llu failures=%llu\n",
                shares.load(),sc.privatizations,sc.failures);
     }
+    // Content probe: identical tiles are counted whether resident or cold, the
+    // all-zero (never written) group is reported on its own, and a slot that is
+    // mid-encode is skipped rather than touched.
+    {
+        auto base=Snapshot();
+        std::vector<uint16_t> patA(Samples),patB(Samples);
+        for(size_t k=0;k<Samples;++k){patA[k]=uint16_t(k*3+11);patB[k]=uint16_t(k/7+900);}
+        auto a1=Allocate(),a2=Allocate(),a3=Allocate(),b1=Allocate(),b2=Allocate(),z1=Allocate(),z2=Allocate(),u=Allocate();
+        assert(a1&&a2&&a3&&b1&&b2&&z1&&z2&&u);
+        memcpy(a1,patA.data(),Bytes);memcpy(a2,patA.data(),Bytes);memcpy(a3,patA.data(),Bytes);
+        memcpy(b1,patB.data(),Bytes);memcpy(b2,patB.data(),Bytes);
+        for(size_t k=0;k<Samples;++k)u[k]=uint16_t(rng());
+        assert(Evict(Index(a2),true));assert(Evict(Index(b2),true));   // cold: the blob's hash
+        assert(b1[0]==patB[0]);                                          // restored read-only: still the blob's hash
+        assert(Evict(Index(b1),true));assert(b1[1]==patB[1]);
+        ProbeResult r{};assert(Probe(&r));
+        assert(r.live==base.live+8 && r.skipped==0);
+        assert(r.hashedPacked==2+1 && r.hashedResident==5);
+        assert(r.distinct==4 && r.duplicated==4 && r.zero==2 && r.pairs==2 && r.largestGroup==3);
+        // A slot whose encode is in flight is skipped, not read.
+        {Guard g;slots[Index(u)].evicting=true;}
+        assert(Probe(&r) && r.skipped==1 && r.hashedResident==4 && r.distinct==3);
+        {Guard g;slots[Index(u)].evicting=false;}
+        for(auto t:{a1,a2,a3,b1,b2,z1,z2,u})assert(Release(t));
+        printf("content probe: distinct=%llu duplicated=%llu zero=%llu ms=%llu\n",r.distinct,r.duplicated,r.zero,r.ms);
+    }
+    // Content dedup: the second eviction of identical bytes shares the first
+    // blob (no encode, no extra compressed bytes); a write to one twin gives it
+    // private bytes and leaves the other on the blob; the blob leaves the index
+    // with its last owner, so the same bytes encode afresh afterwards.
+    {
+        assert(EnableDedup());
+        std::vector<uint16_t> pat(Samples);
+        for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k*5+7);
+        auto base=Snapshot();
+        auto a=Allocate(),b=Allocate();assert(a&&b);
+        memcpy(a,pat.data(),Bytes);memcpy(b,pat.data(),Bytes);
+        assert(Evict(Index(a),true));
+        auto s1=Snapshot();assert(s1.encodes==base.encodes+1 && s1.dedupHits==base.dedupHits);
+        assert(Evict(Index(b),true));
+        auto s2=Snapshot();
+        assert(s2.encodes==s1.encodes && s2.dedupHits==base.dedupHits+1);
+        assert(s2.compressedBytes==s1.compressedBytes && s2.resident==s1.resident-1);
+        {Guard g;assert(slots[Index(a)].packed==slots[Index(b)].packed && slots[Index(a)].packed->refs==2);}
+        assert(memcmp(a,pat.data(),Bytes)==0 && memcmp(b,pat.data(),Bytes)==0);   // reads restore, still shared
+        b[3]=0x5555;                                                              // a write privatizes b
+        {Guard g;assert(!slots[Index(b)].packed && slots[Index(a)].packed && slots[Index(a)].packed->refs==1);}
+        assert(a[3]==pat[3]);
+        // a is resident, read-only and packed: its re-eviction reuses the blob.
+        assert(Evict(Index(a),true));assert(Snapshot().reusedEvictions==s2.reusedEvictions+1);
+        // b's bytes now differ: a fresh encode.
+        assert(Evict(Index(b),true));assert(Snapshot().dedupHits==s2.dedupHits && Snapshot().encodes==s2.encodes+1);
+        // A third tile with a's bytes hits a's blob.
+        auto c=Allocate();assert(c);memcpy(c,pat.data(),Bytes);
+        assert(Evict(Index(c),true));assert(Snapshot().dedupHits==s2.dedupHits+1);
+        assert(memcmp(c,pat.data(),Bytes)==0);
+        assert(Release(a));assert(Release(b));assert(Release(c));
+        // The blob went with its last owner: the same bytes encode again.
+        auto d=Allocate();assert(d);memcpy(d,pat.data(),Bytes);
+        auto s3=Snapshot();assert(Evict(Index(d),true));
+        assert(Snapshot().dedupHits==s3.dedupHits && Snapshot().encodes==s3.encodes+1);
+        assert(memcmp(d,pat.data(),Bytes)==0);assert(Release(d));
+        // A rebuild indexes every stored blob exactly once, shared ones included.
+        auto e=Allocate(),f=Allocate();assert(e&&f);memcpy(e,pat.data(),Bytes);memcpy(f,pat.data(),Bytes);
+        assert(Evict(Index(e),true) && Evict(Index(f),true));
+        {Guard g;size_t used=dedupUsed;assert(used==1);DedupRebuild();assert(dedupUsed==used && dedupTombstones==0);}
+        assert(memcmp(e,pat.data(),Bytes)==0 && memcmp(f,pat.data(),Bytes)==0);
+        assert(Release(e));assert(Release(f));
+        // Eight writers allocating twins, evicting, reading, writing and
+        // releasing, against a forced evictor: every read sees its own bytes.
+        std::atomic<bool> go{false},stop{false};std::atomic<unsigned> bad{0};
+        std::thread ev([&]{while(!go)SwitchToThread();
+            while(!stop){unsigned n;{Guard gg;n=allocated;}for(unsigned i=0;i<n;++i)Evict(i,true);}});
+        std::vector<std::thread> ws;
+        for(unsigned n=0;n<8;++n)ws.emplace_back([&,n]{
+            while(!go)SwitchToThread();
+            for(unsigned k=0;k<300;++k) {
+                auto t=Allocate();if(!t)continue;
+                memcpy(t,pat.data(),Bytes);
+                Evict(Index(t),true);
+                if(memcmp(t,pat.data(),Bytes)!=0)++bad;
+                t[n]=uint16_t(k);if(t[n]!=uint16_t(k))++bad;
+                if(k&1){Evict(Index(t),true);if(t[n]!=uint16_t(k))++bad;}
+                Release(t);
+            }
+        });
+        go=true;for(auto& w:ws)w.join();stop=true;ev.join();
+        assert(bad==0);
+        auto sd=Snapshot();assert(sd.live==0 && sd.compressedBytes==0 && sd.failures==base.failures);
+        printf("content dedup: hits=%llu encodes=%llu rebuilds=%llu\n",sd.dedupHits-base.dedupHits,sd.encodes-base.encodes,sd.dedupRebuilds);
+    }
+    // No section at the commit limit: a restore waits for one instead of
+    // handing the access violation back to the engine.
+    {
+        auto base=Snapshot();
+        std::vector<uint16_t> pat(Samples);
+        for(size_t k=0;k<Samples;++k)pat[k]=uint16_t(k%1000+20000);
+        auto a=Allocate();assert(a);memcpy(a,pat.data(),Bytes);
+        assert(Evict(Index(a),true));
+        InterlockedExchange(&injectSectionFailures,3);
+        assert(memcmp(a,pat.data(),Bytes)==0);                  // cold read: three refusals, then a section
+        auto s1=Snapshot();
+        assert(s1.restoreRetries==base.restoreRetries+3 && s1.failures==base.failures+3 && s1.restoreGiveUps==base.restoreGiveUps);
+        assert(Evict(Index(a),true));
+        InterlockedExchange(&injectSectionFailures,2);
+        a[7]=0x4242;                                              // cold write, same wait
+        assert(a[7]==0x4242 && a[8]==pat[8]);
+        assert(Snapshot().restoreRetries==s1.restoreRetries+2);
+        assert(injectSectionFailures==0);
+        assert(Release(a));
+        printf("restore retry: retries=%llu giveups=%llu\n",Snapshot().restoreRetries-base.restoreRetries,Snapshot().restoreGiveUps);
+        {Guard g;stats.failures=base.failures;}   // the injected refusals are not pager failures
+    }
+    // Eviction rate limit: outside loading a Tick pass stops at the per-second
+    // allowance, over three times the budget too; only a tight commit charge
+    // (SetUrgent) lifts it.
+    {
+        std::vector<uint16_t*> t(16);
+        for(auto& x:t){x=Allocate();assert(x);}
+        SetBudget(8*SlotBytes);                        // 16 resident, 8 allowed: excess 8, no pressure
+        {Guard g;auto now=GetTickCount64();stats.lastBulkAllocation=0;for(auto x:t)slots[Index(x)].touched=now-6000;rateWindow=0;}
+        SetEvictRate(3);
+        auto b=Snapshot();
+        Tick();                                        // soft-blocks count against the allowance
+        auto s1=Snapshot();assert(s1.softBlocked==3 && s1.rateLimited==b.rateLimited+1);
+        Tick();assert(Snapshot().softBlocked==3);      // same second: nothing more
+        {Guard g;rateWindow=GetTickCount64()-1001;}    // next second
+        Tick();assert(Snapshot().softBlocked==6);
+        SetBudget(4*SlotBytes);                        // 16 > 12: over three times the budget
+        {Guard g;rateWindow=GetTickCount64()-1001;}
+        Tick();assert(Snapshot().resident==13);        // still three per second
+        SetUrgent(true);
+        {Guard g;rateWindow=GetTickCount64()-1001;}
+        // Urgent encodes straight down to three times the budget (12) with no
+        // allowance; the rest is only second-chanced.
+        Tick();assert(Snapshot().resident==12 && Snapshot().softBlocked==8);
+        SetUrgent(false);
+        SetEvictRate(0);
+        for(auto x:t)assert(Release(x));
+        auto se=Snapshot();assert(se.evictOps>b.evictOps && se.evictMicros>b.evictMicros);   // every eviction and soft block is timed
+        printf("evict rate: limited passes=%llu, %llu us per eviction\n",se.rateLimited-b.rateLimited,se.evictMicros/se.evictOps);
+    }
+    // Lazy zero allocations: no section until the first touch; a read gets a
+    // read-only zero section on the shared blob, a write a private one; an
+    // untouched slot releases without ever having had a section.
+    {
+        assert(EnableLazyZero());
+        auto base=Snapshot();
+        auto a=Allocate();assert(a);
+        auto s1=Snapshot();assert(s1.resident==base.resident && s1.live==base.live+1 && s1.lazyAllocations==base.lazyAllocations+1);
+        {Guard g;assert(slots[Index(a)].packed==zeroBlob && !slots[Index(a)].section);}
+        for(size_t k=0;k<Samples;k+=257)assert(a[k]==0);           // read: section appears, still on the blob
+        assert(Snapshot().resident==base.resident+1);
+        {Guard g;assert(slots[Index(a)].packed==zeroBlob && slots[Index(a)].readOnly);}
+        a[5]=1234;assert(a[5]==1234 && a[6]==0);                    // write: private
+        {Guard g;assert(!slots[Index(a)].packed);}
+        assert(Evict(Index(a),true));assert(a[5]==1234);            // ordinary from here
+        assert(Release(a));
+        auto b=Allocate();assert(b);assert(Release(b));            // never touched: no section, no failure
+        auto c=Allocate();assert(c);c[0]=7;assert(c[0]==7 && c[Samples-1]==0);   // write first
+        assert(Snapshot().resident==base.resident+1);assert(Release(c));
+        // An untouched tile evicted... cannot be: not resident. A touched-but-
+        // still-zero tile evicts as a dedup hit on the blob.
+        auto d=Allocate();assert(d);assert(d[0]==0);
+        auto s2=Snapshot();assert(Evict(Index(d),true));
+        assert(Snapshot().reusedEvictions==s2.reusedEvictions+1);   // read-only on the blob: reused, no encode
+        assert(d[1]==0);assert(Release(d));
+        SetLazyZero(false);
+        auto e=Allocate();assert(e);assert(Snapshot().resident==base.resident+1);assert(Release(e));
+        auto sd=Snapshot();assert(sd.live==base.live && sd.resident==base.resident && sd.failures==base.failures);
+        printf("lazy zero: %llu lazy allocations\n",sd.lazyAllocations-base.lazyAllocations);
+    }
+    // Backpressure: with the throttle on and the pool over budget, a fault that
+    // needs a new section waits (bounded), then proceeds; slots that already
+    // have a section do not wait; the throttle off means no wait at all.
+    {
+        assert(EnableLazyZero());
+        auto base=Snapshot();
+        auto a=Allocate();assert(a);
+        SetBudget(0);SetThrottle(true);
+        {Guard g;assert(stats.resident*SlotBytes>budget || stats.resident==0);}
+        // resident may be 0 here (nothing over budget): make one resident slot first
+        auto r=Allocate();assert(r);r[0]=1;   // this one may or may not wait; the next must
+        auto t0=GetTickCount64();a[0]=5;auto dt=GetTickCount64()-t0;
+        assert(a[0]==5 && Snapshot().throttleWaits>=base.throttleWaits+1 && dt>=ThrottleMaxMs-100);
+        volatile auto again=a[1];(void)again;   // already has a section: no wait
+        auto w=Snapshot().throttleWaits;
+        assert(Evict(Index(r),true));            // cold again
+        SetThrottle(false);
+        t0=GetTickCount64();r[1]=2;assert(r[1]==2 && GetTickCount64()-t0<500);   // throttle off: immediate
+        assert(Snapshot().throttleWaits==w);
+        SetBudget(4*SlotBytes);SetLazyZero(false);
+        assert(Release(a));assert(Release(r));
+        printf("throttle: waited %llu ms\n",Snapshot().throttleMillis);
+    }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
     DWORD beforeHandles=0,afterHandles=0;
@@ -297,7 +492,8 @@ int main(int argc,char** argv) {
     for(auto t:many){Evict(Index(t),true);assert(memcmp(t,expected.data(),Bytes)==0);Evict(Index(t),true);}
     for(auto t:many)assert(Release(t));
     GetProcessHandleCount(GetCurrentProcess(),&afterHandles);assert(beforeHandles==afterHandles);
-    auto s=Snapshot();assert(s.live==0&&s.resident==0&&s.compressedBytes==0&&s.compressedCommit==0&&s.failures==0);
+    // The zero blob stays for the pager's lifetime; everything else is gone.
+    auto s=Snapshot();assert(s.live==0&&s.resident==0&&s.compressedBytes==zeroBlob->bytes&&s.compressedCommit==zeroBlob->commit&&s.failures==0);
     printf("PASS: exact roundtrips, write faults, address reuse, incompressible fallback, "
            "%u concurrent writes; faults=%llu evictions=%llu failures=%llu\n",
            Threads*Iterations,s.faults,s.evictions,s.failures);

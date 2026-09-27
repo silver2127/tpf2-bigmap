@@ -4,7 +4,7 @@ For Steam Transport Fever 2 Linux build 35924. This is a native `.so` plugin,
 not a Wine/Proton DLL. The package includes the shared native plugin host;
 multiplayer is not required.
 
-1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.3.tar.gz`.
+1. Close the game and extract `tpf2-bigmap-0.4.0-linux-dev.4.tar.gz`.
 2. In the extracted directory, run `bash install.sh` without sudo.
 3. Use the Steam launch-options line printed by the installer. If multiplayer
    is installed, keep its existing launch options: it loads this plugin too.
@@ -21,7 +21,7 @@ Linux defaults are placed in `.cfg.example`.
 
 Use the plugin when loading worlds that need its expanded octree. Back up
 important saves before testing. Larger maps need substantially more RAM and
-generation time. Optional terrain compression reduces settled RAM use, but does
+generation time. Default-on terrain compression reduces settled RAM use, but does
 not eliminate the peak memory needed while loading or generating a world.
 
 ## Supported scope
@@ -33,13 +33,13 @@ not eliminate the peak memory needed while loading or generating a world.
   The largest square is 510 tiles; the preview distance calculation imposes
   a separate diagonal bound until its Linux overflow fix is ported.
 - Exact SSE2 terrain min/max scan and faster zstd saves, enabled by default.
-- Experimental lossless terrain compression using Linux userfaultfd, opt-in.
+- Experimental lossless terrain compression using Linux userfaultfd, enabled by default.
 - Byte/build guards and a shared host that coexists with native multiplayer.
 
 Depth 12/13 (1024/2048-tile edges), material compression, terrain copy sharing,
 generation buffer reuse and the remaining renderer optimizations are not ported
 in this build. Do not use the Windows configuration: its depth-13
-setting is rejected explicitly. See PORT.md for evidence and validation limits.
+setting falls back to depth 11 and does not support larger-root saves. See PORT.md for evidence and validation limits.
 
 ## Sparse density presets
 
@@ -72,8 +72,7 @@ unchanged; files can be larger. `terrain_minmax_fast=1` uses an exact SSE2 scan
 for terrain height bounds. Both default to on even with an older config.
 Set either to 0 and restart to disable it.
 
-To try terrain RAM compression, add or change these keys under `[tpf2_bigmap]`
-in your installed config and restart:
+Terrain RAM compression defaults to these settings under `[tpf2_bigmap]`:
 
 ```ini
 terrain_cache_compress=1
@@ -86,18 +85,36 @@ The plugin reserves a large virtual address range; use resident memory (RSS),
 not virtual size (VIRT), when comparing RAM use. Compressed data and other game
 allocations still need RAM. More cache space can reduce decompression activity.
 
-Compression is **off by default**. It requires a Linux kernel that permits
+Compression is **on by default**, including when the key is missing. Existing
+configs with an explicit `terrain_cache_compress=0` remain off after upgrade. It requires a Linux kernel that permits
 user-mode userfaultfd with missing-page and write-protection support. Unsupported
 systems log `terrain compression unavailable` and continue without compression;
 no root permissions or kernel setting changes are required by the installer.
 The backend handles userspace faults only: a kernel operation directly accessing
 an evicted terrain page is outside its supported path. The tested game paths are
 loading, rendering, simulation, track construction and save/reload; other mods,
-GPU drivers and long sessions need further testing. See PORT.md for details.
+GPU drivers and long sessions need further testing. A kernel-origin fault can
+cause SIGBUS: set `terrain_cache_compress=0` and restart if this occurs. See
+PORT.md for details.
 
 One 128x128-tile save settled at 4.98 GiB RSS versus 7.78 GiB with dev.2, using a
 1 GiB terrain budget. Loading peaks were about 9.8 GiB in both runs. This is a
 single-machine comparison, not a guaranteed saving or a frame-rate benchmark.
+
+## Incremental memory changes and travel controls (dev.4)
+
+Inside the terrain pager, `terrain_lazy_zero=1` delays terrain pages until
+first access and `terrain_dedup=1` shares identical compressed content. Set either
+to 0 to opt out. `terrain_dedup_probe=1` logs a hash-group census every 120 seconds;
+it defaults off and can briefly block writers while hashing resident tiles.
+The pager still uses a fixed hot budget. Windows adaptive budgets, pressure
+backpressure, alignment batching and small/material paging are not available.
+
+`travel_time_limit_s` and `cargo_path_time_s` default to 0 (stock 1200 and 6000
+seconds). Positive values clamp to 60..86400 game seconds. Restart after changing
+them. Both are byte-verified native data patches. Dev.4 passes offline tests;
+its lab launch failed before reaching the game, so the older gameplay and memory
+measurements above do not validate these additions. See PORT.md for evidence.
 
 ## Remove
 

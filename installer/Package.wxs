@@ -67,6 +67,19 @@
          lets them cross into the elevated half of a UAC-prompted install. -->
     <Property Id="TPF2_SKIP_GAMEDIR_CHECK" Secure="yes" />
 
+    <!-- Tells tpf2ca.dll's game-folder check that the GOG build of the game is
+         a supported target. The check knows the Steam 35924 executable values
+         and, with this set, the GOG 2024-12-12 ones as well; without it a GOG
+         folder is refused with GOG_MSG and TPF2_GAMEDIR_OK=0, after which the
+         wizard's Next button does nothing whatever the user does. The GOG
+         package sets it up front; a standard install can still opt in from the
+         command line with TPF2_ALLOW_GOG=1. -->
+    <?ifdef GogVariant ?>
+    <Property Id="TPF2_ALLOW_GOG" Value="1" Secure="yes" />
+    <?else?>
+    <Property Id="TPF2_ALLOW_GOG" Secure="yes" />
+    <?endif?>
+
     <!-- Default install folder. AppSearch rows for one property run in
          Signature order, last hit wins, hence the 1/2 prefixes: a folder
          remembered from an earlier install beats Steam's registration. -->
@@ -159,7 +172,9 @@
        only moves on when TPF2_GAMEDIR_OK is not "0". The stock set cannot be
        extended in place: its Next-button events carry no condition, so a
        DoAction added beside them could never stop the wizard. Identical to
-       the TpF2 Multiplayer copy. -->
+       the TpF2 Multiplayer copy. The check itself is what differs between the
+       two builds of this package: the GOG variant sets TPF2_ALLOW_GOG so
+       tpf2ca.dll accepts the GOG executable as well as Steam's. -->
   <Fragment>
     <UI Id="WixUI_InstallDir_Tpf2">
       <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
