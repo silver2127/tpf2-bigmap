@@ -161,5 +161,15 @@ The offline mock cannot settle these. Each is logged or visible:
     names any type still generic.
 11. **Roadside stops** should appear as small bars on their streets.
 
+**The M key** (`minimap_key=1`, on by default) toggles the minimap like its button.
+It replaces the game's own M (`constructOpt1`, the construction option key): the
+plugin takes the press and its release out of the game's SDL events through the
+exe's `SDL_PollEvent` import. It leaves M alone while a text field is taking keys
+(the focused component or a parent is a `CTextInputField` in editing mode, from
+`UI::g_core` `0x4466d00`: the game's own rule, key listener `0x2303470`) and with
+Shift, Ctrl, Alt or the Windows key held. The press reaches the script as a
+counter in `<game>\plugins	pf2_bigmap_minimap_key.txt`. Every offset is
+byte-verified; a mismatch costs only the key.
+
 Known limits in this version: a climate whose `mapColoring` uses the `texture` form
 (no shipped climate does) keeps the default height ramp; industry markers capped at 4,000; a network gathered by Lua (see point 8).
