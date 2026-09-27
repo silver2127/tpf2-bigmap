@@ -168,7 +168,7 @@ exe's `SDL_PollEvent` import. It leaves M alone while a text field is taking key
 (the focused component or a parent is a `CTextInputField` in editing mode, from
 `UI::g_core` `0x4466d00`: the game's own rule, key listener `0x2303470`) and with
 Shift, Ctrl, Alt or the Windows key held. The press reaches the script as a
-counter in `<game>\plugins	pf2_bigmap_minimap_key.txt`. Every offset is
+counter in `<game>\plugins\tpf2_bigmap_minimap_key.txt`. Every offset is
 byte-verified; a mismatch costs only the key.
 
 Known limits in this version: a climate whose `mapColoring` uses the `texture` form
