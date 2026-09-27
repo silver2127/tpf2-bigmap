@@ -526,3 +526,13 @@ ownership contract are unchanged. No new address or layout is introduced.
 See [integration and tests](../../../docs/linux/UPSTREAM_dev_5d73f324.md).
 These symbolic scheduling results are not native generation timings or
 measured memory savings; no new live validation is claimed.
+
+### Generator-copy times (Windows dev 568e7ea7)
+
+Native anonymous generator streams now retain the original's access and
+modification times, including nanoseconds, via fstat/futimens. Path metadata
+queries remain untouched; time-copy failure serves the original. This ports
+the Windows preview-regeneration fix without a named cache file or Windows
+creation-time API. Native timestamp regression tests pass; the lab launch
+failed before game startup, so preview stability is not yet observed locally.
+See [the RE record](../../../docs/re/linux/DEV_568E7EA7.md).
