@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "generator_memory_lua.inc"
 #include "../src/generator_memory_text.h"
 
@@ -58,6 +60,8 @@ inline FILE* Copy(const char* path) {
     std::unique_ptr<FILE,decltype(&std::fclose)> source(std::fopen(path,"rb"),std::fclose);
     FILE* src=source.get();
     if(!src)return nullptr;
+    struct stat original{};
+    if(::fstat(::fileno(src),&original))return nullptr;
     std::string text; char buf[8192]; size_t n;
     while((n=std::fread(buf,1,sizeof buf,src))) {
         // Refuse unexpectedly large/non-generator input, keeping fallback bounded.
@@ -70,7 +74,11 @@ inline FILE* Copy(const char* path) {
     if(!patched)return nullptr;
     // Anonymous, per-open stream: no shared cache name, symlink or stale-copy race.
     FILE* out=std::tmpfile();
-    if(out && (std::fwrite(patched,1,len,out)!=len || std::fflush(out) || std::fseek(out,0,SEEK_SET))) {
+    // Match path and descriptor modification-time queries, including nanoseconds.
+    // POSIX has no settable creation time; ctime is not a file write timestamp.
+    const timespec times[]={original.st_atim,original.st_mtim};
+    if(out && (std::fwrite(patched,1,len,out)!=len || std::fflush(out) ||
+               ::futimens(::fileno(out),times) || std::fseek(out,0,SEEK_SET))) {
         std::fclose(out);out=nullptr;
     }
     std::free(patched);return out;

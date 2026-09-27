@@ -6,6 +6,7 @@
 #include <vector>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 using namespace linux_generator;
 static std::string Read(FILE* f){assert(f);std::string s;char b[4096];size_t n;while((n=fread(b,1,sizeof b,f)))s.append(b,n);fclose(f);return s;}
 static int enabled=1,verify=1,writes=0,patchOk=1;
@@ -45,16 +46,29 @@ int main(){
     auto dir=std::filesystem::path(root)/"res/config/terrain_generators";std::filesystem::create_directories(dir);
     auto path=dir/"fantasia_map_generator.gen.lua";const std::string src="function data()\n\t\treturn result\nend\n";
     {std::ofstream f(path);f<<src;}
+    // An old, sub-second mtime exposes a fresh tmpfile on every open.
+    const timespec times[]={{1234567890,123456789},{1234567891,987654321}};
+    assert(!utimensat(AT_FDCWD,path.c_str(),times,0));
+    auto checkTimes=[&](FILE* f) {
+        assert(f);struct stat original{},served{};
+        assert(!stat(path.c_str(),&original) && !fstat(fileno(f),&served));
+        assert(served.st_mtim.tv_sec==original.st_mtim.tv_sec);
+        assert(served.st_mtim.tv_nsec==original.st_mtim.tv_nsec);
+        assert(served.st_atim.tv_sec==times[0].tv_sec);
+        assert(served.st_atim.tv_nsec==times[0].tv_nsec);
+        return f;
+    };
     void* code=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(code!=MAP_FAILED);
     memcpy(code,installed,sizeof installed);assert(!mprotect(code,4096,PROT_READ|PROT_EXEC));
     auto routed=reinterpret_cast<FILE*(*)(const char*,const char*)>(code);
-    assert(Read(routed(path.c_str(),"rb")).find("_tpf2_bigmap_memory.Optimize")!=std::string::npos);
+    assert(Read(checkTimes(routed(path.c_str(),"rb"))).find("_tpf2_bigmap_memory.Optimize")!=std::string::npos);
     assert(!munmap(code,4096));
     assert(Index("/mods/f/res/config/terrain_generators/fantasia_map_generator_dry.gen.lua")==1);
     assert(Index("/mods/f/res/config/terrain_generators/fantasia_map_generator_tropical.gen.lua")==2);
     assert(Index(path.c_str())==0);assert(Index("/res/scripts/fantasia_map_generator.gen.lua")==-1);
     assert(Index("/res/config/terrain_generators/xfantasia_map_generator.gen.lua")==-1);
-    const auto patched=Read(Open(path.c_str(),"rb"));assert(patched.find("_tpf2_bigmap_memory.Optimize")!=std::string::npos);
+    assert(!utimensat(AT_FDCWD,path.c_str(),times,0));
+    const auto patched=Read(checkTimes(Open(path.c_str(),"rb")));assert(patched.find("_tpf2_bigmap_memory.Optimize")!=std::string::npos);
     assert(patched.find("_tpf2_bigmap_budget = 0\n")!=std::string::npos);
     assert(Read(std::fopen(path.c_str(),"rb"))==src);
     // Concurrent lifetimes: opening another stream cannot replace the first stream.
