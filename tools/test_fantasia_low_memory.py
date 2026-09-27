@@ -1,10 +1,11 @@
-"""Check the Fantasia Map Generator (low memory) variants against the original.
+"""Check the Fantasia Map Generator stand-ins against the original.
 
 Requires lupa.lua52 and the Fantasia workshop mod (2916150031), which is only
-read. The mod is installed into a temporary mods folder; each variant is loaded
+read. The mod is installed into a temporary mods folder; each stand-in is loaded
 the way the game loads it (its own gen file, package.path over the mod folders
 and the game's res/scripts), and its pipeline is compared with the original
-generator's under the symbolic replay of test_generation_memory.verify.
+generator's: untouched up to 32 x 32 km, and above that under the symbolic
+replay of test_generation_memory.verify.
 """
 from pathlib import Path
 import tempfile
@@ -13,9 +14,9 @@ import test_generation_memory as t
 from install_fantasia_low_memory import install, FOLDER
 
 FANTASIA = Path(r'C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\2916150031\res')
-VARIANTS = (('bigmap_fantasia_low_memory.gen.lua', 'fantasia_map_generator.gen.lua', 'temperate.clima.lua'),
-            ('bigmap_fantasia_low_memory_dry.gen.lua', 'fantasia_map_generator_dry.gen.lua', 'dry.clima.lua'),
-            ('bigmap_fantasia_low_memory_tropical.gen.lua', 'fantasia_map_generator_tropical.gen.lua', 'tropical.clima.lua'))
+GENERATORS = (('fantasia_map_generator.gen.lua', 'temperate.clima.lua'),
+              ('fantasia_map_generator_dry.gen.lua', 'dry.clima.lua'),
+              ('fantasia_map_generator_tropical.gen.lua', 'tropical.clima.lua'))
 
 
 def runtime(script_dirs, lines):
@@ -42,6 +43,14 @@ def generate(L, info, water, seed, km):
     return info.updateFn(p)
 
 
+def pair(mod, file, lines):
+    L = runtime((mod / 'res/scripts', FANTASIA / 'scripts', t.RES / 'scripts'), lines)
+    standin = generator(L, mod / 'res/config/terrain_generators' / file)
+    R = runtime((FANTASIA / 'scripts', t.RES / 'scripts'), [])
+    stock = generator(R, FANTASIA / 'config/terrain_generators' / file)
+    return L, standin, R, stock
+
+
 def main():
     if not FANTASIA.is_dir():
         print(f'SKIP: Fantasia Map Generator not found at {FANTASIA}')
@@ -50,26 +59,34 @@ def main():
         mods = Path(td)
         assert install(mods) > 0 and install(mods) == 0
         mod = mods / FOLDER
-        for variant, original, climate in VARIANTS:
+        armed = '[tpf2_bigmap] {}: buffer reuse armed for maps over 1024 km2'
+        for file, climate in GENERATORS:
             lines = []
-            L = runtime((mod / 'res/scripts', FANTASIA / 'scripts', t.RES / 'scripts'), lines)
-            wrapped = generator(L, mod / 'res/config/terrain_generators' / variant)
-            R = runtime((FANTASIA / 'scripts', t.RES / 'scripts'), [])
-            stock = generator(R, FANTASIA / 'config/terrain_generators' / original)
-            assert wrapped.name == stock.name + ' (low memory)', wrapped.name
-            assert wrapped.climate == stock.climate == climate
-            assert t.native(wrapped.params) == t.native(stock.params)
-            before = t.native(generate(R, stock, 2, 35924, 32))
-            after = t.native(generate(L, wrapped, 2, 35924, 32))
+            L, standin, R, stock = pair(mod, file, lines)
+            assert standin.name == stock.name and standin.climate == stock.climate == climate
+            assert standin.order == stock.order
+            assert t.native(standin.params) == t.native(stock.params)
+            assert lines == [armed.format(file)], lines
+            before = t.native(generate(R, stock, 2, 35924, 40))
+            after = t.native(generate(L, standin, 2, 35924, 40))
             a, b = t.verify(before, after)
-            assert lines == [f'[tpf2_bigmap] terrain memory: {a} -> {b} named buffers'], lines
+            assert lines[1:] == [f'[tpf2_bigmap] terrain memory: {a} -> {b} named buffers'], lines
             assert b <= 12, b
-            print(f'{original:<42} {len(t.indices(before["layers"])):>6} layers  {a} -> {b} named buffers')
+            print(f'{file:<42} 40 km  {len(t.indices(before["layers"])):>6} layers  {a} -> {b} named buffers')
 
-        # Fantasia not active: the variant is listed, but refuses to generate.
+        # 32 x 32 km and below: Fantasia's pipeline, untouched.
+        file = GENERATORS[0][0]
+        lines = []
+        L, standin, R, stock = pair(mod, file, lines)
+        before = t.native(generate(R, stock, 2, 35924, 32))
+        after = t.native(generate(L, standin, 2, 35924, 32))
+        assert before == after and lines == [armed.format(file)], lines
+        print(f'{file:<42} 32 km  unchanged ({len(t.indices(before["layers"]))} layers)')
+
+        # Fantasia not active: the stand-in is listed, but refuses to generate.
         lines = []
         L = runtime((mod / 'res/scripts', t.RES / 'scripts'), lines)
-        missing = generator(L, mod / 'res/config/terrain_generators' / VARIANTS[0][0])
+        missing = generator(L, mod / 'res/config/terrain_generators' / file)
         assert 'not active' in missing.name and missing.climate == 'temperate.clima.lua', missing.name
         assert lines and 'cannot run' in lines[0], lines
         try:
@@ -77,7 +94,7 @@ def main():
         except Exception as e:
             assert 'cannot run' in str(e), e
         else:
-            raise AssertionError('variant without Fantasia generated a map')
+            raise AssertionError('stand-in without Fantasia generated a map')
 
         other = mods / 'someone_else_1'
         other.mkdir()
@@ -93,7 +110,8 @@ def main():
         (mods / FOLDER).rename(other)
         (mods / 'moved').rename(mods / FOLDER)
         assert install(mods, remove=True) == 1 and not (mods / FOLDER).exists()
-    print('PASS: Fantasia low-memory variants (temperate, dry, tropical at 32 km), missing-Fantasia refusal, install/remove')
+    print('PASS: Fantasia stand-ins (temperate, dry, tropical): reuse at 40 km, untouched at 32 km, '
+          'missing-Fantasia refusal, install/remove')
 
 
 if __name__ == '__main__':

@@ -62,16 +62,22 @@ where it died with `std::bad_alloc` on a machine with no page file.
 `python tools/install_fantasia_low_memory.py` installs
 `mod/generation/fantasia_low_memory` as the local mod
 `mods/tpf2_bigmap_fantasia_low_memory_1`, with a copy of `bigmap_memory.lua`.
-Enable it next to Fantasia and choose a "(low memory)" generator. Each variant
+Enable it together with Fantasia, below Fantasia in the mod list. Its three gen files have
+Fantasia's own file names, so the game uses them in place of Fantasia's. Each
 finds Fantasia's `res/` folder through `package.searchpath` on its
 `terrain/fmg_mapgenutil` module, runs Fantasia's own gen file in a private
-environment, and passes the result through the same pass. Fantasia's files are
-never copied or edited. Without Fantasia active, the variant is still listed
-but refuses to generate. `--remove` uninstalls it.
+environment, and passes the result through the same pass when the map is
+larger than 32 x 32 km (area over 32768^2 m^2). Smaller maps get Fantasia's
+pipeline untouched. Fantasia's files are never copied or edited. Loading
+prints `[tpf2_bigmap] fantasia_map_generator*.gen.lua: buffer reuse armed`;
+if that line is missing, Fantasia's copy won the load order. Without Fantasia
+active, the generator is still listed but refuses to generate. `--remove`
+uninstalls it.
 
-All three Fantasia climates go from 224-227 names to 10, which is the lower
-bound. `tools/test_fantasia_low_memory.py` checks name, climate, params and the
-symbolic replay against the original at 32 km. Sharing names serialises
+All three Fantasia climates go from 224-227 names to 10 at 32 km and from
+325-328 names to 10 at 40 km, which is the lower bound.
+`tools/test_fantasia_low_memory.py` checks name, climate, params, the untouched
+32 km pipeline and the symbolic replay at 40 km. Sharing names serialises
 layers, so generation may take longer.
 
 ## Checks and remaining validation
