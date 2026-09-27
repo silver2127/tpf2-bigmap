@@ -1438,12 +1438,17 @@ local function install()
     if not layout then
         return false
     end
+    -- sized like the game's disk buttons: a 60 px disk (the plugin's style sheet,
+    -- mod/minimap/bigmap_minimap_style.lua, class bigmapToolbarDisk) around the
+    -- 3:2 terrain icon at 52 x 34
     local icon = api.gui.comp.ImageView.new(BUTTON_ICON)
-    icon:setMinimumSize(api.gui.util.Size.new(48, 48))
-    icon:setMaximumSize(api.gui.util.Size.new(60, 60))
+    icon:setMinimumSize(api.gui.util.Size.new(52, 34))
+    icon:setMaximumSize(api.gui.util.Size.new(52, 34))
     local button = api.gui.comp.ToggleButton.new(icon)
     button:setTooltip(tr("Minimap (Big Maps)"))
-    button:setMinimumSize(api.gui.util.Size.new(48, 48))
+    button:setStyleClassList({ "bigmapToolbarDisk" })
+    button:setMinimumSize(api.gui.util.Size.new(60, 60))
+    button:setMaximumSize(api.gui.util.Size.new(60, 60))
     layout:insertItem(button, 0)
     state.button = button
     state.window = buildWindow()

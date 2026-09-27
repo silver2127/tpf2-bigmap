@@ -1061,9 +1061,12 @@ void WINAPI BigmapRestoreStockBaseMod(HWND, HINSTANCE, LPSTR, int)
     if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\res\\config\\base_mod.lua", self) < 0) return;
     char why[320];
     SyncBaseMod(path, false, why, sizeof why);
-    // The minimap game script goes too (only if it is ours).
+    // The minimap game script and its style sheet go too (only if they are ours).
     wchar_t script[MAX_PATH];
-    if (MinimapScriptPathIn(self, script, MAX_PATH)) SyncMinimapScript(script, false);
+    if (MinimapScriptPathIn(self, script, MAX_PATH)) {
+        SyncMinimapScript(script, false);
+        SyncMinimapStyle(script, false);
+    }
 }
 
 // ---------------------------------------------------------------------------
