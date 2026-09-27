@@ -20,6 +20,14 @@ int main(){
     assert(TerrainTarget(16*GiB,16*GiB,0,12*GiB,GiB)==4*GiB);
     linux_pager::TerrainPager pager;
     if(!pager.Start(64,0)){puts("SKIP: userfaultfd unavailable");return 77;}
+    {   // a new tile is real, zeroed memory: resident before its first write
+        auto* p=pager.Allocate();assert(p);
+        unsigned char in[linux_pager::TerrainPager::Stride/4096];
+        assert(mincore(p,linux_pager::TerrainPager::Stride,in)==0);
+        for(auto page:in)assert(page&1);
+        for(size_t i=0;i<TerrainCodec::Samples;++i)assert(p[i]==0);
+        assert(pager.Release(p));
+    }
     std::vector<uint16_t*> tiles;
     for(int n=0;n<32;++n){auto* p=pager.Allocate();assert(p);for(size_t i=0;i<TerrainCodec::Samples;++i)p[i]=uint16_t(i/257+i%257+n);tiles.push_back(p);}
     for(int tries=0;tries<100 && pager.Get().evictions<32;++tries)std::this_thread::sleep_for(std::chrono::milliseconds(100));

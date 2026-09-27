@@ -57,6 +57,11 @@ private:
     std::atomic<size_t> budget{0};bool automatic=false;size_t fallbackBudget=0;
     static uint64_t Now(){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
     uint8_t* Address(size_t i){return base+i*Stride;}
+    // One read-only anonymous mapping, never written: it reads as zeros for every copy.
+    static const void* ZeroSource(){
+        static const void* zero=[]{void* p=mmap(nullptr,Stride,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);return p==MAP_FAILED?nullptr:p;}();
+        return zero;
+    }
     static void Fatal(){ssize_t ignored=write(2,"tpf2_bigmap: terrain pager invariant failed\n",42);(void)ignored;abort();}
     void Check(bool ok){if(!ok)Fatal();}
     void Protect(unsigned i,bool on){uffdio_writeprotect wp{};wp.range={uintptr_t(Address(i)),Stride};wp.mode=on?UFFDIO_WRITEPROTECT_MODE_WP:0;Check(ioctl(fd,UFFDIO_WRITEPROTECT,&wp)==0);}
@@ -141,7 +146,12 @@ public:
         unsigned i;
         {std::lock_guard<std::mutex> lock(poolLock);if(!free.empty()){i=free.back();free.pop_back();}else if(next<count){i=next++;highWater=next;}else{++refusals;return nullptr;}}
         auto& s=slots[i];std::lock_guard<std::mutex> lock(s.lock);Check(!s.active);s.active=true;s.cold=false;s.age.Reset(Now());
-        uffdio_zeropage zero{};zero.range={uintptr_t(Address(i)),Stride};Check(ioctl(fd,UFFDIO_ZEROPAGE,&zero)==0 && zero.zeropage==ssize_t(Stride));
+        // Real zeroed pages, not the shared zero page: the refine writes every page of a
+        // new tile, and each write to a UFFDIO_ZEROPAGE mapping is a copy-on-write fault
+        // whose TLB flush interrupts every CPU the game runs on. On the dedicated server
+        // that was half of the load's busiest thread for its longest phase (2026-09-27).
+        uffdio_copy fill{};fill.src=uintptr_t(ZeroSource());fill.dst=uintptr_t(Address(i));fill.len=Stride;fill.mode=UFFDIO_COPY_MODE_DONTWAKE;
+        Check(ZeroSource()!=nullptr && ioctl(fd,UFFDIO_COPY,&fill)==0 && fill.copy==ssize_t(Stride));
         ++live;++resident;return reinterpret_cast<uint16_t*>(Address(i));
     }
     bool Release(void* p){
