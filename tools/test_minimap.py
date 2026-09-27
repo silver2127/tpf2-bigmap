@@ -65,6 +65,8 @@ style_text.argtypes = [C.c_char_p, C.c_uint64]
 style_text.restype = C.c_uint64
 sync_icon = dll.BigmapTestSyncMinimapIcon
 sync_icon.argtypes = [C.c_wchar_p, C.c_int]
+climate_colouring = dll.BigmapTestMinimapClimateColoring
+climate_colouring.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_char_p, C.c_uint64]
 install = dll.BigmapTestInstallMinimap
 install.argtypes = [C.POINTER(Host), C.c_int, C.c_int, C.c_wchar_p]
 
@@ -517,6 +519,94 @@ def check_script_sync(tmp):
           'removed with the folder when empty; another file in it is kept')
 
 
+# ---- the world's climate colouring ---------------------------------------------
+
+def msvc_string(buf, off, text, keep):
+    """An MSVC std::string at buf+off: inline when it fits in 15 bytes, else on the heap."""
+    raw = text.encode()
+    if len(raw) <= 15:
+        C.memmove(C.addressof(buf) + off, raw, len(raw))
+        cap = 15
+    else:
+        heap = C.create_string_buffer(raw, len(raw) + 1)
+        keep.append(heap)
+        C.c_uint64.from_buffer(buf, off).value = C.addressof(heap)
+        cap = len(raw)
+    C.c_uint64.from_buffer(buf, off + 0x10).value = len(raw)
+    C.c_uint64.from_buffer(buf, off + 0x18).value = cap
+
+
+def check_climate():
+    keep = []
+
+    def world(climate_id, climates):
+        """CGameUI -> +0x448 game -> +0x150 GameRes; +0x10 cfg (id at +0x938); +0xd8 ClimateRep."""
+        entries = (C.c_uint8 * (0x30 * len(climates)))()
+        for i, (cname, levels, water, variant) in enumerate(climates):
+            msvc_string(entries, i * 0x30, cname, keep)
+            desc = (C.c_uint8 * 0x200)()
+            pc = 0xc8
+            if levels is not None:
+                arr = (C.c_float * (4 * len(levels)))(*[v for (r, g, b, h) in levels for v in (r / 255, g / 255, b / 255, h)])
+                keep.append(arr)
+                C.c_uint64.from_buffer(desc, pc).value = C.addressof(arr)
+                C.c_uint64.from_buffer(desc, pc + 8).value = C.addressof(arr) + 16 * len(levels)
+            desc[pc + 0x38] = variant
+            # the default ctor (0x36d810) fills every colour; a climate overrides some
+            defaults = [(100, 135, 158), (60, 80, 91), (204, 230, 255), (255, 255, 204)]
+            for k, col in enumerate((water or []) + defaults[len(water or []):]):
+                for j in range(3):
+                    C.c_float.from_buffer(desc, pc + 0x40 + k * 0xc + j * 4).value = col[j] / 255
+            keep.append(desc)
+            C.c_uint64.from_buffer(entries, i * 0x30 + 0x20).value = C.addressof(desc)
+        rep = (C.c_uint8 * 0x60)()
+        C.c_uint64.from_buffer(rep, 0x28).value = C.addressof(entries)
+        C.c_uint64.from_buffer(rep, 0x30).value = C.addressof(entries) + C.sizeof(entries)
+        cfg = (C.c_uint8 * 0x9d0)()
+        msvc_string(cfg, 0x938, climate_id, keep)
+        res = (C.c_uint8 * 0x100)()
+        C.c_uint64.from_buffer(res, 0x10).value = C.addressof(cfg)
+        C.c_uint64.from_buffer(res, 0xd8).value = C.addressof(rep)
+        game = (C.c_uint8 * 0x200)()
+        C.c_uint64.from_buffer(game, 0x150).value = C.addressof(res)
+        ui = (C.c_uint8 * 0x500)()
+        C.c_uint64.from_buffer(ui, 0x448).value = C.addressof(game)
+        keep.extend([entries, rep, cfg, res, game, ui])
+        return ui
+
+    def read(ui):
+        out = (C.c_float * 77)()
+        name = C.create_string_buffer(64)
+        rc = climate_colouring(ui, out, name, 64)
+        return rc, list(out), name.value.decode()
+
+    dry = [(165, 129, 85, 0.0), (175, 153, 105, 150.0), (124, 121, 85, 250.0), (125, 126, 98, 350.0), (242, 235, 220, 550.0)]
+    tropical_water = [(60, 201, 214), (5, 56, 89)]
+    climates = [('temperate.clima.lua', None, None, 0xff),
+                ('dry.clima.lua', dry, None, 1),
+                ('tropical.clima.lua', [(232, 209, 142, 0.0), (93, 112, 66, 1.0)], tropical_water, 1)]
+
+    rc, out, name = read(world('dry.clima.lua', climates))
+    assert rc == 1 and name == 'dry.clima.lua' and out[0] == 5, (rc, name, out[0])
+    for i, (r, g, b, h) in enumerate(dry):
+        assert out[1 + i * 4] == h and all(abs(out[2 + i * 4 + k] - v / 255) < 1e-6 for k, v in enumerate((r, g, b))), i
+    assert abs(out[65] - 100 / 255) < 1e-6, 'dry keeps the default water'
+    rc, out, name = read(world('tropical.clima.lua', climates))
+    assert rc == 1 and out[0] == 2 and abs(out[65] - 60 / 255) < 1e-6 and abs(out[68] - 5 / 255) < 1e-6, out[65:71]
+    rc, out, name = read(world('temperate.clima.lua', climates))   # no levels: the default ramp
+    assert rc == 1 and out[0] == 3 and abs(out[2] - 93 / 255) < 1e-6
+    rc, out, name = read(world('a_mod_climate_with_a_long_name.clima.lua', climates))   # heap string, no match
+    assert rc == 0 and out[0] == 3
+    rc, out, _ = read(None)
+    assert rc == 0 and out[0] == 3
+    bad = world('dry.clima.lua', climates)
+    C.c_uint64.from_buffer(bad, 0x448).value = 0x10   # a pointer into nothing: the fault is caught
+    rc, out, _ = read(bad)
+    assert rc == 0 and out[0] == 3
+    print('PASS: climate colouring: the world\'s climate found by its id (inline and heap strings); dry levels, '
+          'tropical water, temperate and unknown climates keep the default ramp; null and faulting walks keep the default')
+
+
 # ---- installer --------------------------------------------------------------
 
 def check_installer(tmp):
@@ -564,10 +654,11 @@ def check_installer(tmp):
     src = SCRIPT.read_bytes().replace(b'\r\n', b'\n')
     sites = [0x22b4610, 0x5a2900, 0x22b4350, 0x33d130, 0x8bb7f0, 0x8bb820, 0x5a2999,
              0x33d270, 0x33d280, 0x33d560, 0x33d7f0, 0x33d540]
+    climate_sites = [0x5a2959, 0x5a29a4, 0x5a2fa3, 0x318533, 0x318574, 0x36eba9]
 
     events.clear()
     assert install(C.byref(host), 0, 1, str(script))
-    assert [e[1] for e in events if e[0] == 'verify'] == sites
+    assert [e[1] for e in events if e[0] == 'verify'] == sites + climate_sites
     assert [(e[1], e[2]) for e in events if e[0] == 'hook'] == [(0x5a2900, 20), (0x22b4610, 20)]
     assert script.read_bytes() == src
 
@@ -583,6 +674,11 @@ def check_installer(tmp):
         events.clear()
         assert not install(C.byref(host), 0, 1, str(script))
         assert not [e for e in events if e[0] == 'hook'] and not script.exists(), hex(rva)
+    # A climate site that does not verify costs only the climate colours: the minimap stays on.
+    for rva in climate_sites:
+        failure = ('verify', rva)
+        events.clear()
+        assert install(C.byref(host), 0, 1, str(script)) and script.read_bytes() == src, hex(rva)
     failure = ('hook', 0x5a2900)
     script.write_bytes(src)
     events.clear()
@@ -593,9 +689,9 @@ def check_installer(tmp):
     assert not install(C.byref(host), 0, 1, str(script)) and not script.exists()
     failure = None
     assert not errors, errors
-    print('PASS: installer verifies all 12 pinned sites against the Steam exe (whole-instruction 20-byte steals, '
+    print('PASS: installer verifies all 12 pinned sites and the 6 climate sites against the Steam exe (whole-instruction 20-byte steals, '
           'nothing RIP-relative), hooks capture before image, writes the script only when both hooks install, '
-          'and removes it when off, on GOG, on any mismatch or hook failure')
+          'and removes it when off, on GOG, on any mismatch or hook failure; a climate mismatch keeps the minimap')
 
 
 # ---- network overlay ----------------------------------------------------------
@@ -1296,6 +1392,7 @@ def main():
     check_detour(t)
     check_network(t)
     check_thunk()
+    check_climate()
     with tempfile.TemporaryDirectory() as td:
         check_script_sync(Path(td))
         check_installer(Path(td))

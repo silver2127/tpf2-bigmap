@@ -23,7 +23,7 @@ maps. Four things in it are architectural:
 | Detour | `ImageView::SetImage(string)` `0x22b4610` | A 14-byte prefix check for every other image. On a token: the placeholder `ui/icons/main-menu/map_town.tga` is written into the string's own buffer (or an empty path if it does not fit), the original consumes it, then the texture is replaced |
 | Terrain | `*(CGameUI+0x450)` -> `vtbl[1]` -> `+0x20` = `CTerrain`; `CGameUI` captured by a 25-byte thunk on `CreateConstructionMenu` `0x5a2900` | The thunk stores `rcx` and jumps on without touching the stack, so the function's unknown arity does not matter |
 | Heights | `CTerrain::BaseGetVertices` `0x33d130` (65x65 uint16 per tile) | Not paged by the terrain pager. Empty cells are skipped before the call, which would assert |
-| Colour | reimplementation of `CreateTextureData` `0x63b9a0` | Default climate ramp, water depth ramp, hillshade (`relief`), 24-direction ambient term. Shaded on up to 8 threads |
+| Colour | reimplementation of `CreateTextureData` `0x63b9a0` | The world's climate `mapColoring` (height levels, water, ambient and sun colours; read from `ClimateDesc+0xc8`, see `MinimapClimateColoringFrom`), else the engine default; water depth ramp, hillshade (`relief`), 24-direction ambient term. Shaded on up to 8 threads |
 | Upload | `ImageView::SetImage(raw)` `0x22b4350`, RGBA8 | The path the engine's own map preview uses; synchronous |
 
 Twelve sites are byte-verified before anything is hooked, including the getters
@@ -161,5 +161,5 @@ The offline mock cannot settle these. Each is logged or visible:
     names any type still generic.
 11. **Roadside stops** should appear as small bars on their streets.
 
-Known limits in this version: temperate terrain colours on every climate;
-industry markers capped at 4,000; a network gathered by Lua (see point 8).
+Known limits in this version: a climate whose `mapColoring` uses the `texture` form
+(no shipped climate does) keeps the default height ramp; industry markers capped at 4,000; a network gathered by Lua (see point 8).
