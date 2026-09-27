@@ -46,13 +46,15 @@ def runtime(lines):
     return L
 
 
-def generate(text, km):
+def generate(text, tiles):
+    # The game passes mapSizeX/Y in heightmap samples, 64 * tiles + 1 (MEASURED
+    # 12289 for a 192 x 192 tile map), not in metres.
     lines = []
     L = runtime(lines)
     L.execute(text.decode('utf-8'))
     info = L.globals().data()
     p = L.table_from({row['key']: row['defaultIndex'] for _, row in info.params.items()})
-    p.water, p.mapSizeX, p.mapSizeY = 2, km * 1024, km * 1024
+    p.water, p.mapSizeX, p.mapSizeY = 2, tiles * 64 + 1, tiles * 64 + 1
     p.bounds = L.table_from(dict(min=L.table_from(dict(x=-p.mapSizeX / 2, y=-p.mapSizeY / 2)),
                                  max=L.table_from(dict(x=p.mapSizeX / 2, y=p.mapSizeY / 2))))
     L.globals().math.randomseed(35924)
@@ -86,17 +88,21 @@ def main():
         assert out is not None, name
         a, b = src.splitlines(), out.splitlines()
         assert len(b) > len(a) and sum(x != y for x, y in zip(a, b)) == 1, name
-        before, _ = generate(src, 40)
-        after, lines = generate(out, 40)
-        x, y = t.verify(before, after)
-        n = len(t.indices(before['layers']))
-        assert lines == [f'[tpf2_bigmap] generator memory: 40960 x 40960 m, {n} layers over {x} buffer names',
-                         f'[tpf2_bigmap] terrain memory: {x} -> {y} named buffers'], lines
-        assert y == t.lower_bound(before) and y <= 12, (y, t.lower_bound(before))
-        small, _ = generate(src, 32)
-        same, lines = generate(out, 32)
+        report = []
+        for tiles in (130, 160, 192):
+            before, _ = generate(src, tiles)
+            after, lines = generate(out, tiles)
+            x, y = t.verify(before, after)
+            n, s = len(t.indices(before['layers'])), tiles * 64 + 1
+            assert lines == [f'[tpf2_bigmap] generator memory: {s} x {s} samples ({tiles} x {tiles} tiles), '
+                             f'{n} layers over {x} buffer names',
+                             f'[tpf2_bigmap] terrain memory: {x} -> {y} named buffers'], lines
+            assert y == t.lower_bound(before) and y <= 12, (y, t.lower_bound(before))
+            report.append(f'{tiles}: {x} -> {y}')
+        small, _ = generate(src, 128)
+        same, lines = generate(out, 128)
         assert same == small and len(lines) == 1 and lines[0].endswith('(32 x 32 km or less: unchanged)'), (name, lines)
-        print(f'{name:<42} 40 km: {x} -> {y} named buffers; 32 km: unchanged')
+        print(f'{name:<42} tiles {", ".join(report)} named buffers; 128: unchanged')
 
     alt = C.create_unicode_buffer(260)
     path = str(FANTASIA / 'config/terrain_generators' / FILES[0])
