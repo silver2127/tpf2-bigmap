@@ -9,8 +9,19 @@ static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
 static uintptr_t mismatchRva;
 static bool build=true;
+static bool compressionRequested=false;
+
 static bool minimapWarning=false, sidecarWarning=false, capsWarning=false, depthWarning=false;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
+// Test config selection without spawning UFFD workers for the fake ELF host.
+// The pager suite separately exercises real userfaultfd startup and restores.
+static int Bool(const char* section,const char* key,int fallback){
+    if(!strcmp(key,"terrain_cache_compress")){
+        assert(fallback==1); compressionRequested=Int(section,key,fallback)!=0;
+        return 0;
+    }
+    return Int(section,key,fallback);
+}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
 static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
@@ -26,7 +37,7 @@ static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
 static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);return Pack(96,96);}
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
-static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
+static Tpf2mpHost host={sizeof(host),1,Log,Int,Bool,Str,Base,Build,Verify,Hook,PatchBytes,Data};
 static void Reset(){minimapWarning=sidecarWarning=capsWarning=depthWarning=false;mismatchRva=0;config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
@@ -53,7 +64,11 @@ int main(){
     }
     Reset();mismatch=1;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && rows==9 && cap==512);
-    assert(!minimapWarning);
+    assert(!minimapWarning && compressionRequested);
+    Reset();config["terrain_cache_compress"]=0;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && !compressionRequested);
+    Reset();config["terrain_cache_compress"]=1;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && compressionRequested);
     const int stockWrites=writes;const auto stockMemory=memory;
     // Unsupported extended depths load the verified root, never a larger menu.
     for(int depth:{11,12,13})for(int enabled:{0,1})for(int limit:{128,2048}) {

@@ -5,7 +5,7 @@ Maps larger than Transport Fever 2's New Game menu will build.
 **Native Linux:** an experimental port is available under `linux/`. See
 [Linux installation](docs/linux/INSTALL.md) and [port scope and evidence](docs/linux/PORT.md).
 It supports large-map controls through 512 tiles per edge and six sparse density
-presets for towns and industries. Linux dev.3 adds opt-in lossless terrain RAM
+presets for towns and industries. Linux dev.3 adds lossless terrain RAM
 compression, faster saves and an exact SIMD terrain scan. Linux dev.4 adds lazy zero terrain tiles, compressed-content deduplication and
 travel-time controls. Alignment batching, block/material paging, adaptive memory
 policy and depth 12/13 remain unported; see [integration evidence](docs/linux/PORT.md#windows-integration-bd0d85f-linux-dev4-partial).
@@ -18,6 +18,22 @@ ceiling. This does not add larger-root support or make larger-root saves safe.
 See [fallback evidence](docs/linux/PORT.md#windows-integration-926113b).
 The Windows minimap from `cdfee2a` is not yet available on native Linux;
 see the [integration evidence](docs/linux/PORT.md#minimap-integration-cdfee2a-partial).
+
+Compression is enabled by default as of integration `b755f65`; set
+`terrain_cache_compress=0` to disable it. See [latest integration](docs/linux/PORT.md#windows-integration-b755f65-partial).
+
+The following upstream sync and feature descriptions concern the Windows branch;
+this native branch retains the Linux scope described above.
+
+**Big Maps is developed in
+[tpf2-multiplayer](https://github.com/silver2127/tpf2-multiplayer/tree/dev/bigmap),
+under `bigmap/`, and this repository is kept in sync with it automatically.** Every
+change made there lands here too, so this is the place to get Big Maps on its own,
+without multiplayer. TpF2 Multiplayer 0.7 and later already include Big Maps.
+Please open issues and pull requests against `dev` in tpf2-multiplayer: a change
+made only here is overwritten by the next sync. The exception is the standalone
+installer (`installer/`, `.github/`, `tools/vendor_host.ps1`,
+`tools/test_config_msi.py`), which lives only in this repository.
 
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
@@ -32,8 +48,8 @@ overflow above approximately 185 km separation. See
 sites and offline validation; an in-game regeneration check is still pending.
 
 A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
-and has no build-time dependency on the host tree — only the vendored
-`src/tpf2mp_plugin.h`, which is the whole ABI.
+and has no build-time dependency on the host tree, only `src/tpf2mp_plugin.h`,
+the whole ABI, which the sync copies from tpf2-multiplayer.
 
 Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
 (2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
@@ -250,17 +266,21 @@ b2 0b              mov  dl, 0xb            ; depth 11
 ceiling remains **512 tiles (131 km)** with 128 m leaves. The default patch is
 applied only when the configuration asks for a size over 256 tiles.
 
-**Experimental actual depths 12 and 13 are available.** Set `octree_depth=13`
+**Actual depths 12 and 13 are available, and tested.** Set `octree_depth=13`
 and `max_tiles=2048` for **2,048-tile (524.288 km) edge capacity**, or depth 12
 and `max_tiles=1024` for 262.144 km. Both retain **128 m leaves**. The patch
 assigns compact IDs to levels 11/12 and updates the renderer's level decoder.
 It is byte-verified and tested offline against original engine insertion
-instructions, and **validated in a running game** on GOG: a 57 x 57 km map was
-created, played and reloaded with no duplicate street nodes and no assertion.
-Heightmap area
-limits still apply, so the longest maps must be narrow. See
-[the implementation and test notes](docs/octree-depth12.md) for configuration,
-evidence and remaining live checks. Defaults retain depth 11.
+instructions, and the higher depths have been **tested in play and work fine**:
+large maps at depth 13 created, played, saved and reloaded on Steam, in single
+player and in multiplayer (Windows players with the native Linux dedicated
+server, which supports depths 12/13 since 2026-09-23), with no duplicate street
+nodes and no assertion. On GOG the fallback below was validated in a running
+game (a 57 x 57 km map created, played and reloaded). Heightmap area limits
+still apply, so the longest maps must be narrow. Every multiplayer peer needs
+the same `octree_depth`. See
+[the implementation and test notes](docs/octree-depth12.md) for configuration
+and evidence.
 
 **Steam 35924 only.** Depths 12 and 13 replace two prologues the GOG build does
 not share, so there `octree_depth=12`/`13` fall back to the depth-11 root
@@ -507,6 +527,9 @@ It finds the Transport Fever 2 folder (from Steam's own uninstall entry, or from
 the folder a previous install remembered), asks you to confirm it,
 and puts these in place:
 
+If you play with TpF2 Multiplayer 0.7 or later, you already have Big Maps: do not
+install this package as well. Installing TpF2 Multiplayer removes it.
+
 | file | what |
 | --- | --- |
 | `alut.dll` | the proxy the game loads in place of its own (the original is kept as `alut_real.dll`) |
@@ -546,25 +569,16 @@ the way it shapes the stock ones. To set a shape yourself, add a
 `octree=1`, and the area within the street-raster budget (`street_raster=1` scales
 the cell to keep it there).
 
-### Installing alongside TpF2 Multiplayer
+### With TpF2 Multiplayer
 
-Both packages work in either order and can be removed in either order. They
-share the proxy and the plugin host, and both installers declare those under
-the **same component GUIDs** (`installer/PluginHost.wxs`, byte-identical in both
-repositories), so Windows Installer reference-counts them: the second install
-finds them present, the first uninstall leaves them for the other, and only the
-last one out puts the game's own `alut.dll` back. The custom actions that park
-and restore `alut.dll` check that count too, so uninstalling one product never
-restores the stock library out from under the other.
-
-Each product keeps its own config — this one in `plugins\tpf2_bigmap.cfg`, which
-the host merges over `tpf2mp.cfg` — so neither installer touches a file the
-other owns.
-
-`installer\test_coexist.ps1` proves all of it against a throwaway folder with
-the real `msiexec` transactions (both orders, both directions, the shared
-registry value tracked and restored). It needs an elevated PowerShell because
-the packages are per-machine.
+TpF2 Multiplayer 0.7 and later ship Big Maps themselves and remove this package
+when they install (its UpgradeCode is listed in their MSI), so the plugin has one
+owner. Before 0.7 the two packages coexisted: they shared the proxy and the
+plugin host under the **same component GUIDs** (`installer/PluginHost.wxs`), so
+Windows Installer reference-counted them and only the last one out put the game's
+own `alut.dll` back. `installer\test_coexist.ps1` proves that against a
+throwaway folder with the real `msiexec` transactions (it needs an elevated
+PowerShell, because the packages are per-machine).
 
 ### Virus-scanner findings
 
@@ -654,6 +668,52 @@ auto budgets for this machine's RAM, a few during the load, and then quiet. See
 New Game ratios can now extend through **1:20** with `max_ratio=20` (Steam).
 Both stock and added size rows are supported; map-edge and heightmap limits
 still apply. See [map-ratios.md](docs/map-ratios.md) for dimensions and validation.
+
+## Performance optimizations
+
+A big map strains the stock engine in two ways. It runs out of memory, because
+per-tile structures are sized for maps a tenth as large. It also loads slowly,
+because the load re-derives the whole terrain from scratch. Everything below is
+switched in `plugins\tpf2_bigmap.cfg` (restart to apply; `0` restores stock).
+Every item is **lossless**: it produces the same bytes the stock code would,
+and most are checked bit-for-bit against the game's own machine code by a test
+in `tools\`. So none of them can desync a multiplayer session, and peers with
+different settings stay in sync. The one exception, `placement_attempts`, only
+changes how a *new* map is generated. Switches the cfg marks "Steam 35924" keep
+the stock code on any other build.
+
+### Memory
+
+| Optimization | Switch (shipped) | How it works |
+| --- | --- | --- |
+| Terrain compression pager | `terrain_cache_compress=1` | The 1 m height cache (a 257x257 block per tile, kept for the whole session) goes through a pager. Tiles near the camera stay raw. Cold tiles are compressed with planar prediction (left + up - upper-left), zigzag residuals and a per-tile rANS coder, to about 7% of their raw size. They are decommitted, and decoded back **at the same address** when the engine touches them (about 0.2 ms a tile), so the engine never knows. Budgets adapt to the machine's RAM: see the next section. On native Linux the same pager runs on userfaultfd. [terrain-compression.md](docs/terrain-compression.md) |
+| Material-cell paging | `material_cache_compress=1` | The renderer keeps a 67,601-byte material-index cell per tile forever (4.13 GiB on a 256x256 map). Cold cells are held compressed (about 20% of raw) and restored in place on access. [material-grid-lifetime.md](docs/material-grid-lifetime.md) |
+| Alignment batching | `alignment_batch_tiles=512` | On a save load the engine cuts every road, track and construction into the terrain of the *whole map* in one call. It holds millions of intermediate blocks until the end, which was an "Out of memory" assert on a 94 GiB machine. The plugin splits that call into batches of N tiles (compute, publish, free), which is what the engine already does frame by frame in play. Peak private memory on a 207,360-tile save went from **35 GiB to 8.3 GiB**. [alignment-batch.md](docs/alignment-batch.md) |
+| Lazy zero | `terrain_lazy_zero=1` | A load allocates every tile of both terrain versions up front, all zero, then fills them over 20-30 s. Backing each allocation immediately committed up to 27 GiB before any terrain existed. Now a tile gets its memory on first touch, so commit follows the fill. |
+| Tile dedup | `terrain_dedup=1` | During a load both terrain versions exist, and every tile has exactly one byte-identical twin in the other (measured on a 256x256 save). When an evicted tile matches a stored blob (two independent 64-bit hashes must agree), it shares that blob. The second twin costs a hash instead of an encode and is stored once. |
+| Instance-list shrink | `instance_shrink=1` | While a new world is created, the tree and scenery instance lists of each 64 m cell are trimmed to their size, dropping the growth slack the game would otherwise keep all session. Contents and order are unchanged; it uses the game's own allocator. |
+| Generation buffer reuse | `python tools\install_generation_memory.py` | This one is opt-in and a Lua pass rather than a switch. It rewrites the stock New Game terrain generators so that temporary full-map float buffers whose lifetimes do not overlap share storage. The pass examines the completed op list and leaves op order, parameters and seeds alone. Desert goes from 18 buffers to 15 and Temperate from 10 to 9, which is 4 GiB per buffer at 228 x 1140 tiles. `--restore` undoes it. [generation-performance.md](docs/generation-performance.md) |
+
+### Load time and CPU
+
+| Optimization | Switch (shipped) | How it works |
+| --- | --- | --- |
+| Terrain sidecar | `terrain_sidecar=1` | Every save (manual and autosave) also writes `<save>.terr`, the finished, aligned 1 m height cache, fingerprinted with the `.sav`'s hash. Loading that same save decodes each tile from the sidecar the moment the engine creates it, and skips both the refine and the alignment cut for it. On a 256x256 save that skips two alignment passes of about 14 s each. A missing or non-matching sidecar just loads stock. [terrain-sidecar.md](docs/terrain-sidecar.md) |
+| SSE2 terrain refine | `terrain_refine_fast=1` | This is the bicubic refine from the 4 m base heightmap to the 1 m cache, which runs for every tile on load and after every terrain edit. It is rewritten with SSE2 and gives the same bits: about **3.4x** faster (58 to 17 ns a sample). [terrain-refine.md](docs/terrain-refine.md) |
+| SSE2 min/max scan | `terrain_minmax_fast=1` | The per-tile `CalcMinMaxHeight` scan during terrain publication becomes an 8-lane SSE2 reduction, and the height-block copy becomes one `memcpy` a row. The scan is about **24x** faster. [terrain-minmax.md](docs/terrain-minmax.md) |
+| Faster alignment blend | `terrain_align_fast=1` | `CalculateHeightMod`, which re-applies road/track/construction cuts to a height block, gets a pooled scratch buffer instead of an allocation per call and an SSE2 blend. It is **2.6x to 4.7x** faster per block. [terrain-alignment-speed.md](docs/terrain-alignment-speed.md) |
+| Material-index loop | `material_index_fast=1` | This was the largest single game-code hotspot in a world-entry profile. Stock walks a tile region repeatedly, eight material layers per pass. The replacement finishes all layers for one pixel before moving on, so it computes the interpolation coordinates and dither thresholds once. Layer priority, overlap and float order are preserved, and odd geometry falls back to stock. [world-entry-performance.md](docs/world-entry-performance.md) |
+| Fewer placement attempts | `placement_attempts=50` | The town/industry placement worker's inner optimisation budget goes from 200 tries to 50 (75% fewer). Spacing, slope, water checks and requested counts are unchanged. Placement can come out slightly less even. This affects only new-map generation, never a loaded save. [generation-performance.md](docs/generation-performance.md) |
+| Faster saves | `save_fast=1` | zstd level 1 instead of 3, and a 64 KiB save input buffer instead of 128 bytes. Compression is **2.79x** faster for files about 9% larger; the format is unchanged. [save-performance.md](docs/save-performance.md) |
+| Native minimap | `minimap=1` | The minimap's terrain picture is rendered natively and handed to the game as one texture. Its cost is the picture's pixel count, not the map size: there is no UI widget per cell and no Lua height sampling (the Workshop minimap needed ~43 million Lua calls at 256x256). [minimap.md](docs/minimap.md) |
+
+`world_entry_timings=1` logs the time and memory of each world-entry stage to
+`tpf2mp_host.log`, which is how the items above were found and measured.
+
+Retired or held back: `terrain_blocks` paged the alignment blocks through a
+small pager and is superseded by batching (off; kept as the fallback). The 2 m
+derived cache (`terrain_cache_spacing_m=2`) was discontinued after terrain
+seams and a crash. `terrain_cow_share` is still experimental and off.
 
 ## Memory: what a big map costs, and how the plugin keeps it in check
 

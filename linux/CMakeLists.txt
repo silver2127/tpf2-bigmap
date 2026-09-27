@@ -47,11 +47,13 @@ if(BUILD_TESTING)
   # Synthetic Windows-layout grid: tests the shared file API, not Linux hooks.
   add_executable(test_terrain_sidecar ../tools/test_terrain_sidecar.cpp)
   target_compile_options(test_terrain_sidecar PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  target_link_libraries(test_terrain_sidecar PRIVATE Threads::Threads)
   add_test(NAME terrain_sidecar COMMAND test_terrain_sidecar)
 endif()
 
 if(BUILD_TESTING)
   add_executable(test_sidecar_io tests/sidecar_io_test.cpp)
   target_compile_options(test_sidecar_io PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  target_link_libraries(test_sidecar_io PRIVATE Threads::Threads)
   add_test(NAME sidecar_io COMMAND test_sidecar_io)
 endif()

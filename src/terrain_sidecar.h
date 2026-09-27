@@ -63,6 +63,7 @@
 #endif
 #include <windows.h>
 #else
+#include <shared_mutex>
 #include <strings.h>
 #include <dirent.h>
 #include <string>
@@ -267,6 +268,26 @@ struct LoadState {
     uint32_t tiles = 0;
 };
 static LoadState g_load;
+// THREADS (2026-09-26, a player's crash dump: tpf2_bigmap.dll+0x2e74 in
+// EndApply's vector free, the block's header page already released). The game
+// runs the alignment pass on many threads at once and every batched pass that
+// finishes calls EndApply: two of them released the same file. AddTile threads
+// may also still be decoding from it. Has/ApplyTile hold this lock shared
+// (ApplyTile across its decode); BeginApply and EndApply take it exclusive, and
+// the file is freed once, outside the lock.
+#ifdef _WIN32
+static SRWLOCK g_loadLock = SRWLOCK_INIT;
+inline void LockLoadShared() { AcquireSRWLockShared(&g_loadLock); }
+inline void UnlockLoadShared() { ReleaseSRWLockShared(&g_loadLock); }
+inline void LockLoadExclusive() { AcquireSRWLockExclusive(&g_loadLock); }
+inline void UnlockLoadExclusive() { ReleaseSRWLockExclusive(&g_loadLock); }
+#else
+static std::shared_timed_mutex g_loadLock;
+inline void LockLoadShared() { g_loadLock.lock_shared(); }
+inline void UnlockLoadShared() { g_loadLock.unlock_shared(); }
+inline void LockLoadExclusive() { g_loadLock.lock(); }
+inline void UnlockLoadExclusive() { g_loadLock.unlock(); }
+#endif
 
 // Open, validate the header against the live grid's fingerprint and dimensions,
 // and index every tile by scanning the tile headers (NO decode). Returns the
@@ -281,7 +302,13 @@ static LoadState g_load;
 // to the normal compute for that tile. `verify` is unused, kept so the caller's
 // BeginIfPending(cterrain, scratch) signature is stable.
 inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* /*verify*/ = nullptr) {
-    g_load = LoadState{};
+    {
+        LoadState old;
+        LockLoadExclusive();
+        old = std::move(g_load);
+        g_load = LoadState{};
+        UnlockLoadExclusive();
+    }
     if (!grid.base || !grid.records()) return 0;
     FILE* f = OpenFile(path, L"rb");
     if (!f) return 0;
@@ -304,15 +331,29 @@ inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path,
         index[th.index] = {uint32_t(p), th.bytes};   // p != 0 always (past the header)
         p += th.bytes;
     }
+    LockLoadExclusive();
     g_load.file = std::move(buf);
     g_load.byIndex = std::move(index);
     g_load.tiles = hdr.tiles;
     g_load.loaded = true;
+    UnlockLoadExclusive();
     return long(hdr.tiles);
 }
-inline bool Loaded() { return g_load.loaded; }
-inline bool Has(uint32_t recordIndex) {
+inline bool Loaded() {
+    LockLoadShared();
+    const bool loaded = g_load.loaded;
+    UnlockLoadShared();
+    return loaded;
+}
+// Caller holds g_loadLock (shared or exclusive).
+inline bool HasLocked(uint32_t recordIndex) {
     return g_load.loaded && recordIndex < g_load.byIndex.size() && g_load.byIndex[recordIndex].first != 0;
+}
+inline bool Has(uint32_t recordIndex) {
+    LockLoadShared();
+    const bool has = HasLocked(recordIndex);
+    UnlockLoadShared();
+    return has;
 }
 // Decode the saved cache for `recordIndex` into that tile's height vector.
 // False if not loaded, not stored, the tile is not present/eligible, or the
@@ -320,13 +361,29 @@ inline bool Has(uint32_t recordIndex) {
 // the normal compute, i.e. not mark it served). The block codec's content hash
 // makes a bad decode a reliable false, never a wrong restore.
 inline bool ApplyTile(const Grid& grid, uint32_t recordIndex, BlockCodec::DecodeScratch& scratch) {
-    if (!Has(recordIndex)) return false;
-    TileVector* v = VectorOf(grid.record(recordIndex));
-    if (!Eligible(v)) return false;
-    const auto& e = g_load.byIndex[recordIndex];
-    return BlockCodec::Decode(g_load.file.data() + e.first, e.second, v->first, Samples, scratch);
+    LockLoadShared();
+    bool ok = false;
+    if (HasLocked(recordIndex)) {
+        TileVector* v = VectorOf(grid.record(recordIndex));
+        if (Eligible(v)) {
+            const auto& e = g_load.byIndex[recordIndex];
+            ok = BlockCodec::Decode(g_load.file.data() + e.first, e.second, v->first, Samples, scratch);
+        }
+    }
+    UnlockLoadShared();
+    return ok;
 }
-inline void EndApply() { g_load = LoadState{}; }
+// Release the loaded file. True for the one caller that released it; false when
+// nothing was loaded or another thread got there first.
+inline bool EndApply() {
+    LoadState old;
+    LockLoadExclusive();
+    const bool had = g_load.loaded;
+    old = std::move(g_load);
+    g_load = LoadState{};
+    UnlockLoadExclusive();
+    return had;
+}
 
 // ---- Fingerprint and the save/load glue. ----
 // The fingerprint ties a sidecar to one save: a 64-bit hash of the .sav bytes.

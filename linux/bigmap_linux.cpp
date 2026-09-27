@@ -305,7 +305,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         if(!Plan(0xc7b524,levelBefore,levelAfter,6) || !Plan(0xc7b6b1,cmpBefore,cmpAfter,9) ||
            !Plan(0xc7c3a0,allocBefore,allocAfter,5) || !Plan(0xc7c3aa,sizeBefore,sizeAfter,9))return TPF2MP_ERR_BUILD;
     }
-    if(H->cfgBool(Section,"terrain_cache_compress",0)) {
+    if(H->cfgBool(Section,"terrain_cache_compress",1)) {
         // Scope allocation changes to CTerrain's append and detached-copy calls.
         // Dispose is the shared-vector control block's exact native free path.
         auto* candidate=new linux_pager::TerrainPager;
@@ -349,7 +349,21 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
                 (unsigned long long)p.duplicates,(unsigned long long)p.zero,(unsigned long long)p.pairs,(unsigned long long)p.largest);}
             catch(const std::bad_alloc&){H->log("terrain dedup probe: allocation failed");}
         }}).detach();
-        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto s=terrainPager->Get();H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu dedup_hits=%llu",(unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,(unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals,(unsigned long long)s.dedupHits);}}).detach();
+        std::thread([]{
+            auto previous=terrainPager->Get();
+            auto last=std::chrono::steady_clock::now();
+            for(;;){
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                const auto now=std::chrono::steady_clock::now();
+                const auto s=terrainPager->Get();
+                const double seconds=std::chrono::duration<double>(now-last).count();
+                H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu dedup_hits=%llu faults/s=%.1f evictions/s=%.1f",
+                    (unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,
+                    (unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals,
+                    (unsigned long long)s.dedupHits,(s.faults-previous.faults)/seconds,(s.evictions-previous.evictions)/seconds);
+                previous=s;last=now;
+            }
+        }).detach();
     }
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
     H->log("Experimental port: depth 12/13 and material compression are not enabled");

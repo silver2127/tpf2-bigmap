@@ -2,6 +2,9 @@
 
 Baseline Windows source: bigmap commit `4f0de6f` (0.4.0).
 Linux ELF GNU build-id: `3a0e156390b0e6f1e372051c24802c8493ae454a`.
+Current integration: `b755f653a2e5067a6ca34e89df64dcabe039a052` (partial; see
+the final section). Earlier sections describe historical defaults and limits.
+
 The host checks this identity; the plugin checks every patch before publishing
 any change. `tools/linux/verify_game.py GAME_ELF` independently checks all sites.
 
@@ -698,3 +701,127 @@ identified Steam ELF. Actual native depth-12/13 roots and previously recorded
 minimap/sidecar/adaptive-policy gaps remain outside this incremental change.
 The live startup check is blocked by the lab's namespace failure, not reported
 as a successful runtime validation.
+
+
+## Windows integration b755f65 (partial)
+
+Integrated 2026-09-26: eleven Windows commits `c7e8e30` through
+`b755f653a2e5067a6ca34e89df64dcabe039a052`, after `926113b` above.
+The README conflict retains the Linux scope and the upstream standalone-sync
+and unified Windows installer descriptions. All changes are staged; the merge
+is not committed. The initial Windows baseline remains historical.
+
+| Commits | Native disposition |
+| --- | --- |
+| `c7e8e30`, `26b4ca3` | Unified Windows packaging and standalone mirror documentation retained. Native packaging continues to use the shared prefix and preserve installed configs; the synchronized standalone installer and ABI header remain. No native publishing workflow added. |
+| `1c6fccc`, `9cba049`, `9f6a3e2` | GOG support, batch quoting and graceful octree fallback already integrated through `926113b`. Native depth 12/13 requests still install depth 11; unchanged guarded sites and caps. |
+| `2e2abe5`, `4ef7656` | Upstream play results and performance catalog retained, with explicit Linux scope notices. Separate native dedicated-server depth-13 results do not validate this standalone port. |
+| `a2756cc` | Compression on in the shipped native config and missing-key default. Explicit 0 and unavailable-userfaultfd stock fallback preserved. No version change. |
+| `e19eec1` | Thirty-second diagnostics now include elapsed-time faults/s and evictions/s. Recency eviction and automatic headroom/working-set budgets remain unported; see below. |
+| `45dd855` | POSIX autosave discovery helper and native tests added. It is not connected to native SaveGame hooks, which remain absent. Windows save hooks and tests remain intact. |
+| `b755f65` | Shared sidecar reader/release synchronization ported with a native reader/writer mutex and concurrency regression coverage. No live sidecar hook enabled. |
+
+### Native changes and contracts
+
+Compression uses the existing byte-verified AddTile allocation and control-block
+dispose sites; neither the SysV ABI nor the patch manifest changes. Both the
+shipped key and `cfgBool` fallback are 1. Existing installations with explicit 0
+remain off because the installer preserves configuration. Unsupported userfaultfd
+setup still logs and leaves allocation hooks off. `UFFD_USER_MODE_ONLY` cannot
+serve kernel-origin accesses to missing pages: a GPU driver/mod can cause SIGBUS;
+set `terrain_cache_compress=0` and restart in that case. This supersedes earlier
+sections' opt-in defaults, not their validation limitations.
+
+The sidecar header uses Windows SRW locks on Windows and
+`std::shared_timed_mutex` on Linux. Loaded/Has and the entire tile decode hold
+shared ownership; BeginApply publication/reset and EndApply use exclusive
+ownership. EndApply moves state out under the lock, frees it afterward and
+returns true to exactly one releaser. The merged Windows pass callback logs
+only for that releaser. This guards file lifetime, not the game's terrain
+lifetime; native serving remains disabled. BeginApply calls still require the
+load owner to serialize whole load transitions, as in upstream.
+
+`linux/sidecar_files.h` implements the new discovery rule on POSIX UTF-8 paths:
+exactly one regular `.sav` with mtime at least call start minus two seconds.
+Directories, symlinks and `.sav.lua` are excluded; suffix matching is
+case-sensitive. Failure, ambiguity and insufficient output capacity preserve
+the caller's output. No rename, orphan deletion or game-file mutation is
+performed by the helper. Timestamps alone do not prove save/terrain ownership;
+future hook wiring must serialize saves and validate success before stamping.
+
+Native pager status now samples cumulative counters every 30 seconds and divides
+their deltas by actual steady-clock elapsed time. `faults/s` includes lazy-zero
+faults and write-protection events, not just cold restores. The counters do not
+claim that resident reads are observable.
+
+### Static investigation and missing live proof
+
+Re-read Linux signature exports and disassembled the actual lab ELF. No new
+patch site is enabled; build-id and all 22 existing sites pass verification.
+The following are investigation evidence, not hooks:
+
+- SaveGame `0xc7ec00`: `4c 8b 65 10` at `0xc7ec2a` loads the seventh SysV
+  argument (SaveGameId) from rbp+0x10. At `0xc7ec95`/`0xc7ec9a`, the name is
+  read from id+0x20/+0x28. `0xc7fd9d` and `0xc7fda3` return the aggregate in
+  edx/rax. Windows hidden-return and argument placement cannot be reused.
+- LoadGame `0xc7ca40`: id is saved from rcx, with the hidden result in rdi;
+  the logged name uses the native 32-byte string layout. Save/load both use
+  the backend path already documented under `9180629`.
+- GetSavegameInfo `0x3341ef0`: hidden result rdi, backend rsi, id rdx;
+  name/path strings and the `.sav` append agree with the earlier analysis.
+  Backend forwarding at `0x18ba270` ends in `ff 60 20`, vtable+0x20.
+- AddTile detached copy: `4d 8d 6e 10` at `0xcf774a` constructs vector
+  object control+0x10; `4d 89 6c 24 08` at `0xcf77ce` stores it at record+8,
+  and `4d 89 74 24 10` at `0xcf77d3` stores the control at record+0x10.
+  This supports the synthetic grid layout, but not cross-thread ownership.
+
+**Not ported: autosave/sidecar engine integration.** The lab startup failed
+before a process could be attached with gdb. Save success/rotation, actual backend
+identity, terrain snapshot ownership, AddTile writable ownership and completion
+of all alignment workers remain unproven live. Native alignment batching and
+publication suppression are still absent. The new lock and file helper are
+native offline components only; automatic autosave sidecars remain unavailable.
+The native unsupported-setting diagnostic is retained.
+
+**Not ported: recency eviction and adaptive budgets (`e19eec1`).** Compared
+`src/pager_impl.inl` with `linux/terrain_pager.h`. Native Serve updates touched
+on UFFD events; Policy scans up to 256 round-robin candidates and skips those
+less than two seconds old. Resident reads and ordinary unprotected writes are
+invisible. The backend has no recency queue or repeated-fault retention, and its
+fixed 1024 MiB config is not the upstream server's automatic RAM/30 policy.
+Windows section/commit-pressure rules do not establish Linux headroom safety.
+The failed live launch prevented steady-state fault/eviction, simulation-rate,
+load-peak and constrained-memory recovery measurements. Rates are now exposed,
+but an unvalidated automatic budget or claim of eliminating thrash is not shipped.
+Needed: native policy tests for hot-set retention and pressure recovery plus
+live large-save measurements. Existing larger-root/minimap gaps are unchanged.
+
+### Validation and live attempt
+
+`tools/linux/build.sh` passes all seven soldier SDK CTest suites, including real
+UFFD allocation/eviction/restore tests (not skipped). Native config regression
+checks cover missing compression key, explicit 0 and explicit 1; repeated fake
+ELF host initialization intercepts pager startup while the separate pager suite
+runs the real backend. Existing cap, byte-guard and rollback coverage still passes.
+The sidecar I/O suite adds 200 races with four private-grid readers and eight
+releasers: exactly one release, each decode intact or refused, plus repeated
+BeginApply/reset and malformed fingerprint rejection. Discovery tests cover
+UTF-8 paths, zero/one/two candidates, old saves, nanosecond tolerance boundaries,
+metadata/directories/symlinks and short output buffers. ASan/UBSan passes (1,940 concurrent decodes intact in that run). The native
+installer fixture passes checksums, host loading, config-preserving upgrade,
+multiplayer coexistence and uninstall/save preservation. Logs and final build
+output are archived with this job's evidence.
+
+Both native actor directories were backed up with `cp -a` to
+`.before-port-b755f65` (and `.before-port-b755f65-final` for the final-build
+retry); the built plugin and default-on config were installed
+only in the actor. Ran the official launcher from
+`/home/topsnek/tpf2-multiplayer/tools/sandbox/tpf2mp-lab` (absent in this clone),
+with a 180-second timeout. Both launches failed immediately with
+`bwrap: setting up uid map: Permission denied`. No game process, title menu,
+Vulkan device, save load, gameplay or gdb attachment was reached. No input was
+sent, Steam operation performed or save changed. Both directories were restored
+and recursive comparisons are empty. Actor logs/data copied into `meta/live/`
+are pre-existing, not evidence of a successful new run. Disassembly, launch
+output, tests and restoration evidence are retained there. Windows DLL/MSI
+tests were not run on Linux.
