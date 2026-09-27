@@ -1285,6 +1285,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
     g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 1) != 0;
     g_generatorMemory = H->cfgBool("tpf2_bigmap", "generator_memory", 1) != 0;
+    g_generatorBudgetPct = H->cfgInt("tpf2_bigmap", "generator_memory_budget_pct", 50);
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;

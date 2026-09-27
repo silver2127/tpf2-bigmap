@@ -86,8 +86,21 @@ All three Fantasia climates go to 10 names, which is the lower bound: 57-60 at
 130 tiles, 62-65 at 160 and 70-73 at 192. `tools/test_generator_memory.py`
 runs the DLL's patched text against the original: identical pipeline at 128
 tiles, symbolic replay at 130, 160 and 192, path matching, line numbers,
-anchor refusal and the `%TEMP%` copy. Sharing names serialises layers, so
-generation may take longer.
+anchor refusal and the `%TEMP%` copy.
+
+Sharing names serialises layers. MEASURED in game at 192 x 192 tiles with the
+fewest buffers: 10 maps, 6040 MB, `Pipeline took: 285.199s`, against about
+180 s expected from the stock 32 km runs. So the DLL also appends
+`_tpf2_bigmap_budget`, `generator_memory_budget_pct` (default 50) of the
+memory free when the file is opened (the smaller of free physical memory and
+commit headroom). The helper turns that into a buffer count and passes it to
+`Optimize(result, maxSlots)`. The pass then opens new buffers until it has
+that many, and after that reuses the one idle longest. Without `maxSlots`
+(the stock generators) it keeps the fewest-buffers first-fit. The test
+measures the longest chain of layers ordered by shared names at 192 tiles:
+Fantasia stock 1716-1764, fewest buffers 1924-1983, a 30-buffer budget
+541-549 (34 buffers). That chain is a model of the native scheduler, not a
+timing. `generator_memory_budget_pct=0` gives the fewest buffers.
 
 ## Checks and remaining validation
 

@@ -22,19 +22,34 @@ FILES = ('fantasia_map_generator.gen.lua', 'fantasia_map_generator_dry.gen.lua',
 def load_dll():
     dll = C.CDLL(str(ROOT / 'out/tpf2_bigmap.dll'))
     dll.BigmapTestGeneratorIndex.argtypes = [C.c_wchar_p]
-    dll.BigmapTestGeneratorPatch.argtypes = [C.c_char_p, C.c_size_t, C.c_char_p, C.c_size_t]
+    dll.BigmapTestGeneratorPatch.argtypes = [C.c_char_p, C.c_size_t, C.c_char_p, C.c_size_t, C.c_ulonglong]
     dll.BigmapTestGeneratorPatch.restype = C.c_longlong
     dll.BigmapTestGeneratorRedirect.argtypes = [C.c_wchar_p, C.c_wchar_p, C.c_size_t]
     return dll
 
 
-def patch(dll, src):
-    n = dll.BigmapTestGeneratorPatch(src, len(src), None, 0)
+def patch(dll, src, budget=0):
+    n = dll.BigmapTestGeneratorPatch(src, len(src), None, 0, budget)
     if n < 0:
         return None
     buf = C.create_string_buffer(n)
-    assert dll.BigmapTestGeneratorPatch(src, len(src), buf, n) == n
+    assert dll.BigmapTestGeneratorPatch(src, len(src), buf, n, budget) == n
     return buf.raw[:n]
+
+
+def chain(result):
+    """Longest run of layers the native scheduler must order: it orders layers
+    per buffer name (docs/generation-op-semantics.md), so a layer waits for the
+    last layer that touched any of its names."""
+    layers, depth, best = result['layers'], {}, 0
+    for i in t.indices(layers):
+        p = layers[i]['params']
+        names = {p[k] for k in t.KEYS if p.get(k) is not None}
+        d = 1 + max((depth.get(nm, 0) for nm in names), default=0)
+        for nm in names:
+            depth[nm] = d
+        best = max(best, d)
+    return best
 
 
 def runtime(lines):
@@ -99,6 +114,17 @@ def main():
                              f'[tpf2_bigmap] terrain memory: {x} -> {y} named buffers'], lines
             assert y == t.lower_bound(before) and y <= 12, (y, t.lower_bound(before))
             report.append(f'{tiles}: {x} -> {y}')
+            if tiles == 192:
+                # A budget of 30 buffers (4-byte floats): more names, shorter chains.
+                budget = 30 * s * s * 4
+                wide, lines = generate(patch(dll, src, budget), tiles)
+                xb, yb = t.verify(before, wide)
+                assert lines[0].endswith(f', budget {budget / 1048576:.0f} MB = 30 buffers'), lines
+                assert lines[1] == f'[tpf2_bigmap] terrain memory: {xb} -> {yb} named buffers (budget 30)', lines
+                assert y < yb <= x, (y, yb, x)
+                c0, c1, c2 = chain(before), chain(after), chain(wide)
+                assert c2 < c1, (c0, c1, c2)
+                report.append(f'budget 30: {yb} buffers; ordered chain stock {c0}, fewest {c1}, budget {c2}')
         small, _ = generate(src, 128)
         same, lines = generate(out, 128)
         assert same == small and len(lines) == 1 and lines[0].endswith('(32 x 32 km or less: unchanged)'), (name, lines)
@@ -109,7 +135,10 @@ def main():
     assert dll.BigmapTestGeneratorRedirect(path, alt, 260)
     served = Path(alt.value)
     assert served.name == FILES[0] and served.parent.name == 'tpf2_bigmap'
-    assert served.read_bytes() == patch(dll, Path(path).read_bytes())
+    # The last line carries the live memory budget.
+    body, last = served.read_bytes().rsplit(b'\n', 2)[0], served.read_bytes().rsplit(b'\n', 2)[1]
+    assert body == patch(dll, Path(path).read_bytes()).rsplit(b'\n', 2)[0]
+    assert last.startswith(b'_tpf2_bigmap_budget = ') and int(last.split(b'= ')[1]) > 0, last
     assert dll.BigmapTestGeneratorRedirect(path, alt, 260)   # unchanged copy: served again
     assert not dll.BigmapTestGeneratorRedirect(str(t.RES / 'config/terrain_generators/temperate.gen.lua'), alt, 260)
     print(f'PASS: generator memory (redirect copy {served})')
