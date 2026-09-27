@@ -1066,6 +1066,7 @@ void WINAPI BigmapRestoreStockBaseMod(HWND, HINSTANCE, LPSTR, int)
     if (MinimapScriptPathIn(self, script, MAX_PATH)) {
         SyncMinimapScript(script, false);
         SyncMinimapStyle(script, false);
+        SyncMinimapIcon(script, false);
     }
 }
 

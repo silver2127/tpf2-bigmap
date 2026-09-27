@@ -21,8 +21,8 @@ function data()
 		backgroundColor1 = ssu.makeColor(15, 35, 50, 90),
 		backgroundColor2 = ssu.makeColor(15, 35, 50),
 		borderColor = ssu.makeColor(255, 255, 255, 128),
-		-- the terrain icon is 3:2: 52 x 34 inside the 60 px disk
-		padding = { 13, 4, 13, 4 },
+		-- the 34 px icon inside the 60 px disk
+		padding = { 13, 13, 13, 13 },
 	})
 	a("ToggleButton!bigmapToolbarDisk:hover", {
 		backgroundColor = ssu.makeColor(0, 0, 0, 0),

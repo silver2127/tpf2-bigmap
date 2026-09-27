@@ -44,7 +44,7 @@ local CAMERA_SEGMENTS = 32
 local INSTALL_FRAMES = 600       -- frames to wait for the main toolbar
 local MEASURE_FRAMES = 30        -- frames to wait for the container's first layout
 local GATHER_SECONDS = 0.006     -- network gathering budget per frame
-local BUTTON_ICON = "ui/button/medium/terrain@2x.tga"
+local BUTTON_ICON = "ui/bigmap/minimap_button@2x.tga"   -- written by the plugin (src/minimap.h SyncMinimapIcon)
 local PLACEHOLDER = "ui/icons/main-menu/map_town.tga"   -- the plugin replaces it; must stay 31 chars
 -- res/textures/ui/ui.zip ships these two only as @2x: the plain names are no file.
 local TOWN_ICON = "ui/icons/main-menu/map_town@2x.tga"
@@ -1439,18 +1439,17 @@ local function install()
         return false
     end
     -- sized like the game's disk buttons: a 60 px disk (the plugin's style sheet,
-    -- mod/minimap/bigmap_minimap_style.lua, class bigmapToolbarDisk) around the
-    -- 3:2 terrain icon at 52 x 34. The button's size is its CONTENT, the style's
-    -- padding (13 above and below, 4 at the sides) goes outside it: sizing the
-    -- button 60 x 60 made a 68 x 86 oval (seen in game, 2026-09-27).
+    -- mod/minimap/bigmap_minimap_style.lua, class bigmapToolbarDisk) around a
+    -- 34 px icon. The button's size is its CONTENT, the style's 13 px padding goes
+    -- outside it: sizing the button 60 x 60 made an oval (seen in game, 2026-09-27).
     local icon = api.gui.comp.ImageView.new(BUTTON_ICON)
-    icon:setMinimumSize(api.gui.util.Size.new(52, 34))
-    icon:setMaximumSize(api.gui.util.Size.new(52, 34))
+    icon:setMinimumSize(api.gui.util.Size.new(34, 34))
+    icon:setMaximumSize(api.gui.util.Size.new(34, 34))
     local button = api.gui.comp.ToggleButton.new(icon)
     button:setTooltip(tr("Minimap (Big Maps)"))
     button:setStyleClassList({ "bigmapToolbarDisk" })
-    button:setMinimumSize(api.gui.util.Size.new(52, 34))
-    button:setMaximumSize(api.gui.util.Size.new(52, 34))
+    button:setMinimumSize(api.gui.util.Size.new(34, 34))
+    button:setMaximumSize(api.gui.util.Size.new(34, 34))
     layout:insertItem(button, 0)
     state.button = button
     state.window = buildWindow()

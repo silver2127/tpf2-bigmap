@@ -111,7 +111,8 @@ if /i "%1"=="-codec-bench" (
     exit /b
 )
 
-REM The minimap game script and its style sheet travel inside the DLL (src\minimap.h writes them out).
+REM The minimap game script, its style sheet and its button icon travel inside the DLL (src\minimap.h writes them out).
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\embed_bin.ps1 -In "mod\minimap\minimap_button@2x.tga" -Out out\minimap_icon.inc -Name kMinimapIcon || exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\embed_lua.ps1 -In mod\minimap\bigmap_minimap.lua -Out out\minimap_lua.inc -Name kMinimapLua || exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\embed_lua.ps1 -In mod\minimap\bigmap_minimap_style.lua -Out out\minimap_style_lua.inc -Name kMinimapStyleLua || exit /b 1
 REM So does the terrain buffer-reuse pass (src\generator_memory.h serves it to mod generators).
