@@ -65,6 +65,10 @@ style_text.argtypes = [C.c_char_p, C.c_uint64]
 style_text.restype = C.c_uint64
 sync_icon = dll.BigmapTestSyncMinimapIcon
 sync_icon.argtypes = [C.c_wchar_p, C.c_int]
+key_event = dll.BigmapTestMinimapKeyEvent
+key_event.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_uint32)]
+typing_in = dll.BigmapTestMinimapTypingIn
+typing_in.argtypes = [C.c_void_p, C.c_uint64]
 climate_colouring = dll.BigmapTestMinimapClimateColoring
 climate_colouring.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_char_p, C.c_uint64]
 install = dll.BigmapTestInstallMinimap
@@ -517,6 +521,95 @@ def check_script_sync(tmp):
     assert sync_icon(str(path), 1) == 0                                      # not in game_script: none
     print('PASS: button icon: embedded copy equals the TGA; written into its own folder, up to date, rewritten, '
           'removed with the folder when empty; another file in it is kept')
+
+
+# ---- the M key ----------------------------------------------------------------
+
+def check_key():
+    KEYDOWN, KEYUP, TEXT, MOTION = 0x300, 0x301, 0x303, 0x400
+    M, N = 16, 17
+
+    def event(kind, scancode=M, mod=0, repeat=0):
+        ev = (C.c_uint8 * 56)()
+        C.c_uint32.from_buffer(ev, 0).value = kind
+        ev[13] = repeat
+        C.c_int32.from_buffer(ev, 16).value = scancode
+        C.c_uint16.from_buffer(ev, 24).value = mod
+        return ev
+
+    count = C.c_uint32()
+
+    def feed(ev, typing=0):
+        return key_event(ev, typing, C.byref(count))
+
+    base = feed(event(MOTION))
+    start = count.value
+    assert base == 0
+    assert feed(event(KEYDOWN)) == 1 and count.value == start + 1                 # a press: taken, counted
+    assert feed(event(KEYDOWN, repeat=1)) == 1 and count.value == start + 1       # its repeat: taken, not counted
+    assert feed(event(KEYUP)) == 1                                                  # its release: taken
+    assert feed(event(KEYUP)) == 0                                                  # a stray release: the game's
+    assert feed(event(KEYDOWN), typing=1) == 0 and count.value == start + 1        # typing: the text field's
+    assert feed(event(KEYDOWN, repeat=1), typing=1) == 0
+    assert feed(event(KEYUP)) == 0                                                  # ...and so is its release
+    for mod in (0x1, 0x2, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800):                  # Shift/Ctrl/Alt/GUI: the game's
+        assert feed(event(KEYDOWN, mod=mod)) == 0, hex(mod)
+    assert feed(event(KEYDOWN, mod=0x1000 | 0x2000)) == 1 and count.value == start + 2   # Num/Caps lock: still M
+    assert feed(event(KEYUP)) == 1
+    assert feed(event(KEYDOWN, scancode=N)) == 0 and feed(event(TEXT)) == 0        # other keys and text: the game's
+
+    # The typing walk: focused component -> parents (+0x350) -> root; a visible
+    # CTextInputField (vtable compare) in editing mode (+0x74c) somewhere on the way.
+    VT = 0x7ff612345678
+    comps = []
+
+    def comp(vt=0x1111, visible=1, editing=0):
+        c = (C.c_uint8 * 0x800)()
+        C.c_uint64.from_buffer(c, 0).value = vt
+        c[0x8f] = visible
+        c[0x74c] = editing
+        comps.append(c)
+        return c
+
+    def link(child, parent):
+        C.c_uint64.from_buffer(child, 0x350).value = C.addressof(parent)
+
+    core = (C.c_uint8 * 0x300)()
+
+    def tree(focus, root):
+        C.c_uint64.from_buffer(core, 0x2e0).value = C.addressof(focus) if focus is not None else 0
+        C.c_uint64.from_buffer(core, 0x280).value = C.addressof(root)
+
+    root, window = comp(), comp()
+    link(window, root)
+    field = comp(vt=VT, editing=1)
+    link(field, window)
+    tree(field, root)
+    assert typing_in(core, VT) == 1                                  # the caret is blinking
+    field[0x74c] = 0
+    assert typing_in(core, VT) == 0                                  # focused, not editing: hotkeys work
+    field[0x74c] = 1
+    inner = comp()                                                   # focus on a part inside the field
+    link(inner, field)
+    tree(inner, root)
+    assert typing_in(core, VT) == 1
+    window[0x8f] = 0
+    assert typing_in(core, VT) == 0                                  # a hidden window's field
+    window[0x8f] = 1
+    button = comp()
+    link(button, window)
+    tree(button, root)
+    assert typing_in(core, VT) == 0                                  # a button has focus
+    orphan = comp(vt=VT, editing=1)
+    tree(orphan, root)
+    assert typing_in(core, VT) == 0                                  # not under the root
+    tree(None, root)
+    assert typing_in(core, VT) == 0 and typing_in(None, VT) == 0      # nothing focused, no core
+    C.c_uint64.from_buffer(core, 0x2e0).value = 0x10
+    assert typing_in(core, VT) == 1                                  # unreadable: leave M to the game
+    print('PASS: M key: a plain press toggles and is taken with its repeats and release; typing, Shift/Ctrl/Alt/GUI '
+          'and other keys go to the game; the typing walk follows focus to the root through visible parents and '
+          'needs an editing CTextInputField; an unreadable walk leaves the key to the game')
 
 
 # ---- the world's climate colouring ---------------------------------------------
@@ -1393,6 +1486,7 @@ def main():
     check_network(t)
     check_thunk()
     check_climate()
+    check_key()
     with tempfile.TemporaryDirectory() as td:
         check_script_sync(Path(td))
         check_installer(Path(td))

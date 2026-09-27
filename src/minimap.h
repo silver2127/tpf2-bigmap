@@ -978,6 +978,155 @@ static int SyncGameMinimapScript(bool want) {
     return rc;
 }
 
+// ---- the M key -------------------------------------------------------------
+// A plain M (no Shift/Ctrl/Alt/GUI) toggles the minimap, as a click on its
+// button would -- unless a text field is taking the key. The game's own M
+// (constructOpt1) is overridden: the press and its release are taken out of the
+// game's SDL event stream, through the exe's SDL_PollEvent import (the only
+// caller, platform::SdlBackend::Step 0x2474f10, on the main thread). The script
+// learns of a press through a counter in <game>\plugins\tpf2_bigmap_minimap_key.txt.
+//
+// "Typing" is the game's own rule (the CTextInputField key listener 0x2303470):
+// the focused component, or one of its parents, is a CTextInputField (one
+// vtable, no subclasses) in editing mode (+0x74c). From UI::g_core (0x4466d00,
+// set by SetGlobalCore 0x229b1e0): focused component at +0x2e0, root at +0x280,
+// parent at +0x350, visible byte at +0x8f on every level up to the root.
+static const uintptr_t kMinimapCoreRva = 0x4466d00, kMinimapTextFieldVtblRva = 0x38a1780,
+                       kMinimapTextFieldSlot0Rva = 0x2300f70;
+static const uint8_t kMinimapSetGlobalCoreBytes[32] = {0x48,0x83,0xec,0x28,0x48,0x83,0x3d,0x14,0xbb,0x1c,0x02,0x00,0x0f,0x95,0xc2,0x48,0x85,0xc9,0x0f,0x95,0xc0,0x3a,0xd0,0x74,0x0c,0x48,0x89,0x0d,0x00,0xbb,0x1c,0x02};
+static const uint8_t kMinimapHasFocusBytes[11] = {0x48,0x8b,0x41,0x18,0x48,0x8b,0x90,0xe0,0x02,0x00,0x00};
+static const uint8_t kMinimapStartEditingBytes[7] = {0xc6,0x81,0x4c,0x07,0x00,0x00,0x01};
+static const uint8_t kMinimapStopEditingBytes[7] = {0xc6,0x81,0x4c,0x07,0x00,0x00,0x00};
+static const uint8_t kMinimapTextKeyListenerBytes[24] = {0x40,0x57,0x48,0x83,0xec,0x30,0x48,0xc7,0x44,0x24,0x20,0xfe,0xff,0xff,0xff,0x48,0x89,0x5c,0x24,0x40,0x48,0x8b,0x79,0x08};
+
+typedef int (__cdecl* MinimapPollEventFn)(void* event);
+static MinimapPollEventFn g_minimapRealPollEvent = nullptr;
+static uintptr_t g_minimapBase = 0;
+static bool g_minimapKeyDown = false;       // an M press was taken; take its release too
+static unsigned g_minimapKeyCount = 0;
+static wchar_t g_minimapKeyFile[MAX_PATH] = L"";
+
+// Is a text field taking keys? `core` is *g_core; `textVtbl` CTextInputField's vtable.
+static bool MinimapTypingIn(const uint8_t* core, uintptr_t textVtbl) {
+    __try {
+        if (!core) return false;
+        const uint8_t* c = *reinterpret_cast<const uint8_t* const*>(core + 0x2e0);
+        const uint8_t* root = *reinterpret_cast<const uint8_t* const*>(core + 0x280);
+        const uint8_t* field = nullptr;
+        for (int depth = 0; c && depth < 128; ++depth, c = *reinterpret_cast<const uint8_t* const*>(c + 0x350)) {
+            if (!c[0x8f]) return false;   // hidden: the game moves focus off it before the key arrives
+            if (!field && *reinterpret_cast<const uintptr_t*>(c) == textVtbl) field = c;
+            if (c == root) return field && field[0x74c];
+        }
+        return false;   // not attached under the root
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;    // unreadable: leave the key to the game
+    }
+}
+
+static bool MinimapTyping() {
+    const uint8_t* core = *reinterpret_cast<const uint8_t* const*>(g_minimapBase + kMinimapCoreRva);
+    return MinimapTypingIn(core, g_minimapBase + kMinimapTextFieldVtblRva);
+}
+
+// SDL 2 event layout: +0 type; a key event's +13 repeat, +16 scancode, +24 mod.
+enum { MINIMAP_SDL_KEYDOWN = 0x300, MINIMAP_SDL_KEYUP = 0x301, MINIMAP_SDL_SCANCODE_M = 16,
+       MINIMAP_KMOD_BLOCK = 0x0003 | 0x00c0 | 0x0300 | 0x0c00 };   // Shift, Ctrl, Alt, GUI
+
+// Is this event ours to take? A new M press also counts. `typing` is asked only
+// for an M press, so every other event costs two compares.
+static bool MinimapKeyEvent(const uint8_t* ev, bool (*typing)()) {
+    const uint32_t type = *reinterpret_cast<const uint32_t*>(ev);
+    if (type != MINIMAP_SDL_KEYDOWN && type != MINIMAP_SDL_KEYUP) return false;
+    if (*reinterpret_cast<const int32_t*>(ev + 16) != MINIMAP_SDL_SCANCODE_M) return false;
+    if (type == MINIMAP_SDL_KEYUP) {
+        const bool ours = g_minimapKeyDown;
+        g_minimapKeyDown = false;
+        return ours;
+    }
+    if (ev[13]) return g_minimapKeyDown;   // auto-repeat: follows its press
+    if (*reinterpret_cast<const uint16_t*>(ev + 24) & MINIMAP_KMOD_BLOCK) return false;
+    if (typing()) return false;
+    g_minimapKeyDown = true;
+    ++g_minimapKeyCount;
+    return true;
+}
+
+static void MinimapWriteKeyCount() {
+    if (!g_minimapKeyFile[0]) return;
+    char text[16];
+    const int n = _snprintf_s(text, sizeof text, _TRUNCATE, "%u\n", g_minimapKeyCount);
+    if (n > 0) WriteWholeFile(g_minimapKeyFile, text, size_t(n));
+}
+
+static int __cdecl MinimapPollEventDetour(void* event) {
+    for (;;) {
+        const int rc = g_minimapRealPollEvent(event);
+        if (!rc || !event) return rc;
+        const unsigned before = g_minimapKeyCount;
+        if (!MinimapKeyEvent(static_cast<const uint8_t*>(event), MinimapTyping)) return rc;
+        if (g_minimapKeyCount != before) MinimapWriteKeyCount();
+        // taken: hand the game the next event instead
+    }
+}
+
+// The exe's import slot for `func` from `dll`, repointed at `repl`.
+static bool MinimapPatchImport(HMODULE mod, const char* dll, const char* func, void* repl, void** orig) {
+    uint8_t* base = reinterpret_cast<uint8_t*>(mod);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+    for (auto imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp) {
+        if (_stricmp(reinterpret_cast<const char*>(base + imp->Name), dll) != 0 || !imp->OriginalFirstThunk) continue;
+        auto names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->OriginalFirstThunk);
+        auto slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+            const auto byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+            if (strcmp(reinterpret_cast<const char*>(byName->Name), func) != 0) continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return false;
+            *orig = reinterpret_cast<void*>(slots->u1.Function);
+            InterlockedExchangePointer(reinterpret_cast<PVOID*>(&slots->u1.Function), repl);
+            VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool MinimapInstallKey(uintptr_t base, const wchar_t* gameDir) {
+    static const struct { uintptr_t rva; const uint8_t* bytes; uint32_t len; } sites[] = {
+        { 0x229b1e0, kMinimapSetGlobalCoreBytes, sizeof kMinimapSetGlobalCoreBytes },
+        { 0x227ba00, kMinimapHasFocusBytes, sizeof kMinimapHasFocusBytes },
+        { 0x2302ea5, kMinimapStartEditingBytes, sizeof kMinimapStartEditingBytes },
+        { 0x2302f5d, kMinimapStopEditingBytes, sizeof kMinimapStopEditingBytes },
+        { 0x2303470, kMinimapTextKeyListenerBytes, sizeof kMinimapTextKeyListenerBytes },
+    };
+    for (const auto& s : sites)
+        if (!H->verifyBytes(s.rva, s.bytes, s.len)) { H->log("minimap: M key sites do not verify -- no M key"); return false; }
+    // the vtable's first slot, relocated: CTextInputField's own
+    if (*reinterpret_cast<const uintptr_t*>(base + kMinimapTextFieldVtblRva) != base + kMinimapTextFieldSlot0Rva) {
+        H->log("minimap: CTextInputField vtable does not verify -- no M key");
+        return false;
+    }
+    g_minimapBase = base;
+    if (_snwprintf_s(g_minimapKeyFile, MAX_PATH, _TRUNCATE, L"%s\\plugins\\tpf2_bigmap_minimap_key.txt", gameDir) < 0)
+        return false;
+    MinimapWriteKeyCount();   // the script's baseline
+    if (!MinimapPatchImport(GetModuleHandleW(nullptr), "SDL2.dll", "SDL_PollEvent",
+                            reinterpret_cast<void*>(&MinimapPollEventDetour),
+                            reinterpret_cast<void**>(&g_minimapRealPollEvent))) {
+        H->log("minimap: the game imports no SDL2!SDL_PollEvent -- no M key");
+        return false;
+    }
+    H->log("minimap: M opens the minimap (not while typing; replaces the game's M)");
+    return true;
+}
+
 // ---- install --------------------------------------------------------------
 static const uint8_t kMinimapSetImagePathBytes[20] = {0x40,0x53,0x56,0x57,0x48,0x81,0xec,0x90,0x00,0x00,0x00,0x48,0xc7,0x44,0x24,0x20,0xfe,0xff,0xff,0xff};
 static const uint8_t kMinimapCreateMenuBytes[20] = {0x40,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8d,0xac,0x24,0xc0,0xfa,0xff,0xff};
@@ -1062,6 +1211,16 @@ static bool InstallMinimap() {
     const int rc = SyncGameMinimapScript(true);
     const bool ok = rc == MINIMAP_SCRIPT_WRITTEN || rc == MINIMAP_SCRIPT_ALREADY;
     H->log("minimap: %s -- the map button is on the main toolbar in game", ok ? "enabled" : "hooks installed but no script");
+    // The M key, in the real game only (a test's script path has no game beside it).
+    if (ok && !g_minimapScriptPathOverride[0] && H->cfgBool("tpf2_bigmap", "minimap_key", 1)) {
+        wchar_t dir[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, dir, MAX_PATH);
+        wchar_t* slash = (n && n < MAX_PATH) ? wcsrchr(dir, L'\\') : nullptr;
+        if (slash) {
+            *slash = 0;
+            MinimapInstallKey(base, dir);
+        }
+    }
     return ok;
 }
 
@@ -1143,6 +1302,20 @@ void* BigmapTestMinimapCaptureThunk(void** slot, void** trampoline) {
 }
 extern "C" __declspec(dllexport)
 int BigmapTestSyncMinimapScript(const wchar_t* path, int want) { return SyncMinimapScript(path, want != 0); }
+static int g_minimapTestTyping = 0;
+static bool MinimapTestTyping() { return g_minimapTestTyping != 0; }
+// One event through the M-key filter. Returns 1 when taken; *count = presses so far.
+extern "C" __declspec(dllexport)
+int BigmapTestMinimapKeyEvent(const void* ev, int typing, uint32_t* count) {
+    g_minimapTestTyping = typing;
+    const int taken = MinimapKeyEvent(static_cast<const uint8_t*>(ev), MinimapTestTyping) ? 1 : 0;
+    *count = g_minimapKeyCount;
+    return taken;
+}
+extern "C" __declspec(dllexport)
+int BigmapTestMinimapTypingIn(const void* core, uint64_t textVtbl) {
+    return MinimapTypingIn(static_cast<const uint8_t*>(core), uintptr_t(textVtbl)) ? 1 : 0;
+}
 // out: levels, then 16 x {height, r, g, b}, then water0, water1, ambient, sun (3 each)
 extern "C" __declspec(dllexport)
 int BigmapTestMinimapClimateColoring(const void* gameUI, float* out, char* name, uint64_t nameCap) {
