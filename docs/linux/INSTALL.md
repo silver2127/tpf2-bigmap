@@ -47,7 +47,10 @@ not eliminate the peak memory needed while loading or generating a world.
   PORT.md, "Octree depth 12/13". `max_tiles` may then exceed 512, but the
   diagonal bound above still limits the Linux menu to about 720-tile edges.
 
-Material compression, terrain copy sharing, generation buffer reuse and the
+Fantasia generation buffer reuse is now provided by `generator_memory=1`
+without a separate mod; see [current evidence](PORT.md#fantasia-plugin-routing--dev-6584fd03).
+
+Material compression, terrain copy sharing and the
 remaining renderer optimizations are not ported in this build. Do not copy the
 Windows configuration file wholesale. See PORT.md for evidence and validation limits.
 

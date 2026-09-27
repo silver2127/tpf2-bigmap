@@ -53,6 +53,10 @@ allocations and scheduling affect that peak.
 
 ## Fantasia Map Generator
 
+Native Linux uses a byte-verified `fopen` PLT route and anonymous temporary
+streams. See [Linux evidence and live limits](../../docs/re/linux/DEV_6584FD03.md).
+The PE import and `%TEMP%` details below describe Windows.
+
 The Fantasia Map Generator workshop mod (2916150031) builds its pipeline with
 the stock `layersutil` temporaries, but no pass runs over it, and it is far
 larger. The game MEASURED 59-63 maps (15.8-16.9 GB) at 128 x 128 tiles

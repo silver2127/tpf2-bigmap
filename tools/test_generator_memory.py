@@ -3,12 +3,16 @@
 Requires out/tpf2_bigmap.dll (build.bat), lupa.lua52 and the Fantasia workshop
 mod (2916150031), which is only read. For each Fantasia generator the DLL's
 patched text is run like the game runs it and compared with the original:
-identical pipeline up to 32 x 32 km, and at 40 km the symbolic replay of
+identical pipeline at 128 x 128 tiles, and at 130, 160 and 192 tiles the symbolic replay of
 test_generation_memory.verify with the buffer count down to the lower bound.
+On Linux pass --native-library (libtest_generator_text.so), --fantasia-res
+and --game-res; native CTest covers stream routing and installation guards.
+
 Also checks which paths are redirected, that every original line keeps its
 number, refusal of a missing or repeated anchor, and the %TEMP% copy.
 """
 import ctypes as C
+import argparse
 from pathlib import Path
 from lupa.lua52 import LuaRuntime
 import test_generation_memory as t
@@ -77,6 +81,19 @@ def generate(text, tiles):
 
 
 def main():
+    global FANTASIA
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--fantasia-res', type=Path, default=FANTASIA)
+    ap.add_argument('--game-res', type=Path, default=t.RES)
+    ap.add_argument('--native-library', type=Path)
+    args = ap.parse_args()
+    FANTASIA, t.RES = args.fantasia_res, args.game_res
+    if args.native_library:
+        dll = C.CDLL(str(args.native_library.resolve()))
+        dll.BigmapTestGeneratorPatch = dll.TestPatch
+        dll.TestPatch.argtypes = [C.c_char_p, C.c_size_t, C.c_char_p, C.c_size_t, C.c_ulonglong]
+        dll.TestPatch.restype = C.c_longlong
+        return check_generators(dll)
     dll = load_dll()
     gens = r'\res\config\terrain_generators' + '\\'
     ws = r'C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\2916150031'
@@ -94,6 +111,73 @@ def main():
     assert patch(dll, b'x\t\treturn result\n') is None
     print('PASS: path matching and anchor refusal')
 
+    if not check_generators(dll):
+        return
+
+    alt = C.create_unicode_buffer(260)
+    path = str(FANTASIA / 'config/terrain_generators' / FILES[0])
+    assert dll.BigmapTestGeneratorRedirect(path, alt, 260)
+    served = Path(alt.value)
+    assert served.name == FILES[0] and served.parent.name == 'tpf2_bigmap'
+    body, last = served.read_bytes().rsplit(b"\n", 2)[:2]
+    assert body == patch(dll, Path(path).read_bytes()).rsplit(b"\n", 2)[0]
+    assert last.startswith(b"_tpf2_bigmap_budget = ") and int(last.split(b"= ")[1]) > 0, last
+    assert dll.BigmapTestGeneratorRedirect(path, alt, 260)   # unchanged copy: served again
+    assert not dll.BigmapTestGeneratorRedirect(str(t.RES / 'config/terrain_generators/temperate.gen.lua'), alt, 260)
+    print(f'PASS: generator memory (redirect copy {served})')
+
+
+def check_diagnostics(dll):
+    # Exercise the actual embedded helper even without Workshop resources.
+    src = b"function run(result, params)\n\t\treturn result\nend\n"
+    lines = []
+    L = LuaRuntime(unpack_returned_tuples=True)
+    L.globals().print = lambda *a: lines.append(' '.join(str(x) for x in a))
+    L.execute(patch(dll, src).decode('utf-8'))
+    L.execute("""
+        r = {layers={{type="FUTURE", params={type="NEW", output="a"}}}}
+        assert(run(r, {mapSizeX=12289, mapSizeY=12289}) == r)
+        assert(r.layers[1].params.output == "a")
+    """)
+    assert lines == [
+        '[tpf2_bigmap] generator memory: 12289 x 12289 samples (192 x 192 tiles), 1 layers over 1 buffer names',
+        '[tpf2_bigmap] terrain memory: layer 1 of 1 (FUTURE NEW) is not a known op; pipeline left unchanged'], lines
+    lines.clear()
+    L.execute("assert(run(r, {mapSizeX=8193, mapSizeY=8193}) == r)")
+    assert lines == ['[tpf2_bigmap] generator memory: 8193 x 8193 samples (128 x 128 tiles), 1 layers over 1 buffer names (32 x 32 km or less: unchanged)'], lines
+    lines.clear()
+    L.execute("assert(run(r, nil) == r)")
+    assert lines == ['[tpf2_bigmap] generator memory: 0 x 0 samples (-0 x -0 tiles), 1 layers over 1 buffer names (32 x 32 km or less: unchanged)'], lines
+    # Spy on the optimizer to check the exact area gate independently of its
+    # conservative refusal of the unknown operation above, including rectangles.
+    L.execute("""
+        local calls = 0
+        _tpf2_bigmap_memory.Optimize = function(result)
+            calls = calls + 1
+            return result
+        end
+        for _, dims in ipairs({{8192,8193,0}, {8193,8193,0}, {8193,8194,1},
+                               {8194,8193,1}, {4096,16384,0}, {4097,16385,1}}) do
+            local before = calls
+            assert(run(r, {mapSizeX=dims[1], mapSizeY=dims[2]}) == r)
+            assert(calls == before + dims[3])
+        end
+    """)
+    # Budget reaches Optimize as a float-buffer count; small maps still bypass it.
+    for budget, expected in ((0, None), (1, 0), (30 * 12289**2 * 4, 30)):
+        L.execute(patch(dll, src, budget).decode('utf-8'))
+        seen = []
+        L.globals()._tpf2_bigmap_memory.Optimize = lambda result, cap: (seen.append(cap) or result)
+        L.execute("run(r, {mapSizeX=12289, mapSizeY=12289})")
+        assert seen == [expected], (budget, seen)
+        seen.clear()
+        L.execute("run(r, {mapSizeX=8193, mapSizeY=8193})")
+        assert not seen
+    print('PASS: embedded diagnostics, unknown-op refusal, sample-area boundary, rectangles and absent dimensions')
+
+
+def check_generators(dll):
+    check_diagnostics(dll)
     if not FANTASIA.is_dir():
         print(f'SKIP: Fantasia Map Generator not found at {FANTASIA}')
         return
@@ -129,19 +213,8 @@ def main():
         same, lines = generate(out, 128)
         assert same == small and len(lines) == 1 and lines[0].endswith('(32 x 32 km or less: unchanged)'), (name, lines)
         print(f'{name:<42} tiles {", ".join(report)} named buffers; 128: unchanged')
+    return True
 
-    alt = C.create_unicode_buffer(260)
-    path = str(FANTASIA / 'config/terrain_generators' / FILES[0])
-    assert dll.BigmapTestGeneratorRedirect(path, alt, 260)
-    served = Path(alt.value)
-    assert served.name == FILES[0] and served.parent.name == 'tpf2_bigmap'
-    # The last line carries the live memory budget.
-    body, last = served.read_bytes().rsplit(b'\n', 2)[0], served.read_bytes().rsplit(b'\n', 2)[1]
-    assert body == patch(dll, Path(path).read_bytes()).rsplit(b'\n', 2)[0]
-    assert last.startswith(b'_tpf2_bigmap_budget = ') and int(last.split(b'= ')[1]) > 0, last
-    assert dll.BigmapTestGeneratorRedirect(path, alt, 260)   # unchanged copy: served again
-    assert not dll.BigmapTestGeneratorRedirect(str(t.RES / 'config/terrain_generators/temperate.gen.lua'), alt, 260)
-    print(f'PASS: generator memory (redirect copy {served})')
 
 
 if __name__ == '__main__':
