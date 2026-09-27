@@ -55,10 +55,14 @@ allocations and scheduling affect that peak.
 
 The Fantasia Map Generator workshop mod (2916150031) builds its pipeline with
 the stock `layersutil` temporaries, but no pass runs over it, and it is far
-larger: about 16,800 layers over 224 temporary names at 32 x 32 km and 25,800
-over 325 at 40 km. The game MEASURED 59-63 maps (15.8-16.9 GB) at 32 km and 53
-maps (22.2 GB) at 40 km, where it died with `std::bad_alloc` on a machine with
-no page file.
+larger. The game MEASURED 59-63 maps (15.8-16.9 GB) at 128 x 128 tiles
+(32 x 32 km) and 52-63 maps (22-38 GB) at 160 and 192 tiles, where it died
+with `std::bad_alloc` on a machine with no page file. At 192 x 192 tiles the
+game logged 3120 layers over 77 buffer names.
+
+The game passes a generator `mapSizeX`/`mapSizeY` in heightmap samples,
+`64 * tiles + 1` (MEASURED 12289 at 192 tiles), not in metres, so 32 x 32 km
+is 8193 x 8193.
 
 The plugin handles it with no extra mod (`src/generator_memory.h`,
 `generator_memory=1`, on by default). The exe's file-open imports
@@ -66,21 +70,24 @@ The plugin handles it with no extra mod (`src/generator_memory.h`,
 import directory and pointed at detours. A read-only open of
 `fantasia_map_generator.gen.lua`, `_dry` or `_tropical` in any
 `res\config\terrain_generators` folder is served from a patched copy in
-`%TEMP%\tpf2_bigmap`. The one line `\t\treturn result` becomes "Optimize when
-mapSizeX * mapSizeY > 32768^2, then return result", and `bigmap_memory.lua`
-(embedded by `build.bat`) is appended after the last line, so every line
-number is kept. Maps up to 32 x 32 km (128 x 128 tiles) run Fantasia exactly
-as shipped. A file whose anchor is missing or repeated is served unchanged.
-Fantasia's files on disk are never written. The host log says which files
-were served (`generator memory: ... served with buffer reuse`), and the game
-log shows `[tpf2_bigmap] terrain memory: N -> 10 named buffers` per
-generation above 32 x 32 km.
+`%TEMP%\tpf2_bigmap`. The one line `\t\treturn result` becomes
+`return _tpf2_bigmap_generate(result, params)`; `bigmap_memory.lua`
+(embedded by `build.bat`) and that helper are appended after the last line,
+so every line number is kept. The helper logs
+`[tpf2_bigmap] generator memory: <samples> (<tiles>), N layers over M buffer names`
+and runs the pass when the map is over 8193 x 8193 samples. Maps up to
+32 x 32 km (128 x 128 tiles) run Fantasia exactly as shipped. A file whose
+anchor is missing or repeated is served unchanged. Fantasia's files on disk
+are never written. The host log says which files were served
+(`generator memory: ... served with buffer reuse`). If the pass leaves a
+pipeline alone, it logs why (an unknown op or a pinned name).
 
-All three Fantasia climates go from 325-328 names to 10 at 40 km, which is the
-lower bound. `tools/test_generator_memory.py` runs the DLL's patched text
-against the original: identical pipeline at 32 km, symbolic replay at 40 km,
-path matching, line numbers, anchor refusal and the `%TEMP%` copy. Sharing
-names serialises layers, so generation may take longer.
+All three Fantasia climates go to 10 names, which is the lower bound: 57-60 at
+130 tiles, 62-65 at 160 and 70-73 at 192. `tools/test_generator_memory.py`
+runs the DLL's patched text against the original: identical pipeline at 128
+tiles, symbolic replay at 130, 160 and 192, path matching, line numbers,
+anchor refusal and the `%TEMP%` copy. Sharing names serialises layers, so
+generation may take longer.
 
 ## Checks and remaining validation
 
