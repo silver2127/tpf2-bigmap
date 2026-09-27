@@ -123,6 +123,8 @@ def main():
     assert body == patch(dll, Path(path).read_bytes()).rsplit(b"\n", 2)[0]
     assert last.startswith(b"_tpf2_bigmap_budget = ") and int(last.split(b"= ")[1]) > 0, last
     assert dll.BigmapTestGeneratorRedirect(path, alt, 260)   # unchanged copy: served again
+    # the copy reads as the original to a time check through its handle
+    assert served.stat().st_mtime_ns == Path(path).stat().st_mtime_ns, (served.stat().st_mtime_ns, Path(path).stat().st_mtime_ns)
     assert not dll.BigmapTestGeneratorRedirect(str(t.RES / 'config/terrain_generators/temperate.gen.lua'), alt, 260)
     print(f'PASS: generator memory (redirect copy {served})')
 
