@@ -105,7 +105,12 @@ function M.Optimize(result)
     for i = 1, n do
         local layer = layers[i]
         local spec = specFor(layer)
-        if not spec then return result end -- unknown schema: leave it all alone
+        if not spec then -- unknown schema: leave it all alone
+            local p = type(layer) == "table" and layer.params
+            print(string.format("[tpf2_bigmap] terrain memory: layer %d of %d (%s %s) is not a known op; pipeline left unchanged",
+                i, n, tostring(type(layer) == "table" and layer.type), tostring(type(p) == "table" and p.type)))
+            return result
+        end
         specs[i] = spec
         for k, v in pairs(layer) do if k ~= "params" then pin(v) end end
         for k, v in pairs(layer.params) do if not NAME_KEYS[k] then pin(v) end end
@@ -249,7 +254,10 @@ function M.Optimize(result)
         if not names[name] then names[name] = true; after = after + 1 end
     end
     for _, v in pairs(current) do
-        if pinned[v.name] and holder[v.name] ~= v then return result end
+        if pinned[v.name] and holder[v.name] ~= v then
+            print("[tpf2_bigmap] terrain memory: pinned name " .. tostring(v.name) .. " would lose its final value; pipeline left unchanged")
+            return result
+        end
     end
     if after >= before then return result end
 

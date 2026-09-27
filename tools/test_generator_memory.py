@@ -89,11 +89,13 @@ def main():
         before, _ = generate(src, 40)
         after, lines = generate(out, 40)
         x, y = t.verify(before, after)
-        assert lines == [f'[tpf2_bigmap] terrain memory: {x} -> {y} named buffers'], lines
+        n = len(t.indices(before['layers']))
+        assert lines == [f'[tpf2_bigmap] generator memory: 40960 x 40960 m, {n} layers over {x} buffer names',
+                         f'[tpf2_bigmap] terrain memory: {x} -> {y} named buffers'], lines
         assert y == t.lower_bound(before) and y <= 12, (y, t.lower_bound(before))
         small, _ = generate(src, 32)
         same, lines = generate(out, 32)
-        assert same == small and lines == [], (name, lines)
+        assert same == small and len(lines) == 1 and lines[0].endswith('(32 x 32 km or less: unchanged)'), (name, lines)
         print(f'{name:<42} 40 km: {x} -> {y} named buffers; 32 km: unchanged')
 
     alt = C.create_unicode_buffer(260)
