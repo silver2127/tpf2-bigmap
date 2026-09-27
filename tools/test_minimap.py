@@ -22,6 +22,7 @@ from test_world_entry import Host, logtype, basetype, verifytype, hooktype
 ROOT = Path(__file__).resolve().parents[1]
 EXE = r'C:\tools\bin\TransportFever2.exe'
 SCRIPT = ROOT / 'mod/minimap/bigmap_minimap.lua'
+STYLE = ROOT / 'mod/minimap/bigmap_minimap_style.lua'
 MARKER = b'-- tpf2_bigmap minimap'
 
 
@@ -56,6 +57,11 @@ sync_script.argtypes = [C.c_wchar_p, C.c_int]
 script_text = dll.BigmapTestMinimapScriptText
 script_text.argtypes = [C.c_char_p, C.c_uint64]
 script_text.restype = C.c_uint64
+sync_style = dll.BigmapTestSyncMinimapStyle
+sync_style.argtypes = [C.c_wchar_p, C.c_int]
+style_text = dll.BigmapTestMinimapStyleText
+style_text.argtypes = [C.c_char_p, C.c_uint64]
+style_text.restype = C.c_uint64
 install = dll.BigmapTestInstallMinimap
 install.argtypes = [C.POINTER(Host), C.c_int, C.c_int, C.c_wchar_p]
 
@@ -467,6 +473,27 @@ def check_script_sync(tmp):
     print('PASS: game script: embedded copy equals the source; written, up to date, rewritten, removed, absent; '
           'a foreign file is never touched')
 
+    # The button's style sheet: beside a script in a game_script folder, nowhere else.
+    ssrc = STYLE.read_bytes().replace(b'\r\n', b'\n')
+    cap = style_text(None, 0)
+    buf = C.create_string_buffer(cap + 1)
+    assert style_text(buf, cap + 1) == len(ssrc) and buf.raw[:cap] == ssrc, 'embedded style sheet differs from the source'
+    assert ssrc.startswith(MARKER) and b'bigmapToolbarDisk' in ssrc
+    config = tmp / 'res' / 'config'
+    (config / 'game_script').mkdir(parents=True)
+    (config / 'style_sheet').mkdir()
+    script = config / 'game_script' / 'bigmap_minimap.lua'
+    style = config / 'style_sheet' / 'bigmap_minimap.lua'
+    assert sync_style(str(script), 1) == 3 and style.read_bytes() == ssrc     # written
+    assert sync_style(str(script), 1) == 2                                    # up to date
+    assert sync_style(str(script), 0) == 1 and not style.exists()             # removed
+    style.write_bytes(b'-- somebody else\n')
+    assert sync_style(str(script), 1) == 4 and style.read_bytes() == b'-- somebody else\n'
+    style.unlink()
+    assert sync_style(str(path), 1) == 0 and not (tmp / 'style_sheet').exists()   # not in game_script: none
+    print('PASS: style sheet: embedded copy equals the source; written beside game_script, up to date, removed; '
+          'a foreign file is never touched; no game_script folder, no style sheet')
+
 
 # ---- installer --------------------------------------------------------------
 
@@ -662,6 +689,7 @@ end
 function Comp:setMinimumSize(s) self.minSize = { w = s.w, h = s.h } end
 function Comp:setMaximumSize(s) self.maxSize = { w = s.w, h = s.h } end
 function Comp:setTooltip(t) self.tooltip = t end
+function Comp:setStyleClassList(l) self.styleClasses = l end
 function Comp:insertMouseListener(f) table.insert(self.listeners, f) end
 function Comp:setImage(p, b) self.image = p; IMAGES[#IMAGES + 1] = p end
 function Comp:setText(t) self.text = t end
@@ -930,6 +958,7 @@ end
 script.guiInit()
 local button = toolbar.items[1]
 assert(button and button.kind == "ToggleButton", "button inserted at the front of the toolbar")
+assert(button.styleClasses and button.styleClasses[1] == "bigmapToolbarDisk", "button in the game's round disk")
 R.buttonIcon = button.arg.arg
 script.guiUpdate()
 assert(#toolbar.items == 1, "button added once")
