@@ -113,6 +113,8 @@ if /i "%1"=="-codec-bench" (
 
 REM The minimap game script travels inside the DLL (src\minimap.h writes it out).
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\embed_lua.ps1 -In mod\minimap\bigmap_minimap.lua -Out out\minimap_lua.inc -Name kMinimapLua || exit /b 1
+REM So does the terrain buffer-reuse pass (src\generator_memory.h serves it to mod generators).
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\embed_lua.ps1 -In mod\generation\bigmap_memory.lua -Out out\generator_memory_lua.inc -Name kGeneratorMemoryLua || exit /b 1
 cl /nologo /O2 /MT /W3 /EHsc /c src\bigmap.cpp /Fo:out\bigmap.obj || exit /b 1
 link /nologo /DLL /MAP:out\tpf2_bigmap.map /OUT:out\tpf2_bigmap.dll out\bigmap.obj          || exit /b 1
 echo BUILD BIGMAP OK

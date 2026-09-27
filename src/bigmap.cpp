@@ -894,6 +894,7 @@ static bool WriteWholeFile(const wchar_t* path, const char* data, size_t len)
 // The in-game minimap: native terrain texture behind a Lua ImageView. Uses
 // ReadWholeFile / WriteWholeFile above for its game script.
 #include "minimap.h"
+#include "generator_memory.h"
 
 // The stock text with the inserts, malloc'd; nullptr (and `why`) when an anchor
 // is missing, repeated or out of order.
@@ -1283,6 +1284,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_cargoPathTime = H->cfgInt("tpf2_bigmap", "cargo_path_time_s", 0);
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
     g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 1) != 0;
+    g_generatorMemory = H->cfgBool("tpf2_bigmap", "generator_memory", 1) != 0;
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;
@@ -1399,6 +1401,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallSidecarIo();
     installed += InstallInstanceShrink();
     installed += InstallMinimap();
+    installed += InstallGeneratorMemory();
 
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {
