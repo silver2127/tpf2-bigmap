@@ -51,6 +51,29 @@ bytes (11.90 GiB). This is an expected reduction in named terrain storage,
 not a measured reduction of the entire process peak. Additional scratch
 allocations and scheduling affect that peak.
 
+## Fantasia Map Generator (low memory)
+
+The Fantasia Map Generator workshop mod (2916150031) builds its pipeline with
+the stock `layersutil` temporaries, but no pass runs over it, and it is far
+larger: about 16,800 layers over 224 temporary names at 32 x 32 km. The game
+MEASURED 59-63 maps (15.8-16.9 GB) at 32 km and 53 maps (22.2 GB) at 40 km,
+where it died with `std::bad_alloc` on a machine with no page file.
+
+`python tools/install_fantasia_low_memory.py` installs
+`mod/generation/fantasia_low_memory` as the local mod
+`mods/tpf2_bigmap_fantasia_low_memory_1`, with a copy of `bigmap_memory.lua`.
+Enable it next to Fantasia and choose a "(low memory)" generator. Each variant
+finds Fantasia's `res/` folder through `package.searchpath` on its
+`terrain/fmg_mapgenutil` module, runs Fantasia's own gen file in a private
+environment, and passes the result through the same pass. Fantasia's files are
+never copied or edited. Without Fantasia active, the variant is still listed
+but refuses to generate. `--remove` uninstalls it.
+
+All three Fantasia climates go from 224-227 names to 10, which is the lower
+bound. `tools/test_fantasia_low_memory.py` checks name, climate, params and the
+symbolic replay against the original at 32 km. Sharing names serialises
+layers, so generation may take longer.
+
 ## Checks and remaining validation
 
 `tools/test_placement_distance.py` exercises installer refusal paths and runs
