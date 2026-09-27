@@ -73,8 +73,23 @@ static int GeneratorFileIndex(const wchar_t* path) {
 static SRWLOCK g_genLock = SRWLOCK_INIT;
 static volatile LONG g_genServed[_countof(kGeneratorFiles)];
 
-// The patched copy of `path` in %TEMP%\tpf2_bigmap, written when it differs.
-// False (serve the original) on any failure.
+// The copy carries the original's creation and write times. The game checks
+// whether a generator changed through both its path and an open handle; a copy
+// with its own times (written at every start) read as a generator that changed
+// at every check, and the New Game preview threw its map away and generated it
+// again, endlessly, on every generator and size (2026-09-27, 0.7.0.7 and 0.7.1).
+static void GeneratorCopyTimes(const wchar_t* from, const wchar_t* to) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(from, GetFileExInfoStandard, &a)) return;
+    HANDLE h = CreateFileW(to, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);   // the plugin's own import, not the exe's
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFileTime(h, &a.ftCreationTime, nullptr, &a.ftLastWriteTime);
+    CloseHandle(h);
+}
+
+// The patched copy of `path` in %TEMP%\tpf2_bigmap, written when it differs, with
+// the original's times. False (serve the original) on any failure.
 static bool GeneratorRedirect(const wchar_t* path, wchar_t* out, size_t cch) {
     int i = GeneratorFileIndex(path);
     if (i < 0 || !g_generatorMemory) return false;
@@ -92,6 +107,7 @@ static bool GeneratorRedirect(const wchar_t* path, wchar_t* out, size_t cch) {
     if (ReadWholeFile(path, &src, &srcLen) && (patched = PatchGeneratorText(src, srcLen, &patchedLen, GeneratorBudgetBytes()))) {
         bool same = ReadWholeFile(out, &cur, &curLen) && curLen == patchedLen && memcmp(cur, patched, curLen) == 0;
         ok = same || WriteWholeFile(out, patched, patchedLen);
+        if (ok) GeneratorCopyTimes(path, out);
     }
     ReleaseSRWLockExclusive(&g_genLock);
     if (H && InterlockedExchange(&g_genServed[i], 1) == 0) {
@@ -113,10 +129,13 @@ static WfopenFn g_origWfopen;
 static FopenFn g_origFopen;
 static FiopenFn g_origFiopen;
 
+// Only an open that reads the file's bytes is served the copy: one that asks only
+// for its attributes or times sees the original, as every path-based query does.
 static HANDLE WINAPI GenCreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa,
                                     DWORD disposition, DWORD flags, HANDLE tmpl) {
     wchar_t alt[MAX_PATH];
-    if (!(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) &&
+    if ((access & (GENERIC_READ | FILE_READ_DATA)) &&
+        !(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) &&
         disposition == OPEN_EXISTING && GeneratorRedirect(path, alt, MAX_PATH))
         path = alt;
     return g_origCreateFileW(path, access, share, sa, disposition, flags, tmpl);
