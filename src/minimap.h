@@ -313,25 +313,47 @@ static MinimapRgb MinimapLerp(const MinimapRgb& a, const MinimapRgb& b, float t)
 }
 static MinimapRgb MinimapColour(int r, int g, int b) { return { r / 255.0f, g / 255.0f, b / 255.0f }; }
 
-// The engine's default PreviewColoring (0x36d810), which temperate uses.
-static MinimapRgb MinimapRamp(float h) {
-    static const float heights[3] = { 0.0f, 100.0f, 550.0f };
-    static const MinimapRgb colours[3] = { MinimapColour(93, 112, 66), MinimapColour(64, 78, 50),
-                                           MinimapColour(242, 235, 220) };
-    if (!(h > heights[0])) return colours[0];
-    if (h >= heights[2]) return colours[2];
-    const int i = h < heights[1] ? 0 : 1;
-    return MinimapLerp(colours[i], colours[i + 1], (h - heights[i]) / (heights[i + 1] - heights[i]));
+// A climate's map colouring (terrain::PreviewColoring, the clima.lua mapColoring):
+// a height ramp of up to 16 levels, the water depth ramp, and the light colours.
+// The defaults are the engine's own (0x36d810); a climate overrides them
+// (MinimapClimateColoring).
+struct MinimapColoring {
+    int levels;
+    float height[16];
+    MinimapRgb colour[16];
+    MinimapRgb water0, water1, ambient, sun;
+};
+static MinimapColoring MinimapDefaultColoring() {
+    MinimapColoring c{};
+    c.levels = 3;
+    c.height[0] = 0.0f;   c.colour[0] = MinimapColour(93, 112, 66);
+    c.height[1] = 100.0f; c.colour[1] = MinimapColour(64, 78, 50);
+    c.height[2] = 550.0f; c.colour[2] = MinimapColour(242, 235, 220);
+    c.water0 = MinimapColour(100, 135, 158);
+    c.water1 = MinimapColour(60, 80, 91);
+    c.ambient = MinimapColour(204, 230, 255);
+    c.sun = MinimapColour(255, 255, 204);
+    return c;
+}
+
+// The height ramp, as the levels colour function (0x63e1d0): clamped at both
+// ends, linear between levels.
+static MinimapRgb MinimapRamp(const MinimapColoring& pc, float h) {
+    if (pc.levels <= 1 || !(h > pc.height[0])) return pc.colour[0];
+    if (h >= pc.height[pc.levels - 1]) return pc.colour[pc.levels - 1];
+    int i = 0;
+    while (i + 2 < pc.levels && h >= pc.height[i + 1]) ++i;
+    const float span = pc.height[i + 1] - pc.height[i];
+    return MinimapLerp(pc.colour[i], pc.colour[i + 1], span > 0 ? (h - pc.height[i]) / span : 1.0f);
 }
 
 static uint8_t MinimapByte(float v) {
     return uint8_t(v <= 0 ? 0 : v >= 1 ? 255 : int(v * 255.0f + 0.5f));
 }
 
-static void MinimapShadeRows(const MinimapTerrain& m, const MinimapRequest& r, const float* hts,
-                             uint8_t* rgba, int row0, int row1) {
-    static const MinimapRgb water0 = MinimapColour(100, 135, 158), water1 = MinimapColour(60, 80, 91);
-    static const MinimapRgb ambientC = MinimapColour(204, 230, 255), sunC = MinimapColour(255, 255, 204);
+static void MinimapShadeRows(const MinimapTerrain& m, const MinimapRequest& r, const MinimapColoring& pc,
+                             const float* hts, uint8_t* rgba, int row0, int row1) {
+    const MinimapRgb& water0 = pc.water0, & water1 = pc.water1, & ambientC = pc.ambient, & sunC = pc.sun;
     static const MinimapRgb outside = MinimapColour(26, 28, 32);
     // 24 hemisphere directions: 3 rings at theta = (i+0.5)/3 * pi/2 from the
     // zenith, 8 azimuths each (as 0x63aa90).
@@ -372,7 +394,7 @@ static void MinimapShadeRows(const MinimapTerrain& m, const MinimapRequest& r, c
                 for (int i = 0; i < 24; ++i)
                     amb += (std::max)(0.0, nx * dirs[i][0] + ny * dirs[i][1] + nz * dirs[i][2]);
                 amb /= 3 + dirZ;
-                const MinimapRgb base = MinimapRamp(h);
+                const MinimapRgb base = MinimapRamp(pc, h);
                 c = { float(base.r * (amb * ambientC.r + sun * sunC.r) * 0.5),
                       float(base.g * (amb * ambientC.g + sun * sunC.g) * 0.5),
                       float(base.b * (amb * ambientC.b + sun * sunC.b) * 0.5) };
@@ -386,8 +408,140 @@ static void MinimapShadeRows(const MinimapTerrain& m, const MinimapRequest& r, c
     }
 }
 
+// ---- the world's climate ----------------------------------------------------
+// The game's own map preview colours land by the climate's mapColoring; without
+// this the minimap drew temperate greens on a dry map's sand. The walk, from the
+// captured CGameUI (as CreateConstructionMenu 0x5a2900 itself does):
+//   game = *(CGameUI+0x448); GameRes = *(game+0x150)
+//   climate id = std::string at *(GameRes+0x10) + 0x938   ("dry.clima.lua")
+//   ClimateRep = *(GameRes+0xd8): entries (0x30 B) begin/end at +0x28/+0x30,
+//     entry +0x00 std::string name, +0x20 ClimateDesc*
+//   PreviewColoring = ClimateDesc + 0xc8: variant (index byte +0x38; 1 = levels,
+//     vector<{float r,g,b,height}> begin/end +0x00/+0x08), +0x40 water0,
+//     +0x4c water1, +0x58 ambient, +0x64 sun, each float r,g,b in 0..1.
+// Read on every render, on the UI thread: CGame and GameRes are rebuilt per game.
+// Any step that does not hold -- sites that do not verify, a null pointer, no
+// matching climate, the texture variant, a fault -- keeps the engine default.
+static bool g_minimapClimateOk = false;
+
+static const uint8_t kMinimapClimateCfgBytes[18] = {0x48,0x8b,0x81,0x48,0x04,0x00,0x00,0x4c,0x8b,0xb8,0x50,0x01,0x00,0x00,0x49,0x8b,0x77,0x10};
+static const uint8_t kMinimapClimateIdBytes[7] = {0x48,0x8d,0x86,0x38,0x09,0x00,0x00};
+static const uint8_t kMinimapClimateRepBytes[7] = {0x4d,0x8b,0x87,0xd8,0x00,0x00,0x00};
+static const uint8_t kMinimapClimateTypesBytes[8] = {0x4c,0x8b,0x4f,0x28,0x48,0x8b,0x4f,0x30};
+static const uint8_t kMinimapClimateDescBytes[5] = {0x49,0x8b,0x7c,0xc9,0x20};
+static const uint8_t kMinimapClimateColoringBytes[7] = {0x48,0x8d,0x8f,0xc8,0x00,0x00,0x00};
+
+static bool MinimapVerifyClimateSites() {
+    static const struct { uintptr_t rva; const uint8_t* bytes; uint32_t len; } sites[] = {
+        { 0x5a2959, kMinimapClimateCfgBytes, sizeof kMinimapClimateCfgBytes },
+        { 0x5a29a4, kMinimapClimateIdBytes, sizeof kMinimapClimateIdBytes },
+        { 0x5a2fa3, kMinimapClimateRepBytes, sizeof kMinimapClimateRepBytes },
+        { 0x318533, kMinimapClimateTypesBytes, sizeof kMinimapClimateTypesBytes },
+        { 0x318574, kMinimapClimateDescBytes, sizeof kMinimapClimateDescBytes },
+        { 0x36eba9, kMinimapClimateColoringBytes, sizeof kMinimapClimateColoringBytes },
+    };
+    for (const auto& s : sites)
+        if (!H->verifyBytes(s.rva, s.bytes, s.len)) return false;
+    return true;
+}
+
+// An MSVC std::string: the characters inline when capacity <= 15, else behind a pointer.
+static bool MinimapStdString(const uint8_t* s, const char** data, size_t* len) {
+    const size_t size = *reinterpret_cast<const size_t*>(s + 0x10);
+    const size_t cap = *reinterpret_cast<const size_t*>(s + 0x18);
+    if (size > 260 || cap < size) return false;
+    *data = cap > 15 ? *reinterpret_cast<const char* const*>(s) : reinterpret_cast<const char*>(s);
+    *len = size;
+    return *data != nullptr;
+}
+
+static void MinimapRgbAt(const uint8_t* p, MinimapRgb* out) {
+    const float* f = reinterpret_cast<const float*>(p);
+    for (int k = 0; k < 3; ++k)
+        if (!(f[k] >= 0.0f && f[k] <= 1.0f)) return;   // not a colour: keep the default
+    *out = { f[0], f[1], f[2] };
+}
+
+// Fills `pc` from the world's climate. 0 = default kept, 1 = climate read.
+// `name` receives the climate id when one was found.
+static int MinimapClimateColoringFrom(const void* gameUI, MinimapColoring* pc, char* name, size_t nameCap) {
+    __try {
+        const uint8_t* ui = static_cast<const uint8_t*>(gameUI);
+        if (!ui) return 0;
+        const uint8_t* game = *reinterpret_cast<const uint8_t* const*>(ui + 0x448);
+        if (!game) return 0;
+        const uint8_t* gameRes = *reinterpret_cast<const uint8_t* const*>(game + 0x150);
+        if (!gameRes) return 0;
+        const uint8_t* cfg = *reinterpret_cast<const uint8_t* const*>(gameRes + 0x10);
+        const uint8_t* rep = *reinterpret_cast<const uint8_t* const*>(gameRes + 0xd8);
+        if (!cfg || !rep) return 0;
+        const char* id;
+        size_t idLen;
+        if (!MinimapStdString(cfg + 0x938, &id, &idLen) || idLen == 0) return 0;
+        const uint8_t* begin = *reinterpret_cast<const uint8_t* const*>(rep + 0x28);
+        const uint8_t* end = *reinterpret_cast<const uint8_t* const*>(rep + 0x30);
+        if (!begin || end < begin || size_t(end - begin) % 0x30 != 0 || size_t(end - begin) > 0x30 * 4096) return 0;
+        const uint8_t* desc = nullptr;
+        for (const uint8_t* e = begin; e != end; e += 0x30) {
+            const char* n;
+            size_t nLen;
+            if (!MinimapStdString(e, &n, &nLen) || nLen != idLen || memcmp(n, id, idLen) != 0) continue;
+            desc = *reinterpret_cast<const uint8_t* const*>(e + 0x20);
+            break;
+        }
+        if (!desc) return 0;
+        if (name && nameCap) {
+            const size_t k = idLen < nameCap - 1 ? idLen : nameCap - 1;
+            memcpy(name, id, k);
+            name[k] = 0;
+        }
+        const uint8_t* src = desc + 0xc8;
+        if (src[0x38] == 1) {   // levels; the texture form (0) keeps the default ramp
+            const uint8_t* lb = *reinterpret_cast<const uint8_t* const*>(src + 0x00);
+            const uint8_t* le = *reinterpret_cast<const uint8_t* const*>(src + 0x08);
+            if (lb && le > lb && size_t(le - lb) % 16 == 0) {
+                MinimapColoring c = *pc;
+                int n = int((le - lb) / 16);
+                if (n > 16) n = 16;
+                bool ok = true;
+                for (int i = 0; i < n && ok; ++i) {
+                    const float* f = reinterpret_cast<const float*>(lb + size_t(i) * 16);
+                    ok = f[0] >= 0 && f[0] <= 1 && f[1] >= 0 && f[1] <= 1 && f[2] >= 0 && f[2] <= 1 && f[3] == f[3]
+                         && (i == 0 || f[3] >= c.height[i - 1]);
+                    c.colour[i] = { f[0], f[1], f[2] };
+                    c.height[i] = f[3];
+                }
+                if (ok) { c.levels = n; *pc = c; }
+            }
+        }
+        MinimapRgbAt(src + 0x40, &pc->water0);
+        MinimapRgbAt(src + 0x4c, &pc->water1);
+        MinimapRgbAt(src + 0x58, &pc->ambient);
+        MinimapRgbAt(src + 0x64, &pc->sun);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// The world's climate colouring; the engine default when it cannot be read.
+static MinimapColoring MinimapCurrentColoring() {
+    MinimapColoring pc = MinimapDefaultColoring();
+    if (!g_minimapClimateOk) return pc;
+    static char logged[64] = "";
+    char name[64] = "";
+    const int rc = MinimapClimateColoringFrom(g_minimapGameUI, &pc, name, sizeof name);
+    const char* now = rc ? name : "(default)";
+    if (strcmp(now, logged) != 0) {   // once per change of climate, not per render
+        strncpy_s(logged, now, _TRUNCATE);
+        if (H) H->log("minimap: colours from climate %s (%d levels)", now, pc.levels);
+    }
+    return pc;
+}
+
 // Shading touches only the height buffer, so it can use every core.
 static void MinimapShade(const MinimapTerrain& m, const MinimapRequest& r, const float* hts, uint8_t* rgba) {
+    const MinimapColoring pc = MinimapCurrentColoring();
     unsigned n = std::thread::hardware_concurrency();
     if (n < 1) n = 1;
     if (n > 8) n = 8;
@@ -396,14 +550,14 @@ static void MinimapShade(const MinimapTerrain& m, const MinimapRequest& r, const
     unsigned started = 0;
     for (unsigned i = 1; i < n; ++i) {
         try {
-            workers[started] = std::thread(MinimapShadeRows, std::cref(m), std::cref(r), hts, rgba,
+            workers[started] = std::thread(MinimapShadeRows, std::cref(m), std::cref(r), std::cref(pc), hts, rgba,
                                            int(r.h * i / n), int(r.h * (i + 1) / n));
             ++started;
         } catch (...) {
-            MinimapShadeRows(m, r, hts, rgba, int(r.h * i / n), int(r.h * (i + 1) / n));
+            MinimapShadeRows(m, r, pc, hts, rgba, int(r.h * i / n), int(r.h * (i + 1) / n));
         }
     }
-    MinimapShadeRows(m, r, hts, rgba, 0, int(r.h / n));
+    MinimapShadeRows(m, r, pc, hts, rgba, 0, int(r.h / n));
     for (unsigned i = 0; i < started; ++i) workers[i].join();
 }
 
@@ -903,6 +1057,8 @@ static bool InstallMinimap() {
         SyncGameMinimapScript(false);
         return false;
     }
+    g_minimapClimateOk = MinimapVerifyClimateSites();
+    if (!g_minimapClimateOk) H->log("minimap: climate colouring sites do not verify -- default colours");
     const int rc = SyncGameMinimapScript(true);
     const bool ok = rc == MINIMAP_SCRIPT_WRITTEN || rc == MINIMAP_SCRIPT_ALREADY;
     H->log("minimap: %s -- the map button is on the main toolbar in game", ok ? "enabled" : "hooks installed but no script");
@@ -987,6 +1143,20 @@ void* BigmapTestMinimapCaptureThunk(void** slot, void** trampoline) {
 }
 extern "C" __declspec(dllexport)
 int BigmapTestSyncMinimapScript(const wchar_t* path, int want) { return SyncMinimapScript(path, want != 0); }
+// out: levels, then 16 x {height, r, g, b}, then water0, water1, ambient, sun (3 each)
+extern "C" __declspec(dllexport)
+int BigmapTestMinimapClimateColoring(const void* gameUI, float* out, char* name, uint64_t nameCap) {
+    MinimapColoring pc = MinimapDefaultColoring();
+    const int rc = MinimapClimateColoringFrom(gameUI, &pc, name, size_t(nameCap));
+    out[0] = float(pc.levels);
+    for (int i = 0; i < 16; ++i) {
+        out[1 + i * 4] = pc.height[i];
+        out[2 + i * 4] = pc.colour[i].r; out[3 + i * 4] = pc.colour[i].g; out[4 + i * 4] = pc.colour[i].b;
+    }
+    const MinimapRgb* tail[4] = { &pc.water0, &pc.water1, &pc.ambient, &pc.sun };
+    for (int k = 0; k < 4; ++k) { out[65 + k * 3] = tail[k]->r; out[66 + k * 3] = tail[k]->g; out[67 + k * 3] = tail[k]->b; }
+    return rc;
+}
 extern "C" __declspec(dllexport)
 int BigmapTestSyncMinimapStyle(const wchar_t* scriptPath, int want) { return SyncMinimapStyle(scriptPath, want != 0); }
 extern "C" __declspec(dllexport)
