@@ -480,3 +480,49 @@ above are reported by upstream. The report does not establish coverage of
 every root-boundary, vehicle-crossing or renderer-culling case. Native placement
 distance remains unwidened and the menu diagonal limit above still applies;
 the upstream gameplay report does not remove that implementation gap.
+
+## Fantasia plugin routing — dev 6584fd03
+
+Supersedes the separate stand-in mod from dev ba95f609. The native plugin
+byte-verifies and replaces the game's `fopen` PLT slot, serving private
+anonymous streams containing the shared Windows Lua transformation.
+`generator_memory=1` is enabled by default. No Workshop file is modified and
+no additional mod is required; disable the old low-memory stand-in if present.
+
+[Addresses, disassembly, ABI, ownership and live-attempt evidence](../../../docs/re/linux/DEV_6584FD03.md).
+[Integration and tests](../../../docs/linux/UPSTREAM_dev_6584fd03.md).
+All three climates preserve the 32 km pipeline and reduce 40 km symbolic
+buffer names to 10. Native terrain output and measured peak-memory savings
+remain unvalidated because the lab failed before game startup.
+
+## Fantasia diagnostics — dev 46ca48ef
+
+The shared text patch now appends the upstream generator diagnostic helper.
+Native Linux logs dimensions, layer and buffer-name counts before optimization,
+and the shared optimizer reports unknown operations and pinned-name refusals.
+The existing fopen route, byte guards and ABI are unchanged; no new engine
+site is needed. See the [integration and test record](../../../docs/linux/UPSTREAM_dev_46ca48ef.md).
+
+## Fantasia sample units — dev 15ba4df5
+
+The shared helper now gates optimization on area above 8193² heightmap
+samples, with dimensions `64 * tiles + 1`, and logs samples and tiles.
+This corrects the metre interpretation in the earlier Fantasia records above:
+the old 32/40 km symbolic fixtures supplied the wrong generator units.
+All three climates are unchanged at 128 tiles and reduce to 10 names at
+130, 160 and 192 tiles in symbolic replay. The guarded fopen route and ABI
+are unchanged. No new live terrain or peak-memory result is claimed.
+See [integration and tests](../../../docs/linux/UPSTREAM_dev_15ba4df5.md).
+
+## Fantasia parallelism budget — dev 5d73f324
+
+The shared optimizer now accepts a temporary-buffer budget, opening slots
+before reusing the longest-idle slot. Native configuration defaults to
+`generator_memory_budget_pct=50`, capped at 90; 0 selects fewest buffers.
+Linux uses `/proc/meminfo` MemAvailable, with strict-overcommit commit
+headroom as an additional cap. It samples on every redirected open and
+appends the budget to the anonymous stream. The fopen site, SysV ABI and
+ownership contract are unchanged. No new address or layout is introduced.
+See [integration and tests](../../../docs/linux/UPSTREAM_dev_5d73f324.md).
+These symbolic scheduling results are not native generation timings or
+measured memory savings; no new live validation is claimed.

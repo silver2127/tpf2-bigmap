@@ -14,6 +14,7 @@
 #include "alignment_batch.h"
 #include "memory_budget.h"
 #include "octree_depth.h"
+#include "generator_memory.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -377,6 +378,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
             }
         }).detach();
     }
+    linux_generator::Install(H);
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?depth:10,rows,maxRatio);
     if(octree && depth>=12)H->log("octree: EXPERIMENTAL depth %d, root +-%.0f m, 128 m leaves; %d-tile edge capacity; compact IDs enabled",
         depth,double(linux_octree::RootHalfExtent(depth)),linux_octree::EdgeTiles(depth));
