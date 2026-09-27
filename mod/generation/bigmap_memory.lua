@@ -84,8 +84,15 @@ local function specFor(layer)
     return spec
 end
 
-function M.Optimize(result)
+-- maxSlots (optional): temporary buffers the pass may keep. Without it every
+-- value reuses the first free buffer, the fewest buffers. With it a new
+-- buffer opens until maxSlots exist, then the one idle longest is reused.
+-- The native scheduler orders layers per buffer name, so the extra buffers
+-- let independent layers run in parallel again. Values alive together always
+-- get their own buffers, so the count can exceed maxSlots.
+function M.Optimize(result, maxSlots)
     if type(result) ~= "table" or type(result.layers) ~= "table" then return result end
+    if type(maxSlots) ~= "number" or maxSlots < 1 then maxSlots = nil end
     local layers = result.layers
     local n = #layers
     local pinned = {}
@@ -188,9 +195,14 @@ function M.Optimize(result)
                         end
                     end
                 end
-                if not chosen then
+                if not chosen and not maxSlots then
                     for _, slot in ipairs(slots) do
                         if slot.value.last < i then chosen = slot; break end
+                    end
+                elseif not chosen and #slots >= maxSlots then
+                    -- Budgeted: the buffer idle longest, so the fewest layers queue behind it.
+                    for _, slot in ipairs(slots) do
+                        if slot.value.last < i and (not chosen or slot.value.last < chosen.value.last) then chosen = slot end
                     end
                 end
             end
@@ -266,7 +278,8 @@ function M.Optimize(result)
         for _, key in ipairs(spec.inputs) do p[key] = physical(reads[i][key]) end
         p.output = physical(writes[i])
     end
-    print(string.format("[tpf2_bigmap] terrain memory: %d -> %d named buffers", before, after))
+    print(string.format("[tpf2_bigmap] terrain memory: %d -> %d named buffers%s", before, after,
+        maxSlots and string.format(" (budget %d)", maxSlots) or ""))
     return result
 end
 
