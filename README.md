@@ -1,17 +1,17 @@
-# tpf2-bigmap
+<!-- standalone:head -->
+# Big Maps (bigmap/)
 
 Maps larger than Transport Fever 2's New Game menu will build.
 
-**Big Maps is developed in
-[tpf2-multiplayer](https://github.com/silver2127/tpf2-multiplayer/tree/dev/bigmap),
-under `bigmap/`, and this repository is kept in sync with it automatically.** Every
-change made there lands here too, so this is the place to get Big Maps on its own,
-without multiplayer. TpF2 Multiplayer 0.7 and later already include Big Maps.
-Please open issues and pull requests against `dev` in tpf2-multiplayer: a change
-made only here is overwritten by the next sync. The exception is the standalone
-installer (`installer/`, `.github/`, `tools/vendor_host.ps1`,
-`tools/test_config_msi.py`), which lives only in this repository.
+Big Maps lived in its own repository (tpf2-bigmap) until 2026-09-22; it is now
+part of TpF2 Multiplayer and ships in the same MSI. Build it with
+`native\build.bat bigmap` (or `all`); this folder's `build.bat` still takes the
+test targets (`-pager-test`, `-codec-test`, ...).
 
+Every memory and load-time optimization, with its switch and how it works, is
+listed under [Performance optimizations](#performance-optimizations).
+
+<!-- /standalone:head -->
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
 reuse without changing map resolution or octree depth.
@@ -24,10 +24,12 @@ overflow above approximately 185 km separation. See
 [placement-distance.md](docs/placement-distance.md) for the reverse-engineered
 sites and offline validation; an in-game regeneration check is still pending.
 
-A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
-and has no build-time dependency on the host tree, only `src/tpf2mp_plugin.h`,
-the whole ABI, which the sync copies from tpf2-multiplayer.
+<!-- standalone:abi -->
+A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code;
+its one build-time dependency on the rest of the repo is the plugin ABI,
+`native/src/plugin/tpf2mp_plugin.h`.
 
+<!-- /standalone:abi -->
 
 **Native Linux:** the Steam/GOG executable layouts and MSI instructions below
 describe the Windows plugin. For the native Steam ELF, use the
@@ -509,15 +511,13 @@ stock.
 
 ## Install
 
-**Download `TpF2BigMaps-<version>.msi` from the
-[latest release](https://github.com/silver2127/tpf2-bigmap/releases) and run it.**
-It finds the Transport Fever 2 folder (from Steam's own uninstall entry, or from
-the folder a previous install remembered), asks you to confirm it,
-and puts these in place:
+<!-- standalone:install -->
+**Install TpF2 Multiplayer** (`TpF2Multiplayer.msi` from the
+[latest release](https://github.com/silver2127/tpf2-multiplayer/releases)): Big
+Maps ships inside it. It finds the Transport Fever 2 folder Steam registered,
+asks you to confirm it, and puts these in place (besides the multiplayer files):
 
-If you play with TpF2 Multiplayer 0.7 or later, you already have Big Maps: do not
-install this package as well. Installing TpF2 Multiplayer removes it.
-
+<!-- /standalone:install -->
 | file | what |
 | --- | --- |
 | `alut.dll` | the proxy the game loads in place of its own (the original is kept as `alut_real.dll`) |
@@ -557,17 +557,18 @@ the way it shapes the stock ones. To set a shape yourself, add a
 `octree=1`, and the area within the street-raster budget (`street_raster=1` scales
 the cell to keep it there).
 
-### With TpF2 Multiplayer
+<!-- standalone:coexist -->
+### The old TpF2 Big Maps installer
 
-TpF2 Multiplayer 0.7 and later ship Big Maps themselves and remove this package
-when they install (its UpgradeCode is listed in their MSI), so the plugin has one
-owner. Before 0.7 the two packages coexisted: they shared the proxy and the
-plugin host under the **same component GUIDs** (`installer/PluginHost.wxs`), so
-Windows Installer reference-counted them and only the last one out put the game's
-own `alut.dll` back. `installer\test_coexist.ps1` proves that against a
-throwaway folder with the real `msiexec` transactions (it needs an elevated
-PowerShell, because the packages are per-machine).
+Up to 0.5.x Big Maps had its own MSI (`TpF2BigMaps-<version>.msi`), which
+coexisted with TpF2 Multiplayer by sharing the proxy and the plugin host under
+fixed component GUIDs (`installer/PluginHost.wxs`). The TpF2 Multiplayer MSI now
+lists that product's UpgradeCode and removes it when it installs, so the plugin
+has one owner; the shared components are reference-counted, so nothing is lost
+in between, and the old package's base_mod restore does not run during that
+removal (the new plugin re-patches on its next start).
 
+<!-- /standalone:coexist -->
 ### Virus-scanner findings
 
 The DLLs and the MSI are not code-signed, so any rule of the form *unsigned
@@ -584,15 +585,18 @@ no other process. The one custom action, on full uninstall only, runs
 SHA-256 in such a report with the release assets' digests on the GitHub
 release page; they will not match.
 
+<!-- standalone:uninstall -->
 ### Uninstall
 
-Add/Remove Programs → **TpF2 Big Maps**. Puts the stock `res\config\base_mod.lua`
-back (the plugin's own restore, run through rundll32 before its files go), then
-removes the plugin, its config, and — if TpF2 Multiplayer is not installed — the
-proxy, the plugin host, the Segment Heap value, and restores the stock `alut.dll`. Steam's
-*Verify integrity of game files* also puts the stock `alut.dll` back without
-uninstalling anything; **Repair** from Add/Remove Programs reinstalls the proxy.
+Big Maps goes with TpF2 Multiplayer: Add/Remove Programs → **TpF2 Multiplayer**.
+Before its files go, the plugin's own restore (run through rundll32 while the
+DLL is still there) puts the stock `res\config\base_mod.lua` back; then the
+plugin, its config, the proxy and the plugin host are removed and the stock
+`alut.dll` returns. Steam's *Verify integrity of game files* also puts the
+stock `alut.dll` back without uninstalling anything; **Repair** from
+Add/Remove Programs reinstalls the proxy.
 
+<!-- /standalone:uninstall -->
 ## Build
 
 Needs VS 2022 Build Tools.
@@ -609,34 +613,17 @@ multiplayer repository (`tpf2_pluginhost.dll` + the `alut.dll` proxy), drop
 older build left `<game>\mods\bigmap_density_1` behind, delete it: with it enabled
 a map would be scaled twice.
 
+<!-- standalone:build-msi -->
 ### Building the MSI
 
-```
-tools\vendor_host.ps1 -FromMsi TpF2Multiplayer.msi -Release v0.4.18
-                                      # alut.dll, tpf2_pluginhost.dll, tpf2ca.dll out of the
-                                      # latest TpF2 Multiplayer release MSI; the source goes
-                                      # into installer\vendor\VENDORED.md
-installer\build_msi.ps1 -Validate -AcceptWixEula
-```
+Big Maps is packaged in the TpF2 Multiplayer MSI: the repository's
+`installer\build_msi.ps1` ships `bigmap\out\tpf2_bigmap.dll` and
+`bigmap\cfg\tpf2_bigmap.cfg` (the `BigmapFiles` group in
+`installer/Package.wxs`). The standalone TpF2 Big Maps package is built in
+[tpf2-bigmap](https://github.com/silver2127/tpf2-bigmap), which this folder is
+synced to (`tools/bigmap_sync/`).
 
-The three shared binaries are built in the multiplayer repository and vendored
-here unchanged: both packages must ship the same bytes under the same GUIDs.
-Vendor them from the **latest multiplayer release MSI** before each release. A
-rebuild of the same commit gives different bytes, so an install of one product
-could replace the other's copy. `tools\vendor_host.ps1 -Build` vendors from a
-checkout's build outputs instead (dev only). `build_msi.ps1` refuses to build if
-`PluginHost.wxs` has drifted from the multiplayer copy (line endings aside). WiX v7 asks you to accept its
-[OSMF EULA](https://wixtoolset.org/osmf/); `-AcceptWixEula` passes it
-per-invocation and nothing accepts it for you.
-
-GitHub Actions runs the same script (`.github/workflows/build-msi.yml`): every push to `dev` or `main` and
-every pull request builds `TpF2BigMaps-<version>.msi` and `SHA256SUMS.txt` on a `windows-2022` runner from the
-vendored shared binaries and keeps them as the run's artifact; a `v*` tag (which must equal `installer\VERSION`)
-also creates a draft GitHub release with them attached, ready to be edited and published. The runner has no
-multiplayer checkout beside this one, so the workflow compares `PluginHost.wxs` with the copy at the release
-named in `installer\vendor\VENDORED.md` instead. The workflow passes `-AcceptWixEula`, which is the
-repository owner accepting the WiX terms for those builds.
-
+<!-- /standalone:build-msi -->
 ## Verifying it worked
 
 `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log` shows the hook lines, the
@@ -691,7 +678,7 @@ the stock code on any other build.
 | Tile dedup | `terrain_dedup=1` | During a load both terrain versions exist, and every tile has exactly one byte-identical twin in the other (measured on a 256x256 save). When an evicted tile matches a stored blob (two independent 64-bit hashes must agree), it shares that blob. The second twin costs a hash instead of an encode and is stored once. |
 | Instance-list shrink | `instance_shrink=1` | While a new world is created, the tree and scenery instance lists of each 64 m cell are trimmed to their size, dropping the growth slack the game would otherwise keep all session. Contents and order are unchanged; it uses the game's own allocator. |
 | Generation buffer reuse | `python tools\install_generation_memory.py` | This one is opt-in and a Lua pass rather than a switch. It rewrites the stock New Game terrain generators so that temporary full-map float buffers whose lifetimes do not overlap share storage. The pass examines the completed op list and leaves op order, parameters and seeds alone. Desert goes from 18 buffers to 15 and Temperate from 10 to 9, which is 4 GiB per buffer at 228 x 1140 tiles. `--restore` undoes it. [generation-performance.md](docs/generation-performance.md) |
-| Fantasia low memory | `python tools\install_fantasia_low_memory.py` | A local mod that stands in for the Fantasia Map Generator's files. It loads Fantasia's own generator unchanged, and for maps over 32 x 32 km runs the same buffer-reuse pass over it: 325 temporary names become 10 at 40 km. Enable it together with Fantasia, below it in the mod list. `--remove` uninstalls it. [generation-performance.md](docs/generation-performance.md) |
+| Fantasia Map Generator | `generator_memory=1` (default) | The plugin serves the Fantasia workshop generator a patched copy of its own file when the game opens it, so maps over 32 x 32 km run the buffer-reuse pass: 325 temporary names become 10 at 40 km. No extra mod, and Fantasia's files are not changed. [generation-performance.md](docs/generation-performance.md) |
 
 ### Load time and CPU
 
