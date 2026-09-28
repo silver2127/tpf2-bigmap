@@ -206,16 +206,22 @@ static uint64_t PagerHeadroom(uint64_t physical) {
     return h;
 }
 // Free commit below which the pagers back off hard (256 MiB, urgent, throttled):
-// physical/8, clamped to 2..10 GiB. 10 GiB was MEASURED on the 94 GiB box (6
-// came too late, before the alignment pass was batched); a 32 GiB machine with
-// a system-managed page file rarely has 10 GiB of free commit with a big save
-// loaded and would sit throttled for the whole session. Unknown size: 10 GiB.
+// physical/8, clamped to 2..4 GiB (commit_tight_mb overrides). It was 2..10 GiB:
+// 10 GiB was measured on the 94 GiB box before the alignment pass was batched
+// (6 came too late then). With the pass batched and a throttled load evicting on
+// the loading path, 10 GiB only kept that box -- 80 of 94 GB committed by other
+// programs, 33 GB of RAM free -- in the tight budget for whole loads
+// (2026-09-28: two instances, 256 MiB each, 393 s of throttle). A 32 GiB
+// machine with a system-managed page file rarely has 10 GiB of free commit with
+// a big save loaded either. Unknown size: 4 GiB.
+static int g_commitTightMB = 0;        // commit_tight_mb: 0 = automatic
 static uint64_t CommitTightBytes(uint64_t physical) {
     constexpr uint64_t GiB=1024ull*1024*1024;
-    if(!physical)return 10*GiB;
+    if(g_commitTightMB>0)return uint64_t(g_commitTightMB)<<20;
+    if(!physical)return 4*GiB;
     uint64_t t=physical/8;
     if(t<2*GiB)t=2*GiB;
-    if(t>10*GiB)t=10*GiB;
+    if(t>4*GiB)t=4*GiB;
     return t;
 }
 // The automatic resident cap, the same on every machine that can afford it:
@@ -408,7 +414,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             bool haveStatus=PagerMemoryStatus(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
             static const uint64_t physical=InstalledPhysicalBytes();
-            // Sized to the machine (CommitTightBytes): 10 GiB here, 4 GiB on 32 GiB;
+            // Sized to the machine (CommitTightBytes): 4 GiB here and on 32 GiB, 2 on 16;
             // sticky (CommitTightSticky), so this pager's own release cannot clear it.
             static CommitTightState tightState;
             bool commitTight=haveStatus && CommitTightSticky(tightState,m.ullAvailPageFile<CommitTightBytes(physical),m.ullAvailPageFile,
