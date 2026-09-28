@@ -40,7 +40,7 @@ static const uint8_t kDetachBytes[9] = {0x48, 0x8d, 0x4e, 0x08, 0xe8, 0x87, 0x10
 // Coupling to the tile arena (set by InstallTerrainServe; the offline test supplies its own).
 static bool (*mark)(const void* first) = nullptr;
 static volatile LONG64 calls = 0, applied = 0, unmarked = 0, absent = 0, notFound = 0, probes = 0, decodeFailed = 0;
-static volatile LONG cursor = 0;   // record index after the last hit; a hint, races are benign
+static volatile LONG cursor = 0;   // generation of the per-thread cursors (FindRecord); bumped per load
 static thread_local BlockCodec::DecodeScratch* scratch = nullptr;
 
 // Each served tile's height range, taken while the decoded cache is hot, so a
@@ -203,21 +203,34 @@ static bool ServedVersionPending() {
     return pending;
 }
 
-// The record AddTile just filled for `entity`, or -1: scan from the cursor.
+// The record AddTile just filled for `entity`, or -1: scan from this THREAD's
+// cursor. The load adds tiles on two threads at once, each in grid order in its
+// own part of the grid; one shared cursor started every scan where the OTHER
+// thread had been, and a 36,992-tile load probed ~30,000 records per tile
+// (2026-09-28: 6.6 billion probes for 221,952 tiles, the load thread ~92% in
+// here for ~20 s). Per thread and per grid it is one probe again.
+struct Cursor { const uint8_t* grid; uint32_t next; LONG generation; };
+static thread_local Cursor tlsCursor = {nullptr, 0, -1};
+static uint32_t Probe(const TerrainSidecar::Grid& g, uint32_t n, uint32_t start, int entity, long* found) {
+    for (uint32_t k = 0; k < n; ++k) {
+        uint32_t i = start + k; if (i >= n) i -= n;
+        const uint8_t* r = g.record(i);
+        if (*reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8)) { *found = long(i); return k + 1; }
+    }
+    *found = -1;
+    return n;
+}
 static long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
     if (!n) return -1;
-    uint32_t start = uint32_t(cursor) % n;
-    for (uint32_t k = 0; k < n; ++k) {
-        uint32_t i = start + k; if (i >= n) i -= n;
-        InterlockedIncrement64(&probes);
-        const uint8_t* r = g.record(i);
-        if (*reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8)) {
-            InterlockedExchange(&cursor, LONG(i + 1 < n ? i + 1 : 0));
-            return long(i);
-        }
-    }
-    return -1;
+    Cursor& c = tlsCursor;
+    const LONG gen = cursor;                      // bumped when a load begins: every thread starts over
+    if (c.grid != g.base || c.generation != gen) { c.grid = g.base; c.next = 0; c.generation = gen; }
+    long found;
+    const uint32_t probed = Probe(g, n, c.next % n, entity, &found);
+    InterlockedAdd64(&probes, LONG64(probed));
+    if (found >= 0) c.next = uint32_t(found) + 1 < n ? uint32_t(found) + 1 : 0;
+    return found;
 }
 // Every CTerrain this load populated (a load holds two versions briefly and frees one).
 // The SaveGame hook validates each and captures the live one: the alignment system's
@@ -249,7 +262,7 @@ static void BeginIfArmed(void* terrain) {
         bool ok = scratch && TerrainSidecar::BeginIfPending(terrain, scratch);
         QueryPerformanceCounter(&t1);
         InterlockedExchange64(&beginMs, f.QuadPart ? (t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart : 0);
-        InterlockedExchange(&cursor, 0);
+        InterlockedIncrement(&cursor);
         if (H) H->log("terrain sidecar: %s (%lld ms; %u tiles)", ok ? "loaded for this save, serving tiles at AddTile" : "absent, foreign or stale; loading stock", beginMs, TerrainSidecar::g_load.tiles);
     }
     ReleaseSRWLockExclusive(&beginLock);

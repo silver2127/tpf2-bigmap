@@ -219,16 +219,22 @@ inline void* PickTerrain(char* why, size_t cap) {
     }
     return best;
 }
+// The record AddTile just filled, scanning from THIS thread's last hit in this
+// grid: the load adds tiles on two threads in different parts of the grid, and
+// one shared cursor made every scan start where the other thread had been
+// (Windows 2026-09-28: ~30,000 probes per tile; see terrain_serve.h FindRecord).
 inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
-    static std::atomic<uint32_t> cursor{0};
+    struct Cursor { const uint8_t* grid; uint32_t next; };
+    static thread_local Cursor c = {nullptr, 0};
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
     if (!n) return -1;
-    const uint32_t start = cursor.load() % n;
+    if (c.grid != g.base) { c.grid = g.base; c.next = 0; }
+    const uint32_t start = c.next % n;
     for (uint32_t k = 0; k < n; ++k) {
         uint32_t i = start + k; if (i >= n) i -= n;
         const uint8_t* r = g.record(i);
         if (*reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8)) {
-            cursor.store(i + 1 < n ? i + 1 : 0);
+            c.next = i + 1 < n ? i + 1 : 0;
             return long(i);
         }
     }
