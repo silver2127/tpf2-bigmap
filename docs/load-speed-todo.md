@@ -93,3 +93,28 @@ Rules for every item: separate cfg switch (default off), byte-verified hook
 sites with fallback to the original, an offline test that executes the original
 machine code and compares complete outputs, and an in-game load-time measurement
 before enabling by default.
+
+## September 28: after the sidecar skip (36,992-tile save, ~55 s load)
+
+Measured with `profile_load.py --map/--stack-at/--follow` and an ETW `-Light`
+trace read by `tools/re/trace_stacks.py`.
+
+- [x] **Sidecar record lookup:** ~35,000 probes per AddTile (a forward scan from
+  a shared cursor); now outward from each thread's last hit, 2.5 probes.
+- [x] **Sidecar decode on the load thread:** ~8 s serial at AddTile; now decoded
+  at the pass on up to 16 threads (~1.7 s per terrain version).
+- [x] **Material index (`MaterialIndexDetour`):** layer pointers and the dither
+  column hoisted; 1.40x -> 1.58x (all miss), 1.51x -> 1.97x (top hit) vs stock.
+- [ ] **Material index in the sidecar:** deterministic (36,992/36,992 tile hashes
+  equal on two loads), but 2,312 MiB raw, 1,306 MiB run-length, ~334 MiB
+  order-0 entropy for ~3-5 s of wall time. Not built.
+- [x] **Bigger MaterialIndexAsyncWork chunks: REJECTED.** `0x312990` walks the
+  map in 8x8-tile chunks (six immediates). At 32x32 **8,164 of 36,992 tiles came
+  out different**, spread over whole tiles and not only chunk edges, and the
+  phase used the same ~6-7 cores. Do not change the chunk size.
+- [ ] **Previous-world teardown** when loading from inside a world: the load
+  thread's gamestate.cpp path releases every old tile through the pager's unmap
+  (~39,000 stack events). Absent when loading from the title menu.
+- [ ] **Save deserialization** (`game\serializer.cpp` `0x2e5ec0`, ~18 s of the
+  load thread) is mostly waiting, not computing; the `-Light` trace has no
+  context switches to say on what. A full `trace_load.ps1` capture would.
