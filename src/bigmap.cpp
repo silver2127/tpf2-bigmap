@@ -1258,6 +1258,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_terrainCacheSpacing = H->cfgInt("tpf2_bigmap", "terrain_cache_spacing_m", 0);
     g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
+    g_commitTightMB = H->cfgInt("tpf2_bigmap", "commit_tight_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
     g_terrainMaxMB = H->cfgInt("tpf2_bigmap", "terrain_cache_max_mb", 0);
     g_simPhysicalMB = H->cfgInt("tpf2_bigmap", "simulate_physical_mb", 0);
