@@ -149,7 +149,7 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             MaterialPager::SetUrgent(commitTight||pressure);
             // the throttle is for load bursts only (terrain_compression.h, same date)
             MaterialPager::SetThrottle(commitTight && (busy||bulk));
-            if(commitTight && next>256)next=256;
+            if(commitTight)next=TightBudgetMB(effectiveMB,s.resident*MaterialPager::SlotBytes,m.ullAvailPageFile,CommitTightBytes(physical),busy||bulk);
             else if(!(busy||bulk)){ static int wsFloor=0; next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2,&wsFloor); }
             { int cap=PagerCapMB(g_materialMaxMB,g_materialHotMB,physical,1); if(cap && next>cap)next=cap; }
             MaterialPager::SetBudget(size_t(next)*1024*1024);

@@ -261,6 +261,30 @@ static bool CommitTightSticky(CommitTightState& st,bool raw,uint64_t availPageFi
     }
     return false;
 }
+// THE BUDGET WHILE COMMIT IS TIGHT (2026-09-28). It used to be a flat 256 MiB:
+// every tight second evicted ~90% of the terrain, and the camera decoded it
+// back -- the stutter a player reported on a 49,928-tile map with a small page
+// file (6 tight episodes in a session at 9-11 GB of free RAM, 20,626 -> 1,995
+// resident tiles each time, 195,000 re-decodes). Evicting a tile gives its
+// commit back one for one, so the pager now only lets go of what brings free
+// commit back over the threshold plus a margin, measured from what it holds
+// now (eviction lags the budget, so it never compounds second over second),
+// and never grows while the flag is set. The flat 256 MiB stays where it was
+// measured to be needed: a load burst (sections are created faster than they
+// encode), and free commit under half the threshold (the game's own next
+// allocation is at risk).
+static int TightBudgetMB(int effectiveMB,uint64_t residentBytes,uint64_t availPageFile,uint64_t threshold,bool loading) {
+    constexpr uint64_t MiB=1024ull*1024,GiB=1024*MiB;
+    const int floorMB=256;
+    if(loading || availPageFile<threshold/2)return floorMB;
+    const uint64_t want=threshold+GiB;
+    const uint64_t deficit=availPageFile<want?want-availPageFile:0;
+    uint64_t target=residentBytes>deficit?residentBytes-deficit:0;
+    int next=int((target+MiB-1)/MiB);
+    if(next>effectiveMB)next=effectiveMB;
+    if(next<floorMB)next=floorMB;
+    return next;
+}
 static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t available,uint64_t liveMB=0,uint64_t physical=0) {
     // Memory pressure overrides the warmup allowance. Available RAM is sampled
     // outside the pager lock; this is a conservative policy, not an allocation.
@@ -429,7 +453,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
                 if(smallNext!=smallEffectiveMB)H->log("small pager: resident target %d -> %d MiB (commit_tight=%d)",smallEffectiveMB,smallNext,int(commitTight));
                 smallEffectiveMB=smallNext;
             }
-            if(commitTight && next>256)next=256;
+            if(commitTight)next=TightBudgetMB(effectiveMB,s.resident*TerrainPager::SlotBytes,m.ullAvailPageFile,CommitTightBytes(physical),busy||bulk||loading);
             else if(!(busy||bulk||loading)) {
                 static int wsFloor=0;
                 int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3,&wsFloor);
@@ -556,6 +580,7 @@ extern "C" __declspec(dllexport) unsigned BigmapTestUiStalls(const uint64_t* sta
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical,unsigned share){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available,physical,share);}
 extern "C" __declspec(dllexport) uint64_t BigmapTestPagerHeadroom(uint64_t physical){return PagerHeadroom(physical);}
 extern "C" __declspec(dllexport) uint64_t BigmapTestCommitTightBytes(uint64_t physical){return CommitTightBytes(physical);}
+extern "C" __declspec(dllexport) int BigmapTestTightBudgetMB(int effectiveMB,uint64_t residentBytes,uint64_t availPageFile,uint64_t threshold,int loading){return TightBudgetMB(effectiveMB,residentBytes,availPageFile,threshold,loading!=0);}
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetLive(int hot,int warm,int busy,int bulk,uint64_t available,uint64_t liveMB,uint64_t physical){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available,liveMB,physical);}
 extern "C" __declspec(dllexport) int BigmapTestWarmUpdate(TerrainWarmup* state,uint64_t now,int busy,uint64_t bulk,uint64_t ui,int signal){return state->Update(now,busy!=0,bulk,ui,signal!=0);}
 extern "C" __declspec(dllexport) int BigmapTestInstallCompression(const Tpf2mpHost* host,int gog,int spacing,int enabled,int hotMB) {

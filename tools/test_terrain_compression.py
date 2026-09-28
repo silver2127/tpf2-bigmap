@@ -54,6 +54,20 @@ def main():
         assert headroom(phys)==want,(phys,headroom(phys),want)
     for phys,want in [(0,10*G),(8*G,2*G),(16*G,2*G),(32*G,4*G),(94*G,10*G)]:
         assert tight(phys)==want,(phys,tight(phys),want)
+    # Commit tight: give back only the deficit (threshold + 1 GiB - free commit),
+    # from what is resident now; never grow; 256 MiB while loading or under half
+    # the threshold. The reported player: 32 GiB, threshold 4 GiB.
+    tb=dll.BigmapTestTightBudgetMB;tb.argtypes=[C.c_int,C.c_uint64,C.c_uint64,C.c_uint64,C.c_int];tb.restype=C.c_int
+    M=1024*1024
+    for args,want in [((2724,2724*M,int(3.5*G),4*G,0),1188),   # 1.5 GiB short: give back 1.5 GiB, not 90%
+                      ((2724,2724*M,4*G,4*G,0),1700),           # at the threshold: 1 GiB margin
+                      ((2724,2724*M,6*G,4*G,0),2724),           # above threshold + margin (sticky): hold, never grow
+                      ((2000,2724*M,6*G,4*G,0),2000),           # eviction lags: never above the current target
+                      ((2724,2724*M,int(1.9*G),4*G,0),256),     # under half the threshold: the emergency floor
+                      ((2724,2724*M,int(3.5*G),4*G,1),256),     # a load burst: the floor, as measured
+                      ((2724,1024*M,int(3.5*G),4*G,0),256),     # holds less than the deficit: the floor
+                      ((300,300*M,int(3.9*G),4*G,0),256)]:      # never below 256
+        assert tb(*args)==want,(args,tb(*args),want)
     assert live(1024,4096,1,0,16*G,20000,32*G)==8192
     assert live(1024,4096,1,0,5*G,20000,32*G)==4096      # under the 4.6 GiB headroom: warm is the floor
     assert live(1024,4096,1,0,16*G,20000,96*G)==4096     # a big machine keeps its measured 12 GiB
