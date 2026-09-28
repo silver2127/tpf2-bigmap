@@ -1212,7 +1212,9 @@ static bool InstallMinimap() {
     const bool ok = rc == MINIMAP_SCRIPT_WRITTEN || rc == MINIMAP_SCRIPT_ALREADY;
     H->log("minimap: %s -- the map button is on the main toolbar in game", ok ? "enabled" : "hooks installed but no script");
     // The M key, in the real game only (a test's script path has no game beside it).
-    if (ok && !g_minimapScriptPathOverride[0] && H->cfgBool("tpf2_bigmap", "minimap_key", 1)) {
+    // Off by default since 2026-09-28 (the user: "we need to disable the m to open the
+    // mini map"): the toolbar button opens it, and M is the game's own again.
+    if (ok && !g_minimapScriptPathOverride[0] && H->cfgBool("tpf2_bigmap", "minimap_key", 0)) {
         wchar_t dir[MAX_PATH];
         const DWORD n = GetModuleFileNameW(nullptr, dir, MAX_PATH);
         wchar_t* slash = (n && n < MAX_PATH) ? wcsrchr(dir, L'\\') : nullptr;
