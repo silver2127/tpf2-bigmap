@@ -202,7 +202,32 @@ int main() {
         remove(sav); remove(terr);
     }
 
+    {   // Threaded writes (terrain_sidecar_threads): byte for byte the single-thread
+        // file, across several WriteWindow windows, with holes and odd tiles.
+        const int bx = 60, by = 50;   // 3,000 records: two windows and a partial one
+        FakeTerrain big(bx, by);
+        for (uint32_t i = 0; i < uint32_t(bx * by); ++i) {
+            if (i % 3 == 0) big.makeTile(i, Samples, i * 13 + 5);
+            else if (i % 7 == 1) big.makeTile(i, 129 * 129, i);   // not eligible
+        }
+        big.finalize();
+        auto fileBytes = [](const char* p) {
+            std::vector<uint8_t> b; FILE* f = nullptr; fopen_s(&f, p, "rb"); assert(f);
+            fseek(f, 0, SEEK_END); b.resize(size_t(ftell(f))); fseek(f, 0, SEEK_SET);
+            assert(fread(b.data(), 1, b.size(), f) == b.size()); fclose(f); return b;
+        };
+        g_writeThreads = 1;
+        assert(Write(GridOf(big.cterrain), 0x77u, "test_sidecar_1.bin", enc) == 1000);
+        const auto one = fileBytes("test_sidecar_1.bin");
+        for (int t : {2, 4, 7, 0}) {
+            g_writeThreads = t;
+            assert(Write(GridOf(big.cterrain), 0x77u, "test_sidecar_n.bin", enc) == 1000);
+            assert(fileBytes("test_sidecar_n.bin") == one);
+        }
+        g_writeThreads = 0;
+        remove("test_sidecar_1.bin"); remove("test_sidecar_n.bin");
+    }
     remove(path); delete enc; delete dec;
-    printf("PASS: write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint; fingerprint+arm/begin/end and WriteForSave round-trip, a changed .sav rejects the stale sidecar\n");
+    printf("PASS: threaded writes are byte-identical to one thread; write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint; fingerprint+arm/begin/end and WriteForSave round-trip, a changed .sav rejects the stale sidecar\n");
     return 0;
 }
