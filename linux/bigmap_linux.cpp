@@ -304,7 +304,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     alignmentBatch=size_t(std::clamp(H->cfgInt(Section,"alignment_batch_tiles",0),0,65536));
     // The sidecar needs the redirected UpdateSubterrains call too (to skip it).
     linux_sidecar::Enabled().store(false);
-    sidecarOn=H->cfgBool(Section,"terrain_sidecar",0);
+    sidecarOn=H->cfgBool(Section,"terrain_sidecar",1);
     if(alignmentBatch || sidecarOn) {
         const uint8_t entry[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x49,0x89,0xfe,0x41,0x55,0x41,0x54,0x49,0x89,0xf4};
         const uint8_t iter[]={0x4c,0x89,0xff,0xe8,0xa3,0xe1,0xf9,0xfe,0x49,0x89,0xc7};
