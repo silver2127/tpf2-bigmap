@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <new>
 #include <string>
@@ -311,26 +312,100 @@ inline long Apply(const Grid& grid, uint64_t fingerprint, const char* path,
 // lock-free reads of the immutable index and may run on any pass thread
 // (ApplyTile takes the caller's own DecodeScratch).
 namespace TerrainSidecar {
+// A tile's blob: which piece of the file holds it, where, and how long (0 = absent).
+struct Loc { uint32_t chunk = 0, off = 0, bytes = 0; };
 struct LoadState {
-    std::vector<uint8_t> file;                       // the whole sidecar in memory
-    std::vector<std::pair<uint32_t, uint32_t>> byIndex;   // record index -> {file offset, bytes}, offset 0 == absent
+    // The file as read so far, in pieces: the whole file at once for a sidecar
+    // beside the save, one piece per Refresh for a stream still arriving (a
+    // piece never moves once read, so a decode needs only the shared lock).
+    std::vector<std::vector<uint8_t>> chunks;
+    std::vector<Loc> byIndex;                        // record index -> blob
     bool loaded = false;
-    uint32_t tiles = 0;
+    uint32_t tiles = 0;                              // the header's tile count
+    uint32_t indexed = 0;                            // tiles indexed so far (== tiles once complete)
+    uint32_t count = 0;                              // grid records
+    // A STREAM (the host's sidecar still downloading, terrain-stream.md): the
+    // open file, the bytes read from it, and the partial record at its end.
+    FILE* stream = nullptr;
+    uint64_t bytes = 0;
+    std::vector<uint8_t> tail;
+    std::string streamPath;                          // set when this came from a stream (done marker on release)
 };
+// The load is done with a stream: "<stream>.done" tells the joiner's lobby to
+// stop downloading the rest (it would only compete with the game's traffic).
+inline void MarkStreamDone(const std::string& path) {
+    if (path.empty()) return;
+    if (FILE* f = OpenFile((path + ".done").c_str(), L"wb")) fclose(f);
+}
 static LoadState g_load;
 // THREADS (2026-09-26, a player's crash dump: tpf2_bigmap.dll+0x2e74 in
 // EndApply's vector free, the block's header page already released). The game
 // runs the alignment pass on many threads at once and every batched pass that
 // finishes calls EndApply: two of them released the same file. AddTile threads
 // may also still be decoding from it. Has/ApplyTile hold this lock shared
-// (ApplyTile across its decode); BeginApply and EndApply take it exclusive, and
-// the file is freed once, outside the lock.
+// (ApplyTile across its decode); BeginApply, Refresh and EndApply take it
+// exclusive, and the file is freed once, outside the lock.
 static SRWLOCK g_loadLock = SRWLOCK_INIT;
+
+constexpr uint32_t MaxBlob = 64u << 20;              // a tile's blob is ~16 KB; anything near this is a broken file
+// Index every complete record in `piece` (after `st.tail`, the partial record a
+// previous read ended in), keeping the piece. False if a record is malformed.
+inline bool IndexPiece(LoadState& st, std::vector<uint8_t>&& piece) {
+    std::vector<uint8_t> data;
+    if (!st.tail.empty()) { data = std::move(st.tail); st.tail.clear(); data.insert(data.end(), piece.begin(), piece.end()); }
+    else data = std::move(piece);
+    size_t p = 0, end = data.size();
+    const uint32_t chunk = uint32_t(st.chunks.size());
+    while (st.indexed < st.tiles && p + sizeof(TileHeader) <= end) {
+        TileHeader th{}; memcpy(&th, data.data() + p, sizeof th);
+        if (th.bytes == 0 || th.bytes > MaxBlob || th.index >= st.count) return false;
+        if (p + sizeof(TileHeader) + th.bytes > end) break;          // this record is still arriving
+        st.byIndex[th.index] = Loc{chunk, uint32_t(p + sizeof(TileHeader)), th.bytes};
+        p += sizeof(TileHeader) + th.bytes;
+        ++st.indexed;
+    }
+    if (st.indexed < st.tiles && p < end) st.tail.assign(data.begin() + p, data.end());
+    data.resize(p);
+    st.chunks.push_back(std::move(data));
+    return true;
+}
+// Everything `f` holds from its current position on.
+inline int64_t Tell(FILE* f) {
+#ifdef _WIN32
+    return _ftelli64(f);
+#else
+    return int64_t(ftello(f));
+#endif
+}
+inline bool Seek(FILE* f, int64_t off, int whence) {
+#ifdef _WIN32
+    return _fseeki64(f, off, whence) == 0;
+#else
+    return fseeko(f, off_t(off), whence) == 0;
+#endif
+}
+inline std::vector<uint8_t> ReadAvailable(FILE* f) {
+    std::vector<uint8_t> out;
+    clearerr(f);                                     // a stream's earlier read hit its end
+    const int64_t at = Tell(f);
+    int64_t end = -1;
+    if (at >= 0 && Seek(f, 0, SEEK_END)) { end = Tell(f); Seek(f, at, SEEK_SET); }
+    if (end > at) {                                  // one read of what is there now
+        out.resize(size_t(end - at));
+        out.resize(fread(out.data(), 1, out.size(), f));
+    }
+    return out;
+}
 
 // Open, validate the header against the live grid's fingerprint and dimensions,
 // and index every tile by scanning the tile headers (NO decode). Returns the
 // number of tiles indexed, or 0 (nothing held) if the file is absent, foreign,
 // stale, or structurally broken (a header whose lengths run past the file).
+//
+// With `stream`, a file still arriving (the host's sidecar being downloaded
+// while this load runs) is taken as far as it goes and kept open: Refresh
+// indexes what arrives later, and the return is the tiles indexed so far,
+// possibly 0 with the header in hand (then it is loaded, just empty yet).
 //
 // It deliberately does NOT decode the blobs up front: on a 100k-tile map that
 // would stall the first AddTile for the whole verify. Each blob carries its own
@@ -339,43 +414,67 @@ static SRWLOCK g_loadLock = SRWLOCK_INIT;
 // publication) ONLY when ApplyTile returns true; a false result must fall back
 // to the normal compute for that tile. `verify` is unused, kept so the caller's
 // BeginIfPending(cterrain, scratch) signature is stable.
-inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* /*verify*/ = nullptr) {
+inline long BeginApply(const Grid& grid, uint64_t fingerprint, const char* path, BlockCodec::DecodeScratch* /*verify*/ = nullptr, bool stream = false) {
     {
         LoadState old;
         AcquireSRWLockExclusive(&g_loadLock);
         old = std::move(g_load);
         g_load = LoadState{};
         ReleaseSRWLockExclusive(&g_loadLock);
+        if (old.stream) fclose(old.stream);
+        MarkStreamDone(old.streamPath);
     }
     if (!grid.base || !grid.records()) return 0;
     FILE* f = OpenFile(path, L"rb");
     if (!f) return 0;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz < long(sizeof(FileHeader))) { fclose(f); return 0; }
-    std::vector<uint8_t> buf; buf.resize(size_t(sz));
-    bool read = fread(buf.data(), 1, size_t(sz), f) == size_t(sz);
-    fclose(f);
-    if (!read) return 0;
-    FileHeader hdr{}; memcpy(&hdr, buf.data(), sizeof hdr);
-    if (hdr.magic != Magic || hdr.version != Version || hdr.headerHash != HashHeader(hdr)) return 0;
-    if (hdr.fingerprint != fingerprint || hdr.nx != grid.nx() || hdr.ny != grid.ny()) return 0;
-    const uint32_t count = uint32_t(grid.nx()) * uint32_t(grid.ny());
-    std::vector<std::pair<uint32_t, uint32_t>> index(count, {0u, 0u});
-    size_t p = sizeof(FileHeader);
-    for (uint32_t k = 0; k < hdr.tiles; ++k) {
-        if (p + sizeof(TileHeader) > size_t(sz)) return 0;
-        TileHeader th{}; memcpy(&th, buf.data() + p, sizeof th); p += sizeof(TileHeader);
-        if (th.bytes == 0 || p + th.bytes > size_t(sz) || th.index >= count) return 0;
-        index[th.index] = {uint32_t(p), th.bytes};   // p != 0 always (past the header)
-        p += th.bytes;
+    FileHeader hdr{};
+    if (fread(&hdr, sizeof hdr, 1, f) != 1 || hdr.magic != Magic || hdr.version != Version || hdr.headerHash != HashHeader(hdr) ||
+        hdr.fingerprint != fingerprint || hdr.nx != grid.nx() || hdr.ny != grid.ny()) { fclose(f); return 0; }
+    LoadState st;
+    st.count = uint32_t(grid.nx()) * uint32_t(grid.ny());
+    st.tiles = hdr.tiles;
+    st.byIndex.assign(st.count, Loc{});
+    std::vector<uint8_t> rest = ReadAvailable(f);
+    st.bytes = sizeof hdr + rest.size();
+    if (hdr.tiles > st.count || !IndexPiece(st, std::move(rest))) { fclose(f); return 0; }
+    if (st.indexed == st.tiles) {
+        fclose(f);
+    } else if (!stream) {
+        fclose(f); return 0;                         // truncated
+    } else {
+        st.stream = f;
     }
+    if (stream) st.streamPath = path;
+    st.loaded = true;
+    const long indexed = long(st.indexed);
     AcquireSRWLockExclusive(&g_loadLock);
-    g_load.file = std::move(buf);
-    g_load.byIndex = std::move(index);
-    g_load.tiles = hdr.tiles;
-    g_load.loaded = true;
+    g_load = std::move(st);
     ReleaseSRWLockExclusive(&g_loadLock);
-    return long(hdr.tiles);
+    return stream ? indexed : long(hdr.tiles);
+}
+// A stream: index what arrived since the last look. True while it is still
+// arriving; false once complete (the file is then closed) or not a stream.
+// A malformed stream is closed with what it had.
+inline bool Refresh() {
+    FILE* done = nullptr; bool more = false;
+    AcquireSRWLockExclusive(&g_loadLock);
+    if (g_load.loaded && g_load.stream) {
+        std::vector<uint8_t> piece = ReadAvailable(g_load.stream);
+        g_load.bytes += piece.size();
+        const bool ok = piece.empty() || IndexPiece(g_load, std::move(piece));
+        if (!ok || g_load.indexed == g_load.tiles) { done = g_load.stream; g_load.stream = nullptr; g_load.tail.clear(); }
+        else more = true;
+    }
+    ReleaseSRWLockExclusive(&g_loadLock);
+    if (done) fclose(done);
+    return more;
+}
+struct StreamState { bool loaded, streaming; uint32_t indexed, tiles; uint64_t bytes; };
+inline StreamState Progress() {
+    AcquireSRWLockShared(&g_loadLock);
+    const StreamState s{g_load.loaded, g_load.stream != nullptr, g_load.indexed, g_load.tiles, g_load.bytes};
+    ReleaseSRWLockShared(&g_loadLock);
+    return s;
 }
 inline bool Loaded() {
     AcquireSRWLockShared(&g_loadLock);
@@ -385,7 +484,7 @@ inline bool Loaded() {
 }
 // Caller holds g_loadLock (shared or exclusive).
 inline bool HasLocked(uint32_t recordIndex) {
-    return g_load.loaded && recordIndex < g_load.byIndex.size() && g_load.byIndex[recordIndex].first != 0;
+    return g_load.loaded && recordIndex < g_load.byIndex.size() && g_load.byIndex[recordIndex].bytes != 0;
 }
 inline bool Has(uint32_t recordIndex) {
     AcquireSRWLockShared(&g_loadLock);
@@ -404,8 +503,8 @@ inline bool ApplyTile(const Grid& grid, uint32_t recordIndex, BlockCodec::Decode
     if (HasLocked(recordIndex)) {
         TileVector* v = VectorOf(grid.record(recordIndex));
         if (Eligible(v)) {
-            const auto& e = g_load.byIndex[recordIndex];
-            ok = BlockCodec::Decode(g_load.file.data() + e.first, e.second, v->first, Samples, scratch);
+            const Loc& e = g_load.byIndex[recordIndex];
+            ok = BlockCodec::Decode(g_load.chunks[e.chunk].data() + e.off, e.bytes, v->first, Samples, scratch);
         }
     }
     ReleaseSRWLockShared(&g_loadLock);
@@ -420,6 +519,8 @@ inline bool EndApply() {
     old = std::move(g_load);
     g_load = LoadState{};
     ReleaseSRWLockExclusive(&g_loadLock);
+    if (old.stream) fclose(old.stream);
+    MarkStreamDone(old.streamPath);
     return had;
 }
 
@@ -551,11 +652,105 @@ static bool g_pending = false;         // a fingerprint is armed; BeginApply not
 // Called from the LoadGame hook once the .sav path is known, before the world
 // builds. Hashes the save and arms the sidecar; the actual BeginApply waits for
 // the CTerrain, which BeginIfPending supplies.
+static char g_streamDir[520] = {0};    // with a trailing separator; empty = no streams
+static bool g_streamWanted = false;    // this load has no sidecar of its own: look for a stream
 inline void ArmForLoad(const char* savPath) {
     g_saveFingerprint = HashFile(savPath);
     SidecarPath(savPath, g_sidecarPath, sizeof g_sidecarPath);
     if (g_saveFingerprint && g_sidecarPath[0]) FindByFingerprint(g_saveFingerprint, g_sidecarPath, sizeof g_sidecarPath);
     g_pending = g_saveFingerprint && g_sidecarPath[0];
+    g_streamWanted = false;
+}
+
+// ---- The host's sidecar, streamed while this load runs (docs/terrain-stream.md) ----
+// A joiner's lobby writes the host's "<save>.terr" into <data>/terrain_stream/
+// as it downloads, in order, from the moment the load starts. No sidecar beside
+// the save: the stream with this save's fingerprint is used instead, as far as
+// it has arrived, and the alignment pass waits for the rest when that is faster
+// than computing the tiles it lacks.
+#ifdef _WIN32
+constexpr char kSep = '\\';
+#else
+constexpr char kSep = '/';
+#endif
+inline void SetStreamDir(const char* dataDir) {
+    g_streamDir[0] = 0;
+    if (!dataDir || !dataDir[0]) return;
+    const size_t n = strlen(dataDir);
+    const bool sep = dataDir[n - 1] == '/' || dataDir[n - 1] == '\\';
+    snprintf(g_streamDir, sizeof g_streamDir, "%s%sterrain_stream%c", dataDir, sep ? "" : (kSep == '/' ? "/" : "\\"), kSep);
+}
+inline int64_t NowMs() {
+    return int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// The stream for `fingerprint` in the stream folder, if its header has arrived.
+inline bool FindStream(uint64_t fingerprint, char* path, size_t cap) {
+    if (!g_streamDir[0] || !fingerprint || cap < 8) return false;
+    const int n = snprintf(path, cap, "%s-.terr", g_streamDir);   // no such file: FindByFingerprint scans its folder
+    if (n <= 0 || size_t(n) >= cap) return false;
+    return FindByFingerprint(fingerprint, path, cap) && strcmp(path + strlen(path) - 6, "-.terr") != 0;
+}
+// Load the stream for this save, if there is one yet. Throttled to every 250 ms:
+// AddTile and the pass call it freely. True once anything is loaded.
+inline bool TryStream(void* cterrain, bool now = false) {
+    if (Loaded()) return true;
+    if (!g_streamWanted || !cterrain) return false;
+    static std::atomic<int64_t> lastMs{0};
+    const int64_t t = NowMs();
+    int64_t last = lastMs.load();
+    if (!now && (t - last < 250 || !lastMs.compare_exchange_strong(last, t))) return false;
+    char path[520];
+    if (!FindStream(g_saveFingerprint, path, sizeof path)) return false;
+    g_streamWanted = false;
+    BeginApply(GridOf(cterrain), g_saveFingerprint, path, nullptr, true);
+    if (!Loaded()) return false;
+    snprintf(g_sidecarPath, sizeof g_sidecarPath, "%s", path);
+    return true;
+}
+// A stream still arriving: index what came since, at most every 100 ms.
+inline void RefreshIfDue() {
+    static std::atomic<int64_t> lastMs{0};
+    const int64_t t = NowMs();
+    int64_t last = lastMs.load();
+    if (t - last < 100 || !lastMs.compare_exchange_strong(last, t)) return;
+    Refresh();
+}
+// At the alignment pass, with `missing` of this terrain's tiles not yet served:
+// wait for the rest of the stream while its arrival (at the rate seen during
+// the wait) beats the pass computing them (`msPerTile` each), giving up after
+// `stallMs` without a byte or `capMs` in all. True once the stream is complete.
+// `why` gets a short account for the log.
+inline bool WaitForStream(uint32_t missing, double msPerTile, int64_t stallMs, int64_t capMs, char* why, size_t whyCap) {
+    const int64_t t0 = NowMs();
+    int64_t lastGrowth = t0;
+    StreamState s = Progress();
+    const uint64_t bytes0 = s.bytes;
+    uint64_t lastBytes = s.bytes;
+    for (;;) {
+        Refresh();
+        s = Progress();
+        const int64_t t = NowMs(), waited = t - t0;
+        if (!s.streaming) {
+            snprintf(why, whyCap, "%s after %lld ms; %u of %u tiles", s.indexed == s.tiles ? "complete" : "ended", (long long)waited, s.indexed, s.tiles);
+            return s.loaded && s.indexed == s.tiles;
+        }
+        if (s.bytes != lastBytes) { lastBytes = s.bytes; lastGrowth = t; }
+        if (t - lastGrowth > stallMs) { snprintf(why, whyCap, "no data for %lld ms; %u of %u tiles", (long long)stallMs, s.indexed, s.tiles); return false; }
+        if (waited > capMs) { snprintf(why, whyCap, "gave up after %lld ms; %u of %u tiles", (long long)waited, s.indexed, s.tiles); return false; }
+        if (waited >= 1000 && s.indexed) {
+            // After a second of arrival: the rest at this rate against the pass.
+            const double rate = double(s.bytes - bytes0) / double(waited);          // bytes per ms
+            const double perTile = double(s.bytes) / double(s.indexed);
+            const double eta = rate > 0 ? double(s.tiles - s.indexed) * perTile / rate : 1e18;
+            const double pass = double(missing) * msPerTile;
+            if (eta > pass) {
+                snprintf(why, whyCap, "the rest (%u tiles) would take ~%.0f s at %.1f MB/s, the pass ~%.0f s; %u of %u tiles",
+                         s.tiles - s.indexed, eta / 1000.0, rate / 1000.0, pass / 1000.0, s.indexed, s.tiles);
+                return false;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 // Called with the CTerrain the pass will populate, before its first AddTile
 // (the pass owner's Detour entry is the natural spot). Runs BeginApply once.
@@ -563,7 +758,9 @@ inline void ArmForLoad(const char* savPath) {
 inline bool BeginIfPending(void* cterrain, BlockCodec::DecodeScratch* verify) {
     if (!g_pending || !cterrain) return Loaded();
     g_pending = false;
-    return BeginApply(GridOf(cterrain), g_saveFingerprint, g_sidecarPath, verify) > 0;
+    if (BeginApply(GridOf(cterrain), g_saveFingerprint, g_sidecarPath, verify) > 0) return true;
+    g_streamWanted = g_streamDir[0] != 0;            // none beside the save: the host's may be arriving
+    return TryStream(cterrain, true);
 }
 // Called from the SaveGame hook after the save is written, with the CTerrain and
 // the .sav just written. Hashes the save and writes the sidecar beside it.

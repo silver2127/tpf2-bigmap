@@ -11,6 +11,7 @@
 #include <array>
 #include <algorithm>
 #include <new>
+#include <mutex>
 #include "../src/tpf2mp_plugin.h"
 static const Tpf2mpHost* H = nullptr;
 static bool g_gog = false;
@@ -215,7 +216,7 @@ int main() {
             *reinterpret_cast<float*>(t.cterrain + 0x34) = 0.25f;
             for (uint32_t i = 0; i < uint32_t(nx * ny); ++i)
                 BigmapTestServeDetour(t.cterrain, int(1000 + i), FakeAddTile, [](const void* p) { served.push_back(p); return true; });
-            assert(Loaded() && long(served.size()) == want);
+            assert(Loaded() == (want > 0) && long(served.size()) == want);
         };
         FakeTerrain fullLoad(nx, ny);
         load(fullLoad, full, nx * ny);
@@ -254,6 +255,30 @@ int main() {
         served.pop_back();
         assert(BigmapTestServeAllServedFinish(oneGone.cterrain) == 0);
         EndApply();
+        // THE STREAM (terrain-stream.md): no sidecar beside the save, the host's
+        // arriving in <data>/terrain_stream/ only after every tile was added.
+        // The pass finds it, serves every tile there and is skipped.
+        {
+            CreateDirectoryA("test_stream_data", nullptr); CreateDirectoryA("test_stream_data/terrain_stream", nullptr);
+            TerrainSidecar::SetStreamDir("test_stream_data");
+            FakeTerrain late(nx, ny);
+            load(late, "test_serve_absent.bin", 0);                       // nothing beside the save: nothing loaded
+            assert(!Loaded() && TerrainSidecar::g_streamWanted);
+            assert(CopyFileA(full, "test_stream_data/terrain_stream/77.terr", FALSE));
+            TerrainServe::mark = [](const void* p) {          // CatchUp marks from several threads
+                static std::mutex m; std::lock_guard<std::mutex> l(m); served.push_back(p); return true; };
+            assert(BigmapTestServeAllServedFinish(late.cterrain) == 1);
+            for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
+                assert(memcmp(late.caches[i].data(), all.caches[i].data(), Samples * 2) == 0);
+                assert(*reinterpret_cast<int32_t*>(late.record(i) + 0x20) == 2);
+            }
+            assert(BigmapTestServeAllServedFinish(late.cterrain) == 0);   // passed once: a pass in play runs
+            EndApply();
+            TerrainSidecar::SetStreamDir(nullptr);
+            assert(GetFileAttributesA("test_stream_data/terrain_stream/77.terr.done") != INVALID_FILE_ATTRIBUTES);   // the lobby stops the rest
+            DeleteFileA("test_stream_data/terrain_stream/77.terr"); DeleteFileA("test_stream_data/terrain_stream/77.terr.done");
+            RemoveDirectoryA("test_stream_data/terrain_stream"); RemoveDirectoryA("test_stream_data");
+        }
         remove(full);
         g_terrainServedCheck = nullptr;
     }

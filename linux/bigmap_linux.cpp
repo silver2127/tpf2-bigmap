@@ -409,6 +409,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         linux_sidecar::Log()=H->log;
         linux_sidecar::WriteOn()=H->cfgBool(Section,"terrain_sidecar_write",1);
         TerrainSidecar::g_writeThreads=H->cfgInt(Section,"terrain_sidecar_threads",0);
+        if(H->cfgBool(Section,"terrain_stream",1) && H->dataDir)TerrainSidecar::SetStreamDir(H->dataDir());
         void* t=nullptr;
         // AddTile first (inert until a load arms a sidecar), LoadGame last: nothing is armed before every hook is in.
         const bool hooked=sites &&
