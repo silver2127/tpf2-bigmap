@@ -654,11 +654,14 @@ static bool g_pending = false;         // a fingerprint is armed; BeginApply not
 // the CTerrain, which BeginIfPending supplies.
 static char g_streamDir[520] = {0};    // with a trailing separator; empty = no streams
 static bool g_streamWanted = false;    // this load has no sidecar of its own: look for a stream
+static bool g_readLocal = true;        // terrain_sidecar_read_local=0: streams only (a test of the stream on one PC,
+                                       // where a second instance sees the first one's save folder)
 inline void ArmForLoad(const char* savPath) {
     g_saveFingerprint = HashFile(savPath);
     SidecarPath(savPath, g_sidecarPath, sizeof g_sidecarPath);
-    if (g_saveFingerprint && g_sidecarPath[0]) FindByFingerprint(g_saveFingerprint, g_sidecarPath, sizeof g_sidecarPath);
-    g_pending = g_saveFingerprint && g_sidecarPath[0];
+    if (!g_readLocal) g_sidecarPath[0] = 0;
+    else if (g_saveFingerprint && g_sidecarPath[0]) FindByFingerprint(g_saveFingerprint, g_sidecarPath, sizeof g_sidecarPath);
+    g_pending = g_saveFingerprint && (g_sidecarPath[0] || g_streamDir[0]);
     g_streamWanted = false;
 }
 
