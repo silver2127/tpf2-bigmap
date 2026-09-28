@@ -52,7 +52,7 @@ def main():
     tight=dll.BigmapTestCommitTightBytes;tight.argtypes=[C.c_uint64];tight.restype=C.c_uint64
     for phys,want in [(0,12*G),(8*G,2*G),(16*G,(16*G)//7),(32*G,(32*G)//7),(94*G,12*G),(512*G,12*G)]:
         assert headroom(phys)==want,(phys,headroom(phys),want)
-    for phys,want in [(0,4*G),(8*G,2*G),(16*G,2*G),(24*G,3*G),(32*G,4*G),(94*G,4*G)]:
+    for phys,want in [(0,3*G),(8*G,2*G),(16*G,2*G),(20*G,int(2.5*G)),(24*G,3*G),(32*G,3*G),(94*G,3*G)]:
         assert tight(phys)==want,(phys,tight(phys),want)
     # Commit tight: give back only the deficit (threshold + 1 GiB - free commit),
     # from what is resident now; never grow; 256 MiB while loading or under half
