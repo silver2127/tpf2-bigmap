@@ -53,7 +53,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <memory>
+#include <new>
+#include <string>
+#include <thread>
 #include <vector>
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN   // keeps rpcndr.h's `#define small char` out of whoever includes this
 #endif
@@ -61,6 +67,20 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+// The native Linux build (bigmap/linux/sidecar_linux.cpp, 2026-09-28): the same
+// file format byte for byte, so a sidecar written on one platform serves on the
+// other. Only the file, directory and lock primitives differ.
+#include <pthread.h>
+#include <dirent.h>
+#include <strings.h>
+typedef pthread_rwlock_t SRWLOCK;
+#define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
+inline void AcquireSRWLockExclusive(SRWLOCK* l) { pthread_rwlock_wrlock(l); }
+inline void ReleaseSRWLockExclusive(SRWLOCK* l) { pthread_rwlock_unlock(l); }
+inline void AcquireSRWLockShared(SRWLOCK* l) { pthread_rwlock_rdlock(l); }
+inline void ReleaseSRWLockShared(SRWLOCK* l) { pthread_rwlock_unlock(l); }
+#endif
 #include "small_codec.h"
 #include "terrain_codec.h"   // Side, Samples
 
@@ -74,6 +94,7 @@ constexpr size_t Samples = TerrainCodec::Samples;   // 66,049
 // UTF-8 std::string); the CRT's narrow fopen would read them in the ANSI code
 // page and miss a profile folder with a non-ASCII name. Windows only: this
 // header is part of the plugin DLL and of its offline test.
+#ifdef _WIN32
 inline bool WidePath(const char* utf8, wchar_t* out, int cap) {
     if (!utf8 || !utf8[0]) return false;
     return MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, cap) > 0;
@@ -84,6 +105,16 @@ inline FILE* OpenFile(const char* utf8, const wchar_t* mode) {
     return f;
 }
 inline void RemoveFile(const char* utf8) { wchar_t w[1040]; if (WidePath(utf8, w, 1040)) _wremove(w); }
+#else
+// Linux paths are bytes: UTF-8 passes through unchanged.
+inline FILE* OpenFile(const char* path, const wchar_t* mode) {
+    char m[8]; size_t i = 0;
+    for (; mode[i] && i + 1 < sizeof m; ++i) m[i] = char(mode[i]);
+    m[i] = 0;
+    return path && path[0] ? fopen(path, m) : nullptr;
+}
+inline void RemoveFile(const char* path) { if (path && path[0]) remove(path); }
+#endif
 
 #pragma pack(push, 1)
 struct FileHeader {
@@ -143,9 +174,36 @@ inline uint64_t HashHeader(const FileHeader& h) {
     return v;
 }
 
+// One tile's encode. On Windows a fault reading the tile (a freed or foreign
+// vector) is caught here, per tile and on whichever thread encodes it, and the
+// tile is omitted -- the caller's own __try does not reach worker threads.
+#ifdef _WIN32
+inline size_t EncodeTileGuarded(const uint16_t* first, uint8_t* out, size_t cap, BlockCodec::EncodeScratch* s, bool* fault) {
+    __try { return BlockCodec::Encode(first, Samples, out, cap, *s); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *fault = true; return 0; }
+}
+#else
+inline size_t EncodeTileGuarded(const uint16_t* first, uint8_t* out, size_t cap, BlockCodec::EncodeScratch* s, bool*) {
+    return BlockCodec::Encode(first, Samples, out, cap, *s);
+}
+#endif
+// Encoder threads for a sidecar write: `requested` when positive, else the
+// CPUs less one, at most 8. MEASURED 2026-09-28: 36,992 tiles took 12,170 ms on
+// one thread, inside SaveGame, while every player waited on the save.
+inline unsigned WriteThreads(int requested) {
+    if (requested > 0) return unsigned(requested > 16 ? 16 : requested);
+    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned n = hw > 1 ? hw - 1 : 1;
+    return n > 8 ? 8 : n;
+}
+static int g_writeThreads = 0;   // terrain_sidecar_threads; 0 = automatic, 1 = the single-thread path
+
 // ---- Write: compress every eligible tile of `grid` to `path`. ----
 // Returns the number of tiles written, or -1 on an I/O or allocation failure.
 // A partial file is removed on failure so a later Apply never sees it.
+// Tiles are encoded in windows of WriteWindow on WriteThreads() threads and
+// written in index order, so the file is byte for byte the single-thread one.
+constexpr uint32_t WriteWindow = 2048;
 inline long Write(const Grid& grid, uint64_t fingerprint, const char* path,
                   BlockCodec::EncodeScratch* scratch, uint64_t* compressedBytesOut = nullptr) {
     if (!grid.base || !grid.records()) return -1;
@@ -156,17 +214,47 @@ inline long Write(const Grid& grid, uint64_t fingerprint, const char* path,
     FileHeader hdr{Magic, Version, fingerprint, nx, ny, 0, 0};
     // Header rewritten at the end with the true tile count and hash.
     if (fwrite(&hdr, sizeof hdr, 1, f) != 1) { fclose(f); RemoveFile(path); return -1; }
-    std::vector<uint8_t> blob(Samples * 2 + 128);
+    const size_t cap = Samples * 2 + 128;
     uint32_t tiles = 0; uint64_t compressed = 0; bool ok = true;
     const uint32_t count = uint32_t(nx) * uint32_t(ny);
-    for (uint32_t i = 0; i < count && ok; ++i) {
-        TileVector* v = VectorOf(grid.record(i));
-        if (!Eligible(v)) continue;
-        size_t n = BlockCodec::Encode(v->first, Samples, blob.data(), blob.size(), *scratch);
-        if (!n) continue;   // an incompressible tile is simply omitted; Apply leaves it to the pass
-        TileHeader th{i, uint32_t(n)};
-        if (fwrite(&th, sizeof th, 1, f) != 1 || fwrite(blob.data(), 1, n, f) != n) { ok = false; break; }
-        ++tiles; compressed += n;
+    const unsigned threads = WriteThreads(g_writeThreads);
+    // Per-window output: slot k holds tile (window start + k), its length in lens[k]
+    // (0 = omitted: not eligible, incompressible, or unreadable).
+    const uint32_t window = count < WriteWindow ? count : WriteWindow;
+    std::unique_ptr<uint8_t[]> out(new (std::nothrow) uint8_t[size_t(window) * cap]);
+    std::unique_ptr<uint32_t[]> lens(new (std::nothrow) uint32_t[window]);
+    std::vector<std::unique_ptr<BlockCodec::EncodeScratch>> scratches;
+    for (unsigned t = 1; t < threads; ++t) {
+        std::unique_ptr<BlockCodec::EncodeScratch> s(new (std::nothrow) BlockCodec::EncodeScratch);
+        if (!s) break;
+        scratches.push_back(std::move(s));
+    }
+    if (!out || !lens) { fclose(f); RemoveFile(path); return -1; }
+    for (uint32_t start = 0; start < count && ok; start += window) {
+        const uint32_t n = count - start < window ? count - start : window;
+        std::atomic<uint32_t> next{0};
+        auto work = [&](BlockCodec::EncodeScratch* s) {
+            for (uint32_t k; (k = next.fetch_add(1)) < n;) {
+                lens[k] = 0;
+                TileVector* v = VectorOf(grid.record(start + k));
+                if (!Eligible(v)) continue;
+                bool fault = false;
+                const size_t bytes = EncodeTileGuarded(v->first, out.get() + size_t(k) * cap, cap, s, &fault);
+                lens[k] = fault ? 0 : uint32_t(bytes);
+            }
+        };
+        std::vector<std::thread> pool;
+        for (auto& s : scratches) {
+            try { pool.emplace_back(work, s.get()); } catch (...) { break; }   // fewer threads, same result
+        }
+        work(scratch);
+        for (auto& t : pool) t.join();
+        for (uint32_t k = 0; k < n && ok; ++k) {
+            if (!lens[k]) continue;   // omitted; Apply leaves it to the pass
+            TileHeader th{start + k, lens[k]};
+            if (fwrite(&th, sizeof th, 1, f) != 1 || fwrite(out.get() + size_t(k) * cap, 1, lens[k], f) != lens[k]) { ok = false; break; }
+            ++tiles; compressed += lens[k];
+        }
     }
     if (ok) {
         hdr.tiles = tiles; hdr.headerHash = HashHeader(hdr);
@@ -375,19 +463,27 @@ inline bool Refingerprint(const char* path, uint64_t fingerprint) {
     return ok;
 }
 // The fingerprint a sidecar file carries, 0 if it is not a valid sidecar.
-inline uint64_t FingerprintOf(const wchar_t* widePath) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, widePath, L"rb") || !f) return 0;
+inline uint64_t FingerprintOfFile(FILE* f) {
+    if (!f) return 0;
     FileHeader hdr{};
     bool ok = fread(&hdr, sizeof hdr, 1, f) == 1 && hdr.magic == Magic && hdr.version == Version && hdr.headerHash == HashHeader(hdr);
     fclose(f);
     return ok ? hdr.fingerprint : 0;
 }
+#ifdef _WIN32
+inline uint64_t FingerprintOf(const wchar_t* widePath) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, widePath, L"rb") || !f) return 0;
+    return FingerprintOfFile(f);
+}
+#endif
+inline uint64_t FingerprintOfPath(const char* path) { return FingerprintOfFile(OpenFile(path, L"rb")); }
 // The sidecar for a save is normally "<save>.terr". Multiplayer loads a COPY of
 // the host's save under another name (mp_shared.sav), and the copy has the same
 // bytes and so the same fingerprint: when the named file is absent or carries
 // another fingerprint, look through the save's folder for one that matches.
 // Reads 32 bytes per candidate. Leaves `path` alone when nothing matches.
+#ifdef _WIN32
 inline bool FindByFingerprint(uint64_t fingerprint, char* path, size_t cap) {
     wchar_t w[1040];
     if (!fingerprint || !WidePath(path, w, 1040)) return false;
@@ -410,10 +506,38 @@ inline bool FindByFingerprint(uint64_t fingerprint, char* path, size_t cap) {
     FindClose(h);
     return found;
 }
+#else
+inline bool FindByFingerprint(uint64_t fingerprint, char* path, size_t cap) {
+    if (!fingerprint || !path || !path[0]) return false;
+    if (FingerprintOfPath(path) == fingerprint) return true;
+    const char* slash = strrchr(path, '/');
+    if (!slash) return false;
+    std::string dir(path, size_t(slash - path + 1));
+    DIR* d = opendir(dir.c_str());
+    if (!d) return false;
+    bool found = false;
+    while (struct dirent* e = readdir(d)) {
+        const size_t n = strlen(e->d_name);
+        if (n < 5 || strcmp(e->d_name + n - 5, ".terr")) continue;
+        const std::string cand = dir + e->d_name;
+        if (FingerprintOfPath(cand.c_str()) == fingerprint && cand.size() < cap) {
+            memcpy(path, cand.c_str(), cand.size() + 1);
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+#endif
 inline void SidecarPath(const char* savPath, char* out, size_t cap) {
     // "<save>.sav" -> "<save>.terr"; otherwise "<path>.terr".
     size_t n = strlen(savPath);
+#ifdef _WIN32
     const char* ext = (n >= 4 && !_stricmp(savPath + n - 4, ".sav")) ? savPath + n - 4 : savPath + n;
+#else
+    const char* ext = (n >= 4 && !strcasecmp(savPath + n - 4, ".sav")) ? savPath + n - 4 : savPath + n;
+#endif
     size_t base = size_t(ext - savPath);
     if (base + 6 >= cap) { if (cap) out[0] = 0; return; }
     memcpy(out, savPath, base); memcpy(out + base, ".terr", 6);
@@ -453,6 +577,7 @@ inline long WriteForSave(void* cterrain, const char* savPath, BlockCodec::Encode
 }  // namespace TerrainSidecar
 
 // ---- Offline test entry points (no game state). ----
+#ifdef _WIN32
 extern "C" __declspec(dllexport) long BigmapTestSidecarWrite(void* cterrain, uint64_t fp, const char* path, uint64_t* bytesOut) {
     auto* s = new BlockCodec::EncodeScratch;
     long r = TerrainSidecar::Write(TerrainSidecar::GridOf(cterrain), fp, path, s, bytesOut);
@@ -463,3 +588,4 @@ extern "C" __declspec(dllexport) long BigmapTestSidecarApply(void* cterrain, uin
     long r = TerrainSidecar::Apply(TerrainSidecar::GridOf(cterrain), fp, path, s);
     delete s; return r;
 }
+#endif
