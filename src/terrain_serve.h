@@ -203,33 +203,41 @@ static bool ServedVersionPending() {
     return pending;
 }
 
-// The record AddTile just filled for `entity`, or -1: scan from this THREAD's
-// cursor. The load adds tiles on two threads at once, each in grid order in its
-// own part of the grid; one shared cursor started every scan where the OTHER
-// thread had been, and a 36,992-tile load probed ~30,000 records per tile
-// (2026-09-28: 6.6 billion probes for 221,952 tiles, the load thread ~92% in
-// here for ~20 s). Per thread and per grid it is one probe again.
-struct Cursor { const uint8_t* grid; uint32_t next; LONG generation; };
+// The record AddTile just filled for `entity`, or -1: searched OUTWARD from
+// this thread's last hit in this grid (last+1, last-1, last+2, last-2, ...).
+// A forward scan from one shared cursor cost ~35,000 probes per tile on a
+// 36,992-tile load (2026-09-28: 2.59 billion probes for 73,984 tiles, the load
+// thread 83% in here): the load adds tiles on two threads, and in an order a
+// forward scan wraps around for. Outward from each thread's own last hit,
+// ascending, descending and nearby orders all take one or two probes.
+struct Cursor { const uint8_t* grid; uint32_t last; LONG generation; };
 static thread_local Cursor tlsCursor = {nullptr, 0, -1};
-static uint32_t Probe(const TerrainSidecar::Grid& g, uint32_t n, uint32_t start, int entity, long* found) {
-    for (uint32_t k = 0; k < n; ++k) {
-        uint32_t i = start + k; if (i >= n) i -= n;
-        const uint8_t* r = g.record(i);
-        if (*reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8)) { *found = long(i); return k + 1; }
+static inline bool IsRecord(const TerrainSidecar::Grid& g, uint32_t i, int entity) {
+    const uint8_t* r = g.record(i);
+    return *reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8);
+}
+static uint32_t Probe(const TerrainSidecar::Grid& g, uint32_t n, uint32_t last, int entity, long* found) {
+    uint32_t probed = 0;
+    for (uint32_t d = 1; d <= n / 2 + 1; ++d) {
+        const uint32_t up = last + d < n ? last + d : last + d - n;         // last + d, wrapped
+        const uint32_t down = last >= d ? last - d : last + n - d;          // last - d, wrapped
+        ++probed; if (IsRecord(g, up, entity)) { *found = long(up); return probed; }
+        if (down != up) { ++probed; if (IsRecord(g, down, entity)) { *found = long(down); return probed; } }
     }
-    *found = -1;
-    return n;
+    ++probed;
+    *found = IsRecord(g, last, entity) ? long(last) : -1;               // the last hit itself, checked last
+    return probed;
 }
 static long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
     if (!n) return -1;
     Cursor& c = tlsCursor;
     const LONG gen = cursor;                      // bumped when a load begins: every thread starts over
-    if (c.grid != g.base || c.generation != gen) { c.grid = g.base; c.next = 0; c.generation = gen; }
+    if (c.grid != g.base || c.generation != gen) { c.grid = g.base; c.last = n - 1; c.generation = gen; }   // n-1: record 0 is its "+1"
     long found;
-    const uint32_t probed = Probe(g, n, c.next % n, entity, &found);
+    const uint32_t probed = Probe(g, n, c.last % n, entity, &found);
     InterlockedAdd64(&probes, LONG64(probed));
-    if (found >= 0) c.next = uint32_t(found) + 1 < n ? uint32_t(found) + 1 : 0;
+    if (found >= 0) c.last = uint32_t(found);
     return found;
 }
 // Every CTerrain this load populated (a load holds two versions briefly and frees one).
@@ -315,8 +323,8 @@ static bool InstallTerrainServe() {
             return;
         }
         if (!TerrainSidecar::EndApply()) return;
-        if (H) H->log("terrain sidecar: load done, %lld tiles served (%lld unmarked, %lld absent, %lld not found, %lld copies skipped, open+verify %lld ms); file released",
-            applied, unmarked, absent, notFound, g_terrainServedCopiesSkipped, beginMs);
+        if (H) H->log("terrain sidecar: load done, %lld tiles served (%lld unmarked, %lld absent, %lld not found, %lld copies skipped, open+verify %lld ms, %.1f record probes per AddTile); file released",
+            applied, unmarked, absent, notFound, g_terrainServedCopiesSkipped, beginMs, calls ? double(probes) / double(calls) : 0.0);
     };
     H->log("terrain sidecar: a loaded sidecar's tiles are applied at AddTile and the load's publication into them is skipped");
     return true;
