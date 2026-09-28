@@ -43,6 +43,73 @@ static volatile LONG64 calls = 0, applied = 0, unmarked = 0, absent = 0, notFoun
 static volatile LONG cursor = 0;   // record index after the last hit; a hint, races are benign
 static thread_local BlockCodec::DecodeScratch* scratch = nullptr;
 
+// Each served tile's height range, taken while the decoded cache is hot, so a
+// skipped alignment pass can write the record's minZ/maxZ without touching the
+// (possibly evicted) tile again. One entry per record of the grid being
+// served: lo | hi << 16, or kNoRange. Reset when a sidecar load begins.
+constexpr uint32_t kNoRange = 0x0000FFFFu;   // lo 0xFFFF > hi 0: never a real range
+static SRWLOCK rangeLock = SRWLOCK_INIT;
+static uint8_t* rangeGrid = nullptr;
+static uint32_t rangeCount = 0;
+static uint32_t* ranges = nullptr;
+static void ResetRanges() {
+    AcquireSRWLockExclusive(&rangeLock);
+    if (ranges) HeapFree(GetProcessHeap(), 0, ranges);
+    ranges = nullptr; rangeGrid = nullptr; rangeCount = 0;
+    ReleaseSRWLockExclusive(&rangeLock);
+}
+// The stock CalcMinMaxHeight result (terrain-minmax.md): the true unsigned
+// minimum and maximum of the tile's samples.
+static uint32_t HeightRange(const uint16_t* h, size_t n) {
+    unsigned lo = h[0], hi = h[0];
+    for (size_t i = 1; i < n; ++i) { const unsigned v = h[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    return lo | (hi << 16);
+}
+static void NoteRange(const TerrainSidecar::Grid& g, uint32_t idx, const TerrainSidecar::TileVector* v) {
+    const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
+    const uint32_t r = HeightRange(v->first, TerrainSidecar::Samples);
+    AcquireSRWLockExclusive(&rangeLock);
+    if (rangeGrid != g.base || rangeCount != n) {
+        if (ranges) HeapFree(GetProcessHeap(), 0, ranges);
+        ranges = static_cast<uint32_t*>(HeapAlloc(GetProcessHeap(), 0, size_t(n) * sizeof(uint32_t)));
+        rangeGrid = ranges ? g.base : nullptr; rangeCount = ranges ? n : 0;
+        for (uint32_t i = 0; i < rangeCount; ++i) ranges[i] = kNoRange;
+    }
+    if (ranges && idx < rangeCount) ranges[idx] = r;
+    ReleaseSRWLockExclusive(&rangeLock);
+}
+// True, with every record's minZ/maxZ written and version bumped as the
+// engine's publication does (float(v) * the terrain's scale at +0x34, then
+// ++version), when every record of `terrain` holds a served tile whose range
+// was noted. False, changing nothing, otherwise.
+static bool AllServedFinish(void* terrain) {
+    // Only the load's own pass: the sidecar is released when it finishes, and a
+    // later big pass (a terraform in play) must run, served marks or not.
+    if (!terrain || !g_terrainServedCheck || !TerrainSidecar::Loaded()) return false;
+    TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+    if (!g.base || !g.records() || g.nx() <= 0 || g.ny() <= 0) return false;
+    const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
+    const float scale = *reinterpret_cast<const float*>(static_cast<uint8_t*>(terrain) + 0x34);
+    if (!(scale >= 0.0f)) return false;
+    AcquireSRWLockShared(&rangeLock);
+    bool ok = ranges && rangeGrid == g.base && rangeCount == n;
+    for (uint32_t i = 0; ok && i < n; ++i) {
+        const auto* v = TerrainSidecar::VectorOf(g.record(i));
+        ok = TerrainSidecar::Eligible(v) && g_terrainServedCheck(v->first) && ranges[i] != kNoRange;
+    }
+    if (ok) {
+        for (uint32_t i = 0; i < n; ++i) {
+            uint8_t* r = g.record(i);
+            const float lo = float(ranges[i] & 0xFFFF) * scale, hi = float(ranges[i] >> 16) * scale;
+            *reinterpret_cast<float*>(r + 0x18) = lo;
+            *reinterpret_cast<float*>(r + 0x1c) = hi;
+            *reinterpret_cast<int32_t*>(r + 0x20) += 1;
+        }
+    }
+    ReleaseSRWLockShared(&rangeLock);
+    return ok;
+}
+
 // The record AddTile just filled for `entity`, or -1: scan from the cursor.
 static long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
@@ -83,6 +150,7 @@ static void BeginIfArmed(void* terrain) {
     if (!TerrainSidecar::g_pending) return;
     AcquireSRWLockExclusive(&beginLock);
     if (TerrainSidecar::g_pending) {
+        ResetRanges();
         if (!scratch) scratch = new (std::nothrow) BlockCodec::DecodeScratch;
         LARGE_INTEGER f{}, t0{}, t1{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
         bool ok = scratch && TerrainSidecar::BeginIfPending(terrain, scratch);
@@ -109,6 +177,7 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     if (!scratch) return;
     if (!TerrainSidecar::ApplyTile(g, uint32_t(idx), *scratch)) { InterlockedIncrement64(&decodeFailed); return; }
     const auto* v = TerrainSidecar::VectorOf(g.record(uint32_t(idx)));
+    NoteRange(g, uint32_t(idx), v);
     if (mark && mark(v->first)) InterlockedIncrement64(&applied);
     else InterlockedIncrement64(&unmarked);
 }
@@ -127,6 +196,7 @@ static bool InstallTerrainServe() {
     }
     mark = TerrainPager::SetServed;
     g_terrainServedCheck = TerrainPager::IsServed;
+    g_alignmentAllServed = AllServedFinish;
     // Every thread whose batched alignment pass finishes lands here, several at
     // once: only the one that releases the file reports it (TerrainSidecar::g_loadLock).
     g_alignmentPassDone = []() {
@@ -151,6 +221,7 @@ extern "C" __declspec(dllexport) void BigmapTestServeDetour(void* terrain, int e
     TerrainServe::original = fn; TerrainServe::mark = markFn;
     TerrainServe::Detour(terrain, entity, 0, 0);
 }
+extern "C" __declspec(dllexport) int BigmapTestServeAllServedFinish(void* terrain) { return TerrainServe::AllServedFinish(terrain) ? 1 : 0; }
 extern "C" __declspec(dllexport) void BigmapTestServeCounters(long long* out) {
     out[0] = TerrainServe::calls; out[1] = TerrainServe::applied; out[2] = TerrainServe::unmarked; out[3] = TerrainServe::absent;
     out[4] = TerrainServe::notFound; out[5] = TerrainServe::probes; out[6] = TerrainServe::decodeFailed;

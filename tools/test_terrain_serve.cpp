@@ -19,12 +19,13 @@ namespace TerrainPager { static bool SetServed(const void*) { return false; } st
 static bool (*g_terrainServedCheck)(const void*) = nullptr;
 static volatile LONG64 g_terrainServedCopiesSkipped = 0;
 static void (*g_alignmentPassDone)() = nullptr;
+static bool (*g_alignmentAllServed)(void*) = nullptr;
 #include "../src/terrain_sidecar.h"
 #include "../src/terrain_serve.h"
 using namespace TerrainSidecar;
 
 struct FakeTerrain {
-    uint8_t cterrain[0x20];
+    uint8_t cterrain[0x40];   // +0x18 the grid, +0x34 the height scale
     std::vector<uint8_t> grid;
     std::vector<std::vector<uint16_t>> caches;
     std::vector<std::array<uint8_t, 0x20>> controls;
@@ -190,6 +191,61 @@ int main() {
             assert(!EndApply());
         }
         for (auto* ft : readers) delete ft;
+    }
+    // 8. A skipped alignment pass (AllServedFinish): only when every record of
+    //    the terrain is served and the sidecar is loaded; then each record gets
+    //    publication's minZ/maxZ (float(v) * scale) and one more version.
+    {
+        static std::vector<const void*> served;
+        g_terrainServedCheck = [](const void* p) { return std::find(served.begin(), served.end(), p) != served.end(); };
+        const char* full = "test_serve_full.bin";
+        FakeTerrain all(nx, ny);
+        for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
+            all.fill(i, i * 5 + 3);
+            *reinterpret_cast<int32_t*>(all.record(i) + 0) = int32_t(1000 + i);
+            *reinterpret_cast<uint8_t**>(all.record(i) + 8) = all.controls[i].data() + 0x10;
+            *reinterpret_cast<uint8_t**>(all.record(i) + 0x10) = all.controls[i].data();
+            auto* v = all.vec(i); v->first = all.caches[i].data(); v->last = v->end = v->first + Samples;
+        }
+        uint64_t fb = 0;
+        assert(Write(GridOf(all.cterrain), 0x5EED, full, enc, &fb) == nx * ny);
+        auto load = [&](FakeTerrain& t, const char* file, long want) {
+            TerrainSidecar::g_saveFingerprint = 0x5EED; strcpy_s(TerrainSidecar::g_sidecarPath, file); TerrainSidecar::g_pending = true;
+            g_live = &t; served.clear();
+            *reinterpret_cast<float*>(t.cterrain + 0x34) = 0.25f;
+            for (uint32_t i = 0; i < uint32_t(nx * ny); ++i)
+                BigmapTestServeDetour(t.cterrain, int(1000 + i), FakeAddTile, [](const void* p) { served.push_back(p); return true; });
+            assert(Loaded() && long(served.size()) == want);
+        };
+        FakeTerrain fullLoad(nx, ny);
+        load(fullLoad, full, nx * ny);
+        assert(BigmapTestServeAllServedFinish(fullLoad.cterrain) == 1);
+        for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
+            const auto& c = all.caches[i];
+            const uint16_t lo = *std::min_element(c.begin(), c.end()), hi = *std::max_element(c.begin(), c.end());
+            assert(*reinterpret_cast<float*>(fullLoad.record(i) + 0x18) == float(lo) * 0.25f);
+            assert(*reinterpret_cast<float*>(fullLoad.record(i) + 0x1c) == float(hi) * 0.25f);
+            assert(*reinterpret_cast<int32_t*>(fullLoad.record(i) + 0x20) == 2);   // AddTile's + publication's
+        }
+        EndApply();
+        assert(BigmapTestServeAllServedFinish(fullLoad.cterrain) == 0);          // released: a pass in play always runs
+        // 70% of the tiles in the sidecar: not all served, nothing written
+        FakeTerrain partLoad(nx, ny);
+        load(partLoad, path, written);
+        assert(BigmapTestServeAllServedFinish(partLoad.cterrain) == 0);
+        for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
+            assert(*reinterpret_cast<int32_t*>(partLoad.record(i) + 0x20) == 1);
+            assert(*reinterpret_cast<float*>(partLoad.record(i) + 0x18) == 0.0f);
+        }
+        EndApply();
+        // every tile applied, but one is no longer served (the arena let it go): refused
+        FakeTerrain oneGone(nx, ny);
+        load(oneGone, full, nx * ny);
+        served.pop_back();
+        assert(BigmapTestServeAllServedFinish(oneGone.cterrain) == 0);
+        EndApply();
+        remove(full);
+        g_terrainServedCheck = nullptr;
     }
     remove(path);
     // 6. Byte anchors in the real executable.

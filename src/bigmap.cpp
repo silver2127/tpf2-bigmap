@@ -1282,6 +1282,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
     g_travelTimeLimit = H->cfgInt("tpf2_bigmap", "travel_time_limit_s", 0);
     g_alignmentBatch = H->cfgInt("tpf2_bigmap", "alignment_batch_tiles", 512);
+    g_alignmentSkipServed = H->cfgInt("tpf2_bigmap", "alignment_skip_served", 1);
     g_terrainServe = H->cfgBool("tpf2_bigmap", "terrain_sidecar", 1) != 0;
     g_sidecarWrite = H->cfgBool("tpf2_bigmap", "terrain_sidecar_write", 1) != 0;
     g_sidecarMaxTiles = H->cfgInt("tpf2_bigmap", "terrain_sidecar_max_tiles", 0);
