@@ -411,6 +411,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         TerrainSidecar::g_writeThreads=H->cfgInt(Section,"terrain_sidecar_threads",0);
         if(H->cfgBool(Section,"terrain_stream",1) && H->dataDir)TerrainSidecar::SetStreamDir(H->dataDir());
         TerrainSidecar::g_readLocal=H->cfgBool(Section,"terrain_sidecar_read_local",1);
+        linux_sidecar::ServeAtPass()=H->cfgBool(Section,"terrain_sidecar_decode_at_pass",1);
         void* t=nullptr;
         // AddTile first (inert until a load arms a sidecar), LoadGame last: nothing is armed before every hook is in.
         const bool hooked=sites &&

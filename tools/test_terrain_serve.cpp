@@ -317,6 +317,36 @@ int main() {
             DeleteFileA("test_stream_data/terrain_stream/77.terr"); DeleteFileA("test_stream_data/terrain_stream/77.terr.done");
             RemoveDirectoryA("test_stream_data/terrain_stream"); RemoveDirectoryA("test_stream_data");
         }
+        // DECODE AT THE PASS (terrain_sidecar_decode_at_pass): AddTile serves
+        // nothing; each version's pass decodes all its tiles in parallel and is
+        // skipped, and the file stays until the second version has passed.
+        {
+            BigmapTestServeAtPass(1);
+            TerrainServe::ForgetTerrains();
+            FakeTerrain v1(nx, ny), v2(nx, ny);
+            *reinterpret_cast<float*>(v1.cterrain + 0x34) = 0.25f; *reinterpret_cast<float*>(v2.cterrain + 0x34) = 0.25f;
+            TerrainSidecar::g_saveFingerprint = 0x5EED; strcpy_s(TerrainSidecar::g_sidecarPath, full); TerrainSidecar::g_pending = true;
+            served.clear();
+            static std::mutex sm;
+            auto markSafe = [](const void* p) { std::lock_guard<std::mutex> l(sm); served.push_back(p); return true; };
+            g_live = &v1; for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) BigmapTestServeDetour(v1.cterrain, int(1000 + i), FakeAddTile, markSafe);
+            g_live = &v2; for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) BigmapTestServeDetour(v2.cterrain, int(1000 + i), FakeAddTile, markSafe);
+            assert(Loaded() && served.empty());                                   // nothing decoded at AddTile
+            for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) assert(v1.caches[i] != all.caches[i]);
+            TerrainServe::mark = markSafe;
+            assert(BigmapTestServeAllServedFinish(v1.cterrain) == 1);
+            assert(BigmapTestServeVersionPending() == 1 && Loaded());            // v2 seen at AddTile, not passed: keep the file
+            assert(BigmapTestServeAllServedFinish(v2.cterrain) == 1);
+            assert(BigmapTestServeVersionPending() == 0);
+            for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
+                assert(v1.caches[i] == all.caches[i] && v2.caches[i] == all.caches[i]);
+                assert(*reinterpret_cast<int32_t*>(v1.record(i) + 0x20) == 2 && *reinterpret_cast<int32_t*>(v2.record(i) + 0x20) == 2);
+            }
+            assert(served.size() == size_t(2 * nx * ny));
+            EndApply();
+            TerrainServe::ForgetTerrains();
+            BigmapTestServeAtPass(0);
+        }
         remove(full);
         g_terrainServedCheck = nullptr;
     }

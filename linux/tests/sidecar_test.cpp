@@ -260,6 +260,31 @@ int main() {
         TerrainSidecar::SetStreamDir(nullptr);
     }
 
+    // 11. Decode at the pass (terrain_sidecar_decode_at_pass): AddTile serves
+    //     nothing; each version's pass decodes its tiles, and the file stays
+    //     until the second version has passed.
+    {
+        g_savContent = "save v5";
+        f.Fill(13);
+        linux_sidecar::WriteOn() = true;
+        linux_sidecar::AddTileHook(f.terrain, 1000, 0, 0, 0, 0);
+        linux_sidecar::SaveHook(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &id, 0, nullptr);
+        std::vector<uint16_t> want5[N];
+        for (int i = 0; i < N; ++i) want5[i] = f.heights[i];
+        linux_sidecar::ServeAtPass() = true;
+        Fake v2;
+        f.Clear(); v2.Clear();
+        Load(f, id, N);
+        for (int i = 0; i < N; ++i) linux_sidecar::AddTileHook(v2.terrain, 1000 + i, 0, 0, 0, 0);
+        assert(TerrainSidecar::Loaded());
+        for (int i = 0; i < N; ++i) assert(f.heights[i] != want5[i]);   // nothing decoded at AddTile
+        assert(Pass(f) && TerrainSidecar::Loaded());                    // v2 still to pass: kept
+        assert(Pass(v2) && !TerrainSidecar::Loaded());
+        for (int i = 0; i < N; ++i) assert(f.heights[i] == want5[i] && v2.heights[i] == want5[i]);
+        linux_sidecar::ServeAtPass() = false;
+        linux_sidecar::ForgetTerrains();
+    }
+
     // 8. Writing off: a save leaves no sidecar.
     linux_sidecar::WriteOn() = false;
     const auto other = Id("Other");
