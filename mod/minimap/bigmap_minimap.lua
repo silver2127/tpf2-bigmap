@@ -332,6 +332,40 @@ end
 
 -- ---- companies --------------------------------------------------------------
 
+-- The multiplayer mod's palette (mp/companies.lua CM.cmPaletteColor): 20 distinct
+-- colours, then a golden-angle hue walk. A company's chosen colour arrives as an
+-- index into it (mp_company_map.txt), so the map matches the Multiplayer window.
+local MP_PALETTE = { { 230, 25, 75 }, { 0, 130, 200 }, { 60, 180, 75 }, { 245, 130, 48 }, { 145, 30, 180 }, { 70, 240, 240 },
+    { 240, 50, 230 }, { 255, 225, 25 }, { 0, 128, 128 }, { 170, 110, 40 }, { 210, 245, 60 }, { 128, 0, 0 }, { 0, 0, 128 },
+    { 128, 128, 0 }, { 250, 190, 212 }, { 220, 190, 255 }, { 170, 255, 195 }, { 255, 215, 180 }, { 128, 128, 128 }, { 255, 250, 200 } }
+local function paletteColor(idx)
+    idx = tonumber(idx) or 1
+    local c = MP_PALETTE[idx]
+    if c then
+        return c[1] / 255, c[2] / 255, c[3] / 255
+    end
+    local h = ((idx - 21) * 137.508) % 360
+    local sat, val = 0.62, 0.85
+    local C = val * sat
+    local X = C * (1 - math.abs((h / 60) % 2 - 1))
+    local m = val - C
+    local r, g, b
+    if h < 60 then
+        r, g, b = C, X, 0
+    elseif h < 120 then
+        r, g, b = X, C, 0
+    elseif h < 180 then
+        r, g, b = 0, C, X
+    elseif h < 240 then
+        r, g, b = 0, X, C
+    elseif h < 300 then
+        r, g, b = X, 0, C
+    else
+        r, g, b = C, 0, X
+    end
+    return r + m, g + m, b + m
+end
+
 local function companyColor(cid)
     cid = tonumber(cid) or 1
     local c = COMPANY_COLORS[cid]
@@ -416,13 +450,23 @@ local function readCompanyConfig()
             -- creation-order guess below is not.
             local okMap, m = pcall(io.open, candidates[i] .. "mp_company_map.txt", "r")
             if okMap and m then
-                local companyOf, names, me = {}, {}, nil
+                local companyOf, names, colors, me = {}, {}, {}, nil
                 pcall(function()
                     for line in m:lines() do
-                        local cid, pid, name = line:match("^(%d+)=(%d+)=(.*)$")
+                        -- "<cid>=<pid>=<name>[=<palette index>[=<RRGGBB>]]" (the index since
+                        -- 2026-09-27: the colour the company chose in the Multiplayer window;
+                        -- the RRGGBB since free colours, the exact one)
+                        local cid, pid, rest = line:match("^(%d+)=(%d+)=(.*)$")
                         if cid then
+                            local name, color, hex = rest:match("^([^=]*)=(%d+)=(%x%x%x%x%x%x)$")
+                            if not name then name, color = rest:match("^([^=]*)=(%d+)$") end
                             companyOf[tonumber(pid)] = tonumber(cid)
-                            names[tonumber(cid)] = unescape(name)
+                            names[tonumber(cid)] = unescape(name or rest)
+                            if hex then
+                                colors[tonumber(cid)] = { tonumber(hex:sub(1, 2), 16) / 255, tonumber(hex:sub(3, 4), 16) / 255, tonumber(hex:sub(5, 6), 16) / 255 }
+                            else
+                                colors[tonumber(cid)] = tonumber(color)
+                            end
                         else
                             me = tonumber(line:match("^me=(%d+)")) or me
                         end
@@ -430,7 +474,7 @@ local function readCompanyConfig()
                 end)
                 pcall(function() m:close() end)
                 if next(companyOf) then
-                    cfg.map, cfg.names = companyOf, names
+                    cfg.map, cfg.names, cfg.colors = companyOf, names, colors
                     cfg.mode = "companies"
                     if me then cfg.mine = me end
                 end
@@ -518,7 +562,14 @@ local function describeOwners(owners)
     for i = 1, #owners do
         local pid = owners[i]
         local cid = companyOf[pid]
-        local r, g, b = companyColor(cid or rank[pid])
+        local r, g, b
+        if cid and cfg.colors and type(cfg.colors[cid]) == "table" then
+            r, g, b = cfg.colors[cid][1], cfg.colors[cid][2], cfg.colors[cid][3]
+        elseif cid and cfg.colors and cfg.colors[cid] then
+            r, g, b = paletteColor(cfg.colors[cid])
+        else
+            r, g, b = companyColor(cid or rank[pid])
+        end
         local label
         if cid then
             label = (cfg.names and cfg.names[cid] and cfg.names[cid] ~= "") and cfg.names[cid] or string.format(tr("Company %d"), cid)
