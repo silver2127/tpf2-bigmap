@@ -9,12 +9,14 @@
 #include <cstring>
 #include <climits>
 #include <sys/mman.h>
+#include <chrono>
 #include "density.h"
 #include "terrain_pager.h"
 #include "alignment_batch.h"
 #include "memory_budget.h"
 #include "octree_depth.h"
 #include "generator_memory.h"
+#include "sidecar_linux.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -161,11 +163,19 @@ uint8_t* TownStub(uint8_t* page,uintptr_t ret) {
     return entry;
 }
 size_t alignmentBatch=0;
+bool sidecarOn=false;
 void AlignmentUpdate(void* self,const linux_alignment::Map* map) {
+    const size_t blocks=map?map->count:0;
+    // A load whose sidecar served every tile skips the pass (sidecar_linux.h).
+    if(sidecarOn && linux_sidecar::SkipPass(self,blocks)){linux_sidecar::PassDone(blocks);return;}
     const auto update=reinterpret_cast<linux_alignment::Update>(H->moduleBase()+0x173dae0);
     const auto next=reinterpret_cast<linux_alignment::Increment>(H->moduleBase()+0x6dc1c0);
+    const auto t0=std::chrono::steady_clock::now();
     const size_t n=linux_alignment::Run(self,map,alignmentBatch,update,next);
     if(n)H->log("alignment batch: %zu blocks in %zu batches of %zu",n,(n+alignmentBatch-1)/alignmentBatch,alignmentBatch);
+    if(blocks>512)H->log("alignment pass: %zu blocks, %lld ms",blocks,
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count());
+    if(sidecarOn)linux_sidecar::PassDone(blocks);
 }
 linux_pager::TerrainPager* terrainPager=nullptr;
 struct TerrainVector {uint16_t *begin,*end,*capacity;};
@@ -292,7 +302,9 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     }
     // Experimental until a live load proves the publication/lifetime contract.
     alignmentBatch=size_t(std::clamp(H->cfgInt(Section,"alignment_batch_tiles",0),0,65536));
-    if(alignmentBatch) {
+    // The sidecar needs the redirected UpdateSubterrains call too (to skip it).
+    sidecarOn=H->cfgBool(Section,"terrain_sidecar",1);
+    if(alignmentBatch || sidecarOn) {
         const uint8_t entry[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x49,0x89,0xfe,0x41,0x55,0x41,0x54,0x49,0x89,0xf4};
         const uint8_t iter[]={0x4c,0x89,0xff,0xe8,0xa3,0xe1,0xf9,0xfe,0x49,0x89,0xc7};
         const uint8_t value[]={0x49,0x8d,0x47,0x28,0x49,0x8b,0x76,0x08,0x4d,0x8d,0x46,0x20};
@@ -306,7 +318,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
            !H->verifyBytes(0x173e3ea,caller,sizeof(caller)) ||
            !H->verifyBytes(0x173e168,publish,sizeof(publish)) ||
            !PlanCall(0x173e443,0x173dae0,reinterpret_cast<void*>(AlignmentUpdate),stub)) {
-            alignmentBatch=0;H->log("alignment batch: byte mismatch; stock path retained");
+            alignmentBatch=0;sidecarOn=false;H->log("alignment batch: byte mismatch; stock path retained, no terrain sidecar");
         }
     }
     const bool minMax=H->cfgBool(Section,"terrain_minmax_fast",1);
@@ -377,6 +389,42 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
                 previous=now;previousFaults=s.faults;
             }
         }).detach();
+    }
+    if(sidecarOn){
+        // Every site the sidecar relies on, byte for byte (docs/linux/PORT.md, "Terrain sidecar").
+        static const uint8_t addTile[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x49,0x89,0xff};
+        static const uint8_t record[]={0x49,0x8b,0x77,0x18,0x41,0x8b,0x46,0x08,0x2b,0x46,0x04,0x0f,0xaf,0x46,0x08,0x41,0x03,0x46,0x04,0x2b,0x06,0x48,0x98,0x48,0x8d,0x3c,0x80,0x48,0x8b,0x46,0x10,0x4c,0x8d,0x24,0xf8};
+        static const uint8_t save[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x08,0x06,0x00,0x00};
+        static const uint8_t load[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x4c,0x8d,0xbd,0x58,0xfa,0xff,0xff,0x41,0x55,0x49,0x89,0xcd};
+        static const uint8_t saveId[]={0x4c,0x8b,0x65,0x10};                           // mov r12,[rbp+0x10]: the id is the first stack argument
+        static const uint8_t savePath[]={0x49,0x83,0x7c,0x24,0x08,0x00};               // cmp qword [r12+8],0: path must be empty
+        static const uint8_t saveName[]={0x49,0x8b,0x74,0x24,0x20,0x49,0x8b,0x54,0x24,0x28};   // name data/size at +0x20/+0x28
+        static const uint8_t scale[]={0x48,0x8b,0x43,0x18,0xf3,0x0f,0x10,0x53,0x34};   // grid +0x18, scale +0x34
+        static const uint8_t store[]={0xf3,0x41,0x0f,0x11,0x44,0x24,0x18,0xf3,0x41,0x0f,0x11,0x4c,0x24,0x1c,0x41,0x83,0x44,0x24,0x20,0x01};
+        const bool sites=H->verifyBytes(0xcf71d0,addTile,sizeof addTile) && H->verifyBytes(0xcf73f2,record,sizeof record) &&
+            H->verifyBytes(0xc7ec00,save,sizeof save) && H->verifyBytes(0xc7ca40,load,sizeof load) &&
+            H->verifyBytes(0xc7ec2a,saveId,sizeof saveId) && H->verifyBytes(0xc7ec5c,savePath,sizeof savePath) &&
+            H->verifyBytes(0xc7ec95,saveName,sizeof saveName) && H->verifyBytes(0xcf5805,scale,sizeof scale) &&
+            H->verifyBytes(0xcf58ad,store,sizeof store);
+        linux_sidecar::Log()=H->log;
+        linux_sidecar::WriteOn()=H->cfgBool(Section,"terrain_sidecar_write",1);
+        TerrainSidecar::g_writeThreads=H->cfgInt(Section,"terrain_sidecar_threads",0);
+        void* t=nullptr;
+        // AddTile first (inert until a load arms a sidecar), LoadGame last: nothing is armed before every hook is in.
+        const bool hooked=sites &&
+            H->installHook(H->moduleBase()+0xcf71d0,reinterpret_cast<void*>(linux_sidecar::AddTileHook),sizeof addTile,&t) &&
+            (linux_sidecar::OriginalAddTile()=reinterpret_cast<linux_sidecar::AddTileFn>(t),
+             H->installHook(H->moduleBase()+0xc7ec00,reinterpret_cast<void*>(linux_sidecar::SaveHook),sizeof save,&t)) &&
+            (linux_sidecar::OriginalSave()=reinterpret_cast<linux_sidecar::SaveFn>(t),
+             H->installHook(H->moduleBase()+0xc7ca40,reinterpret_cast<void*>(linux_sidecar::LoadHook),sizeof load,&t));
+        if(hooked){
+            linux_sidecar::OriginalLoad()=reinterpret_cast<linux_sidecar::LoadFn>(t);
+            H->log("terrain sidecar: %s beside each save; a load whose sidecar holds every tile skips the alignment pass",
+                   linux_sidecar::WriteOn()?"written":"not written (terrain_sidecar_write=0), read");
+        } else {
+            sidecarOn=false;
+            H->log("terrain sidecar: %s; sidecars are neither written nor read",sites?"a hook failed":"byte mismatch");
+        }
     }
     linux_generator::Install(H);
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?depth:10,rows,maxRatio);
