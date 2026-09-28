@@ -11,6 +11,8 @@
 #include <array>
 #include <algorithm>
 #include <new>
+#include <atomic>
+#include <thread>
 #include <mutex>
 #include "../src/tpf2mp_plugin.h"
 static const Tpf2mpHost* H = nullptr;
@@ -114,6 +116,29 @@ int main() {
     assert(c[2] - before[2] == written && c[1] == before[1] && c[4] == 0);
     assert(c[5] - before[5] > nx * ny);                                        // shuffled: the cursor misses
     for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) if (stored[i]) assert(live2.caches[i] == save.caches[i]);
+    // 3b. Two AddTile threads at once, each in grid order in its own half (the
+    //     load's shape): per-thread cursors keep it near one probe per tile. One
+    //     shared cursor started each scan where the other thread was: ~n/2 probes
+    //     per tile (2026-09-28: 6.6 billion probes for 221,952 tiles).
+    {
+        FakeTerrain live4(nx, ny); g_live = &live4;
+        long long b4[7]{}; BigmapTestServeCounters(b4);
+        const uint32_t half = uint32_t(nx * ny) / 2;
+        std::atomic<int> turn{0};
+        auto run = [&](int me) {
+            for (uint32_t k = 0; k < half; ++k) {
+                while (turn.load() != me) {}
+                BigmapTestServeDetour(live4.cterrain, int(1000 + me * half + k), FakeAddTile, MarkFails);
+                turn.store(1 - me);
+            }
+        };
+        std::thread t0(run, 0), t1(run, 1); t0.join(); t1.join();
+        BigmapTestServeCounters(c);
+        const long long probed = c[5] - b4[5];
+        printf("two AddTile threads: %lld probes for %d tiles\n", probed, nx * ny);
+        assert(probed <= 2LL * nx * ny);
+        for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) if (stored[i]) assert(live4.caches[i] == save.caches[i]);
+    }
     // 4. Not loaded (EndApply): AddTile runs, nothing is applied or probed.
     EndApply(); assert(!Loaded());
     FakeTerrain live3(nx, ny); g_live = &live3; BigmapTestServeCounters(before);
