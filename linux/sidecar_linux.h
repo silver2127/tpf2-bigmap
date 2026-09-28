@@ -7,8 +7,8 @@
 // holds EVERY tile of the terrain. Then no publication of the pass is needed at
 // all and the pass is not called; its one other effect, each tile record's
 // minZ/maxZ/version (publication 0xcf56d0: 0xcf58ad/0xcf58b4/0xcf58bb, scale
-// at CTerrain+0x34, 0xcf5809), is written from the range noted at AddTile. A
-// partial sidecar is applied at AddTile and then overwritten by the stock pass
+// at CTerrain+0x34, 0xcf5809), is written from the range noted while serving. A
+// partial sidecar is applied before the pass and then overwritten by the stock pass
 // -- the same result as without it. There is no per-copy skip to get wrong.
 //
 // Sites (docs/linux/PORT.md, "Terrain sidecar"):
@@ -36,6 +36,8 @@
 
 namespace linux_sidecar {
 using LogFn = void (*)(const char*, ...);
+// Publish only after all hooks are installed. Partial installs only forward.
+inline std::atomic<bool>& Enabled() { static std::atomic<bool> on{false}; return on; }
 
 struct LStr { const char* p; size_t n; char buf[16]; };   // libstdc++ std::string
 struct SaveGameId { LStr path; LStr name; LStr ns; };
@@ -82,7 +84,7 @@ inline bool Mtime(const std::string& p, struct timespec* out) {
     *out = st.st_mtim; return true;
 }
 
-// ---- the load: what AddTile applied, and each tile's height range ------------
+// ---- the load: served tiles and each tile's height range ---------------------
 // A load builds two CTerrain versions (Windows served 68,086 tiles of a
 // 36,992-tile map), each with its own grid, so the ranges are kept per grid.
 struct Served {
@@ -135,7 +137,7 @@ inline bool AllServedFinish(void* terrain) {
         uint8_t* r = g.record(i);
         *reinterpret_cast<float*>(r + 0x18) = float(slot->range[i] & 0xFFFF) * scale;
         *reinterpret_cast<float*>(r + 0x1c) = float(slot->range[i] >> 16) * scale;
-        *reinterpret_cast<int32_t*>(r + 0x20) += 1;
+        *reinterpret_cast<uint32_t*>(r + 0x20) += 1;
     }
     slot->finished = true;
     s.finished.push_back(terrain);
@@ -222,7 +224,7 @@ inline long FullTiles(void* terrain) {
     }
     return full;
 }
-// The live CTerrain among those seen, or nullptr. `why` lists each candidate's count.
+// The best readable CTerrain candidate, or nullptr; readability does not prove ownership. `why` lists each candidate's count.
 inline void* PickTerrain(char* why, size_t cap) {
     void* cands[4];
     { Seen& s = SeenTerrains(); std::lock_guard<std::mutex> l(s.m); memcpy(cands, s.t, sizeof cands); }
@@ -236,24 +238,29 @@ inline void* PickTerrain(char* why, size_t cap) {
     }
     return best;
 }
-// The record AddTile just filled, scanning from THIS thread's last hit in this
-// grid: the load adds tiles on two threads in different parts of the grid, and
-// one shared cursor made every scan start where the other thread had been
-// (Windows 2026-09-28: ~30,000 probes per tile; see terrain_serve.h FindRecord).
-inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
-    // Outward from this thread's last hit (last+1, last-1, last+2, ...): the
-    // Windows load showed a forward scan costing ~35,000 probes per tile.
-    struct Cursor { const uint8_t* grid; uint32_t last; };
-    static thread_local Cursor c = {nullptr, 0};
+// Search outward from this thread's last hit: ascending and descending loads
+// both stay nearby, whereas a forward-only scan wraps the grid on every descent.
+inline std::atomic<uint64_t>& CursorGeneration() { static std::atomic<uint64_t> gen{0}; return gen; }
+struct LookupStats { std::atomic<uint64_t> calls{0}, probes{0}; };
+inline LookupStats& Lookups() { static LookupStats s; return s; }
+// Count locally; production accounting adds once per lookup, never per probe.
+inline long FindRecord(const TerrainSidecar::Grid& g, int entity, uint32_t* probes = nullptr) {
+    struct Cursor { const uint8_t* grid; uint32_t last; uint64_t generation; };
+    static thread_local Cursor c = {nullptr, 0, 0};
+    if (probes) *probes = 0;
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
     if (!n) return -1;
-    if (c.grid != g.base) { c.grid = g.base; c.last = n - 1; }
+    const uint64_t gen = CursorGeneration().load(std::memory_order_relaxed);
+    if (c.grid != g.base || c.generation != gen) { c.grid = g.base; c.last = n - 1; c.generation = gen; }
     auto is = [&](uint32_t i) {
+        if (probes) ++*probes;
         const uint8_t* r = g.record(i);
         return *reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8);
     };
     const uint32_t last = c.last % n;
-    for (uint32_t d = 1; d <= n / 2 + 1; ++d) {
+    // Each non-center record exactly once, including the opposite point of an
+    // even ring. Checking the center last also handles a one-record grid.
+    for (uint32_t d = 1; d <= n / 2; ++d) {
         const uint32_t up = last + d < n ? last + d : last + d - n;
         const uint32_t down = last >= d ? last - d : last + n - d;
         if (is(up)) { c.last = up; return long(up); }
@@ -267,7 +274,7 @@ inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
 inline bool& ServeAtPass() { static bool on = false; return on; }
 inline void AddTileHook(void* terrain, int entity, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     OriginalAddTile()(terrain, entity, a, b, c, d);
-    if (!terrain) return;
+    if (!Enabled().load() || !terrain) return;
     NoteTerrain(terrain);
     static std::mutex beginLock;
     if (TerrainSidecar::g_pending) {
@@ -278,7 +285,10 @@ inline void AddTileHook(void* terrain, int entity, uint64_t a, uint64_t b, uint6
     if (ServeAtPass()) return;
     const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records()) return;
-    const long idx = FindRecord(g, entity);
+    uint32_t probes = 0;
+    const long idx = FindRecord(g, entity, &probes);
+    Lookups().calls.fetch_add(1, std::memory_order_relaxed);
+    Lookups().probes.fetch_add(probes, std::memory_order_relaxed);
     if (idx < 0) return;
     if (!TerrainSidecar::Has(uint32_t(idx))) {
         TerrainSidecar::RefreshIfDue();              // a stream: maybe it has arrived since
@@ -333,6 +343,7 @@ inline std::string WrittenSince(const std::string& dir, const struct timespec& s
     return best;
 }
 inline Ret16 SaveHook(void* meta, void* shot, void* cfg, void* res, void* state, void* gui, const SaveGameId* id, uint64_t flag, void* monitor) {
+    if (!Enabled().load()) return OriginalSave()(meta, shot, cfg, res, state, gui, id, flag, monitor);
     struct timespec callStart{}; clock_gettime(CLOCK_REALTIME, &callStart);
     std::string sav = WriteOn() ? SavPath(id) : std::string(), tmp;
     long tiles = -1; uint64_t bytes = 0; long long ms = 0;
@@ -381,10 +392,16 @@ inline Ret16 SaveHook(void* meta, void* shot, void* cfg, void* res, void* state,
 using LoadFn = void* (*)(void*, void*, void*, const SaveGameId*, void*, void*, void*, void*, void*, void*, void*);
 inline LoadFn& OriginalLoad() { static LoadFn f = nullptr; return f; }
 inline void* LoadHook(void* ret, void* ctx, void* mods, const SaveGameId* id, void* a4, void* a5, void* s0, void* s1, void* s2, void* s3, void* s4) {
+    if (!Enabled().load()) return OriginalLoad()(ret, ctx, mods, id, a4, a5, s0, s1, s2, s3, s4);
+    // Worker threads can survive loads and the allocator can reuse grid addresses.
+    CursorGeneration().fetch_add(1, std::memory_order_relaxed);
+    Lookups().calls.store(0, std::memory_order_relaxed);
+    Lookups().probes.store(0, std::memory_order_relaxed);
     ForgetTerrains();
     S().Reset();
     TerrainSidecar::EndApply();
     TerrainSidecar::g_pending = false;
+    TerrainSidecar::g_streamWanted = false;
     const std::string sav = SavPath(id);
     if (!sav.empty()) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -464,7 +481,7 @@ inline void SettleStream(void* terrain) {
 // Called from the redirected UpdateSubterrains call. True when the pass must
 // not run (the caller then returns without calling it).
 inline bool SkipPass(void* self, size_t blocks) {
-    if (!self || blocks <= 512) return false;
+    if (!Enabled().load() || !self || blocks <= 512) return false;
     void* terrain = *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 8);
     if (!terrain) return false;
     if (VersionFinished(terrain)) return false;      // it passed already: a pass in play, never the load's
@@ -478,7 +495,12 @@ inline bool SkipPass(void* self, size_t blocks) {
 inline void PassDone(size_t blocks, bool skipped) {
     if (blocks <= 512) return;
     if (skipped && VersionPending()) { if (Log()) Log()("terrain sidecar: pass skipped; kept for the load's other terrain version"); return; }
+    // A stream first arriving after this load pass must never overwrite play edits.
+    TerrainSidecar::g_streamWanted = false;
     const uint32_t applied = [] { Served& s = S(); std::lock_guard<std::mutex> l(s.m); uint32_t a = 0; for (auto& g : s.grids) a += g.applied; return a; }();
-    if (TerrainSidecar::EndApply() && Log()) Log()("terrain sidecar: load done, %u tiles applied from the sidecar; file released", applied);
+    const uint64_t calls = Lookups().calls.load(std::memory_order_relaxed);
+    const uint64_t probes = Lookups().probes.load(std::memory_order_relaxed);
+    if (TerrainSidecar::EndApply() && Log()) Log()("terrain sidecar: load done, %u tiles applied from the sidecar, %.1f record probes per AddTile lookup; file released",
+        applied, calls ? double(probes) / double(calls) : 0.0);
 }
 }  // namespace linux_sidecar

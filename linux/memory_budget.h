@@ -11,6 +11,9 @@ inline int TerrainHotMB(uint64_t physicalBytes,int configured) {
     return int(std::clamp<uint64_t>((physicalBytes>>20)/30,256,4096));
 }
 // Windows PagerHeadroom / PagerCapMB, with Linux MemAvailable (no swap).
+// Like dev 2b8505c's tight-budget fix, subtract the shortfall from resident
+// bytes, never the previous target: pending eviction must not compound it.
+// There is no Windows commit-tight flag or flat 256 MiB pressure clamp here.
 inline uint64_t TerrainTarget(uint64_t physical,uint64_t available,
                               uint64_t resident,uint64_t live,uint64_t fallback) {
     if(!physical || available==UINT64_MAX)return std::min(live,fallback);

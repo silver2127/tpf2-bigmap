@@ -10,6 +10,16 @@
 #include <array>
 #include <string>
 #include "../src/terrain_sidecar.h"
+#ifndef _WIN32
+#include <cerrno>
+#include <sys/stat.h>
+#include <unistd.h>
+// Keep the Windows CRT path while exercising the same fixtures on Linux.
+static int fopen_s(FILE** out, const char* path, const char* mode) {
+    *out = fopen(path, mode);
+    return *out ? 0 : errno;
+}
+#endif
 
 using namespace TerrainSidecar;
 
@@ -19,7 +29,7 @@ struct FakeTerrain {
     uint8_t cterrain[0x20];
     std::vector<uint8_t> grid;
     std::vector<std::vector<uint16_t>> caches;               // backing for each vector's data
-    std::vector<std::array<uint8_t, 0x20>> controls;         // the shared control block per record
+    std::vector<std::array<uint8_t, 0x28>> controls;         // the shared control block per record
     FakeTerrain(int nx, int ny) {
         memset(cterrain, 0, sizeof cterrain);
         grid.assign(0x18 + size_t(nx) * ny * 40, 0);
@@ -204,7 +214,7 @@ int main() {
 
     {   // Threaded writes (terrain_sidecar_threads): byte for byte the single-thread
         // file, across several WriteWindow windows, with holes and odd tiles.
-        const int bx = 60, by = 50;   // 3,000 records: two windows and a partial one
+        const int bx = 90, by = 50;   // 4,500 records: two full windows and a partial one
         FakeTerrain big(bx, by);
         for (uint32_t i = 0; i < uint32_t(bx * by); ++i) {
             if (i % 3 == 0) big.makeTile(i, Samples, i * 13 + 5);
@@ -217,16 +227,43 @@ int main() {
             assert(fread(b.data(), 1, b.size(), f) == b.size()); fclose(f); return b;
         };
         g_writeThreads = 1;
-        assert(Write(GridOf(big.cterrain), 0x77u, "test_sidecar_1.bin", enc) == 1000);
+        assert(Write(GridOf(big.cterrain), 0x77u, "test_sidecar_1.bin", enc) == 1500);
         const auto one = fileBytes("test_sidecar_1.bin");
         for (int t : {2, 4, 7, 0}) {
             g_writeThreads = t;
-            assert(Write(GridOf(big.cterrain), 0x77u, "test_sidecar_n.bin", enc) == 1000);
+            assert(Write(GridOf(big.cterrain), 0x77u, "test_sidecar_n.bin", enc) == 1500);
             assert(fileBytes("test_sidecar_n.bin") == one);
         }
         g_writeThreads = 0;
         remove("test_sidecar_1.bin"); remove("test_sidecar_n.bin");
     }
+#ifndef _WIN32
+    {   // Native byte paths and same-folder fallback, including a renamed save.
+        const char* dir = "test_sidecar_é";
+        assert(mkdir(dir, 0700) == 0);
+        const std::string candidate = std::string(dir) + "/original.terr";
+        FakeTerrain tiny(1, 1); tiny.makeTile(0, Samples, 42); tiny.finalize();
+        assert(Write(GridOf(tiny.cterrain), 123, candidate.c_str(), enc) == 1);
+        assert(FingerprintOfPath(candidate.c_str()) == 123);
+        char lookup[256];
+        snprintf(lookup, sizeof lookup, "%s/renamed.terr", dir);
+        const std::string missing = lookup;
+        assert(!FindByFingerprint(456, lookup, sizeof lookup));
+        assert(lookup == missing);
+        assert(!FindByFingerprint(123, lookup, 1));
+        assert(lookup == missing);
+        assert(FindByFingerprint(123, lookup, sizeof lookup));
+        assert(lookup == candidate);
+        assert(FindByFingerprint(123, lookup, sizeof lookup));
+        assert(Refingerprint(lookup, 456) && FingerprintOfPath(lookup) == 456);
+        char sidecar[256]; SidecarPath("é.SAV", sidecar, sizeof sidecar);
+        assert(std::string(sidecar) == "é.terr");
+        RemoveFile(candidate.c_str()); assert(rmdir(dir) == 0);
+    }
+#endif
+    assert(WriteThreads(1) == 1 && WriteThreads(7) == 7);
+    assert(WriteThreads(99) == 16 && WriteThreads(0) >= 1 && WriteThreads(0) <= 8);
+    assert(WriteThreads(-1) == WriteThreads(0));
     remove(path); delete enc; delete dec;
     printf("PASS: threaded writes are byte-identical to one thread; write walks the grid, apply restores exactly, foreign/stale/absent are no-ops, truncation and corruption are rejected; streaming BeginApply/Has/ApplyTile restore per tile and reject a foreign fingerprint; fingerprint+arm/begin/end and WriteForSave round-trip, a changed .sav rejects the stale sidecar\n");
     return 0;
