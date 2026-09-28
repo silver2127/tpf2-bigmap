@@ -48,15 +48,28 @@ static thread_local BlockCodec::DecodeScratch* scratch = nullptr;
 // (possibly evicted) tile again. One entry per record of the grid being
 // served: lo | hi << 16, or kNoRange. Reset when a sidecar load begins.
 constexpr uint32_t kNoRange = 0x0000FFFFu;   // lo 0xFFFF > hi 0: never a real range
+// Per grid: a load builds two CTerrain versions (68,086 tiles served for a
+// 36,992-tile map), each with its own grid and records.
 static SRWLOCK rangeLock = SRWLOCK_INIT;
-static uint8_t* rangeGrid = nullptr;
-static uint32_t rangeCount = 0;
-static uint32_t* ranges = nullptr;
+struct RangeSlot { uint8_t* grid; uint32_t count; uint32_t applied; uint32_t* ranges; };
+static RangeSlot rangeSlots[4] = {};
 static void ResetRanges() {
     AcquireSRWLockExclusive(&rangeLock);
-    if (ranges) HeapFree(GetProcessHeap(), 0, ranges);
-    ranges = nullptr; rangeGrid = nullptr; rangeCount = 0;
+    for (auto& r : rangeSlots) { if (r.ranges) HeapFree(GetProcessHeap(), 0, r.ranges); r = RangeSlot{}; }
     ReleaseSRWLockExclusive(&rangeLock);
+}
+// Caller holds rangeLock. The slot for `grid` (n records), made if new and `make`.
+static RangeSlot* FindRangeSlot(uint8_t* grid, uint32_t n, bool make) {
+    for (auto& r : rangeSlots) if (r.grid == grid && r.count == n && r.ranges) return &r;
+    if (!make) return nullptr;
+    for (auto& r : rangeSlots) if (!r.grid) {
+        r.ranges = static_cast<uint32_t*>(HeapAlloc(GetProcessHeap(), 0, size_t(n) * sizeof(uint32_t)));
+        if (!r.ranges) return nullptr;
+        for (uint32_t i = 0; i < n; ++i) r.ranges[i] = kNoRange;
+        r.grid = grid; r.count = n; r.applied = 0;
+        return &r;
+    }
+    return nullptr;
 }
 // The stock CalcMinMaxHeight result (terrain-minmax.md): the true unsigned
 // minimum and maximum of the tile's samples.
@@ -69,13 +82,8 @@ static void NoteRange(const TerrainSidecar::Grid& g, uint32_t idx, const Terrain
     const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
     const uint32_t r = HeightRange(v->first, TerrainSidecar::Samples);
     AcquireSRWLockExclusive(&rangeLock);
-    if (rangeGrid != g.base || rangeCount != n) {
-        if (ranges) HeapFree(GetProcessHeap(), 0, ranges);
-        ranges = static_cast<uint32_t*>(HeapAlloc(GetProcessHeap(), 0, size_t(n) * sizeof(uint32_t)));
-        rangeGrid = ranges ? g.base : nullptr; rangeCount = ranges ? n : 0;
-        for (uint32_t i = 0; i < rangeCount; ++i) ranges[i] = kNoRange;
-    }
-    if (ranges && idx < rangeCount) ranges[idx] = r;
+    RangeSlot* slot = FindRangeSlot(g.base, n, true);
+    if (slot && idx < slot->count && slot->ranges[idx] == kNoRange) { slot->ranges[idx] = r; ++slot->applied; }
     ReleaseSRWLockExclusive(&rangeLock);
 }
 // True, with every record's minZ/maxZ written and version bumped as the
@@ -91,22 +99,23 @@ static bool AllServedFinish(void* terrain) {
     const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
     const float scale = *reinterpret_cast<const float*>(static_cast<uint8_t*>(terrain) + 0x34);
     if (!(scale >= 0.0f)) return false;
-    AcquireSRWLockShared(&rangeLock);
-    bool ok = ranges && rangeGrid == g.base && rangeCount == n;
+    AcquireSRWLockExclusive(&rangeLock);
+    RangeSlot* slot = FindRangeSlot(g.base, n, false);
+    bool ok = slot && slot->applied == n;
     for (uint32_t i = 0; ok && i < n; ++i) {
         const auto* v = TerrainSidecar::VectorOf(g.record(i));
-        ok = TerrainSidecar::Eligible(v) && g_terrainServedCheck(v->first) && ranges[i] != kNoRange;
+        ok = TerrainSidecar::Eligible(v) && g_terrainServedCheck(v->first) && slot->ranges[i] != kNoRange;
     }
     if (ok) {
         for (uint32_t i = 0; i < n; ++i) {
             uint8_t* r = g.record(i);
-            const float lo = float(ranges[i] & 0xFFFF) * scale, hi = float(ranges[i] >> 16) * scale;
+            const float lo = float(slot->ranges[i] & 0xFFFF) * scale, hi = float(slot->ranges[i] >> 16) * scale;
             *reinterpret_cast<float*>(r + 0x18) = lo;
             *reinterpret_cast<float*>(r + 0x1c) = hi;
             *reinterpret_cast<int32_t*>(r + 0x20) += 1;
         }
     }
-    ReleaseSRWLockShared(&rangeLock);
+    ReleaseSRWLockExclusive(&rangeLock);
     return ok;
 }
 
