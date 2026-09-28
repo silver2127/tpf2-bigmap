@@ -219,7 +219,13 @@ int main() {
         };
         FakeTerrain fullLoad(nx, ny);
         load(fullLoad, full, nx * ny);
-        assert(BigmapTestServeAllServedFinish(fullLoad.cterrain) == 1);
+        // the load's second CTerrain version: its own grid, served from the same file
+        FakeTerrain second(nx, ny); g_live = &second;
+        *reinterpret_cast<float*>(second.cterrain + 0x34) = 0.25f;
+        for (uint32_t i = 0; i < uint32_t(nx * ny); ++i)
+            BigmapTestServeDetour(second.cterrain, int(1000 + i), FakeAddTile, [](const void* p) { served.push_back(p); return true; });
+        assert(BigmapTestServeAllServedFinish(second.cterrain) == 1);
+        assert(BigmapTestServeAllServedFinish(fullLoad.cterrain) == 1);   // the first version's ranges survived the second's
         for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
             const auto& c = all.caches[i];
             const uint16_t lo = *std::min_element(c.begin(), c.end()), hi = *std::max_element(c.begin(), c.end());
