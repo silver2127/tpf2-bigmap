@@ -167,7 +167,7 @@ bool sidecarOn=false;
 void AlignmentUpdate(void* self,const linux_alignment::Map* map) {
     const size_t blocks=map?map->count:0;
     // A load whose sidecar served every tile skips the pass (sidecar_linux.h).
-    if(sidecarOn && linux_sidecar::SkipPass(self,blocks)){linux_sidecar::PassDone(blocks);return;}
+    if(sidecarOn && linux_sidecar::SkipPass(self,blocks)){linux_sidecar::PassDone(blocks,true);return;}
     const auto update=reinterpret_cast<linux_alignment::Update>(H->moduleBase()+0x173dae0);
     const auto next=reinterpret_cast<linux_alignment::Increment>(H->moduleBase()+0x6dc1c0);
     const auto t0=std::chrono::steady_clock::now();
@@ -175,7 +175,7 @@ void AlignmentUpdate(void* self,const linux_alignment::Map* map) {
     if(n)H->log("alignment batch: %zu blocks in %zu batches of %zu",n,(n+alignmentBatch-1)/alignmentBatch,alignmentBatch);
     if(blocks>512)H->log("alignment pass: %zu blocks, %lld ms",blocks,
         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count());
-    if(sidecarOn)linux_sidecar::PassDone(blocks);
+    if(sidecarOn)linux_sidecar::PassDone(blocks,false);
 }
 linux_pager::TerrainPager* terrainPager=nullptr;
 struct TerrainVector {uint16_t *begin,*end,*capacity;};

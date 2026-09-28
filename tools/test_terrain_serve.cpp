@@ -18,7 +18,7 @@ static bool g_gog = false;
 namespace TerrainPager { static bool SetServed(const void*) { return false; } static bool IsServed(const void*) { return false; } }
 static bool (*g_terrainServedCheck)(const void*) = nullptr;
 static volatile LONG64 g_terrainServedCopiesSkipped = 0;
-static void (*g_alignmentPassDone)() = nullptr;
+static void (*g_alignmentPassDone)(bool) = nullptr;
 static bool (*g_alignmentAllServed)(void*) = nullptr;
 #include "../src/terrain_sidecar.h"
 #include "../src/terrain_serve.h"
@@ -224,8 +224,12 @@ int main() {
         *reinterpret_cast<float*>(second.cterrain + 0x34) = 0.25f;
         for (uint32_t i = 0; i < uint32_t(nx * ny); ++i)
             BigmapTestServeDetour(second.cterrain, int(1000 + i), FakeAddTile, [](const void* p) { served.push_back(p); return true; });
+        assert(BigmapTestServeVersionPending() == 1);
         assert(BigmapTestServeAllServedFinish(second.cterrain) == 1);
+        assert(BigmapTestServeVersionPending() == 1);                      // the first version has not passed yet: keep the file
+        assert(BigmapTestServeAllServedFinish(second.cterrain) == 0);      // once per version: a later pass on it runs
         assert(BigmapTestServeAllServedFinish(fullLoad.cterrain) == 1);   // the first version's ranges survived the second's
+        assert(BigmapTestServeVersionPending() == 0);
         for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
             const auto& c = all.caches[i];
             const uint16_t lo = *std::min_element(c.begin(), c.end()), hi = *std::max_element(c.begin(), c.end());

@@ -51,7 +51,9 @@ constexpr uint32_t kNoRange = 0x0000FFFFu;   // lo 0xFFFF > hi 0: never a real r
 // Per grid: a load builds two CTerrain versions (68,086 tiles served for a
 // 36,992-tile map), each with its own grid and records.
 static SRWLOCK rangeLock = SRWLOCK_INIT;
-struct RangeSlot { uint8_t* grid; uint32_t count; uint32_t applied; uint32_t* ranges; };
+// `finished`: this version's pass was skipped once; a later big pass on it (a
+// terraform in play) must run.
+struct RangeSlot { uint8_t* grid; uint32_t count; uint32_t applied; uint32_t* ranges; bool finished; };
 static RangeSlot rangeSlots[4] = {};
 static void ResetRanges() {
     AcquireSRWLockExclusive(&rangeLock);
@@ -66,7 +68,7 @@ static RangeSlot* FindRangeSlot(uint8_t* grid, uint32_t n, bool make) {
         r.ranges = static_cast<uint32_t*>(HeapAlloc(GetProcessHeap(), 0, size_t(n) * sizeof(uint32_t)));
         if (!r.ranges) return nullptr;
         for (uint32_t i = 0; i < n; ++i) r.ranges[i] = kNoRange;
-        r.grid = grid; r.count = n; r.applied = 0;
+        r.grid = grid; r.count = n; r.applied = 0; r.finished = false;
         return &r;
     }
     return nullptr;
@@ -101,7 +103,7 @@ static bool AllServedFinish(void* terrain) {
     if (!(scale >= 0.0f)) return false;
     AcquireSRWLockExclusive(&rangeLock);
     RangeSlot* slot = FindRangeSlot(g.base, n, false);
-    bool ok = slot && slot->applied == n;
+    bool ok = slot && !slot->finished && slot->applied == n;
     for (uint32_t i = 0; ok && i < n; ++i) {
         const auto* v = TerrainSidecar::VectorOf(g.record(i));
         ok = TerrainSidecar::Eligible(v) && g_terrainServedCheck(v->first) && slot->ranges[i] != kNoRange;
@@ -114,9 +116,21 @@ static bool AllServedFinish(void* terrain) {
             *reinterpret_cast<float*>(r + 0x1c) = hi;
             *reinterpret_cast<int32_t*>(r + 0x20) += 1;
         }
+        slot->finished = true;
     }
     ReleaseSRWLockExclusive(&rangeLock);
     return ok;
+}
+// A served CTerrain version whose pass has not come yet. The load builds two
+// versions and passes each: releasing the sidecar at the first skip left the
+// second's last AddTiles unserved and its pass ran (5.8 s of 36,992 tiles,
+// 2026-09-27: 69,125 of 73,984 AddTiles served, none failed).
+static bool ServedVersionPending() {
+    AcquireSRWLockShared(&rangeLock);
+    bool pending = false;
+    for (const auto& r : rangeSlots) if (r.grid && !r.finished) pending = true;
+    ReleaseSRWLockShared(&rangeLock);
+    return pending;
 }
 
 // The record AddTile just filled for `entity`, or -1: scan from the cursor.
@@ -208,7 +222,12 @@ static bool InstallTerrainServe() {
     g_alignmentAllServed = AllServedFinish;
     // Every thread whose batched alignment pass finishes lands here, several at
     // once: only the one that releases the file reports it (TerrainSidecar::g_loadLock).
-    g_alignmentPassDone = []() {
+    g_alignmentPassDone = [](bool skipped) {
+        // A skip keeps the file for a served version still to pass; a pass that ran releases it.
+        if (skipped && ServedVersionPending()) {
+            if (H) H->log("terrain sidecar: pass skipped; kept for the load's other terrain version");
+            return;
+        }
         if (!TerrainSidecar::EndApply()) return;
         if (H) H->log("terrain sidecar: load done, %lld tiles served (%lld unmarked, %lld absent, %lld not found, %lld copies skipped, open+verify %lld ms); file released",
             applied, unmarked, absent, notFound, g_terrainServedCopiesSkipped, beginMs);
@@ -231,6 +250,7 @@ extern "C" __declspec(dllexport) void BigmapTestServeDetour(void* terrain, int e
     TerrainServe::Detour(terrain, entity, 0, 0);
 }
 extern "C" __declspec(dllexport) int BigmapTestServeAllServedFinish(void* terrain) { return TerrainServe::AllServedFinish(terrain) ? 1 : 0; }
+extern "C" __declspec(dllexport) int BigmapTestServeVersionPending() { return TerrainServe::ServedVersionPending() ? 1 : 0; }
 extern "C" __declspec(dllexport) void BigmapTestServeCounters(long long* out) {
     out[0] = TerrainServe::calls; out[1] = TerrainServe::applied; out[2] = TerrainServe::unmarked; out[3] = TerrainServe::absent;
     out[4] = TerrainServe::notFound; out[5] = TerrainServe::probes; out[6] = TerrainServe::decodeFailed;
