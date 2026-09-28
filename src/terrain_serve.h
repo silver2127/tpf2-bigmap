@@ -92,10 +92,80 @@ static void NoteRange(const TerrainSidecar::Grid& g, uint32_t idx, const Terrain
 // engine's publication does (float(v) * the terrain's scale at +0x34, then
 // ++version), when every record of `terrain` holds a served tile whose range
 // was noted. False, changing nothing, otherwise.
+// This CTerrain version's load pass was skipped already.
+static bool VersionFinished(void* terrain) {
+    TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+    if (!g.base || g.nx() <= 0 || g.ny() <= 0) return false;
+    AcquireSRWLockShared(&rangeLock);
+    const RangeSlot* slot = FindRangeSlot(g.base, uint32_t(g.nx()) * uint32_t(g.ny()), false);
+    const bool finished = slot && slot->finished;
+    ReleaseSRWLockShared(&rangeLock);
+    return finished;
+}
+// Serve every tile of `terrain` the sidecar holds that AddTile did not (it had
+// not arrived yet, or the stream was found after the tile was added), on
+// several threads. Returns the tiles served here.
+static uint32_t CatchUp(void* terrain) {
+    TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+    if (!g.base || !g.records() || g.nx() <= 0 || g.ny() <= 0) return 0;
+    const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
+    std::vector<uint32_t> todo;
+    AcquireSRWLockShared(&rangeLock);
+    RangeSlot* slot = FindRangeSlot(g.base, n, false);
+    for (uint32_t i = 0; i < n; ++i)
+        if ((!slot || slot->ranges[i] == kNoRange) && TerrainSidecar::Has(i)) todo.push_back(i);
+    ReleaseSRWLockShared(&rangeLock);
+    if (todo.empty()) return 0;
+    std::atomic<size_t> next{0};
+    std::atomic<uint32_t> served{0};
+    auto work = [&] {
+        auto* sc = new (std::nothrow) BlockCodec::DecodeScratch;
+        if (!sc) return;
+        for (size_t k; (k = next.fetch_add(1)) < todo.size();) {
+            const uint32_t i = todo[k];
+            if (!TerrainSidecar::ApplyTile(g, i, *sc)) { InterlockedIncrement64(&decodeFailed); continue; }
+            const auto* v = TerrainSidecar::VectorOf(g.record(i));
+            NoteRange(g, i, v);
+            if (mark && mark(v->first)) { InterlockedIncrement64(&applied); served.fetch_add(1); }
+            else InterlockedIncrement64(&unmarked);
+        }
+        delete sc;
+    };
+    const unsigned threads = (std::max)(1u, (std::min)(8u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < threads && todo.size() > 64; ++t) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    return served.load();
+}
+// The pass is here and this load's sidecar is a stream still arriving: wait for
+// it when that beats computing the missing tiles, then serve what arrived.
+constexpr double kPassMsPerTile = 1.0;   // the load pass: 44-75 s for 49,928 tiles, 5.8 s for ~4,900 unserved
+static void SettleStream(void* terrain) {
+    TerrainSidecar::TryStream(terrain, true);
+    TerrainSidecar::StreamState s = TerrainSidecar::Progress();
+    if (!s.loaded) return;
+    if (s.streaming) {
+        TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+        const uint32_t n = g.base && g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
+        uint32_t missing = n;
+        AcquireSRWLockShared(&rangeLock);
+        if (RangeSlot* slot = FindRangeSlot(g.base, n, false)) missing = n - slot->applied;
+        ReleaseSRWLockShared(&rangeLock);
+        char why[200] = {0};
+        const bool complete = TerrainSidecar::WaitForStream(missing, kPassMsPerTile, 5000, 300000, why, sizeof why);
+        if (H) H->log("terrain stream: %s at the pass (%u tiles of this terrain unserved): %s", complete ? "complete" : "not waited for", missing, why);
+    }
+    const uint32_t caught = CatchUp(terrain);
+    if (caught && H) H->log("terrain stream: %u tiles served at the pass", caught);
+}
 static bool AllServedFinish(void* terrain) {
     // Only the load's own pass: the sidecar is released when it finishes, and a
     // later big pass (a terraform in play) must run, served marks or not.
-    if (!terrain || !g_terrainServedCheck || !TerrainSidecar::Loaded()) return false;
+    if (!terrain || !g_terrainServedCheck) return false;
+    if (VersionFinished(terrain)) return false;      // it passed already: this pass is in play, never the load's
+    SettleStream(terrain);
+    if (!TerrainSidecar::Loaded()) return false;
     TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records() || g.nx() <= 0 || g.ny() <= 0) return false;
     const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
@@ -190,12 +260,15 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     if (!g_terrainServe || !terrain) return;
     NoteTerrain(terrain);
     BeginIfArmed(terrain);
-    if (!TerrainSidecar::Loaded()) return;
+    if (!TerrainSidecar::Loaded() && !TerrainSidecar::TryStream(terrain)) return;
     TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records()) return;
     long idx = FindRecord(g, entity);
     if (idx < 0) { InterlockedIncrement64(&notFound); return; }
-    if (!TerrainSidecar::Has(uint32_t(idx))) { InterlockedIncrement64(&absent); return; }
+    if (!TerrainSidecar::Has(uint32_t(idx))) {
+        TerrainSidecar::RefreshIfDue();              // a stream: maybe it has arrived since
+        if (!TerrainSidecar::Has(uint32_t(idx))) { InterlockedIncrement64(&absent); return; }
+    }
     if (!scratch) scratch = new (std::nothrow) BlockCodec::DecodeScratch;
     if (!scratch) return;
     if (!TerrainSidecar::ApplyTile(g, uint32_t(idx), *scratch)) { InterlockedIncrement64(&decodeFailed); return; }

@@ -24,8 +24,11 @@
 #pragma once
 #include "../src/terrain_sidecar.h"
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -148,7 +151,74 @@ inline bool VersionPending() {
 // ---- AddTile: begin the armed sidecar, apply this tile ------------------------
 using AddTileFn = void (*)(void*, int, uint64_t, uint64_t, uint64_t, uint64_t);
 inline AddTileFn& OriginalAddTile() { static AddTileFn f = nullptr; return f; }
-inline void*& LastTerrain() { static void* t = nullptr; return t; }
+
+// ---- which CTerrain is live -----------------------------------------------------
+// A load builds two CTerrain versions and frees one; the last one AddTile saw may
+// be the freed one (Windows, 2026-09-21: "the last seen CTerrain is not this
+// world's"). Every distinct CTerrain seen is kept (the last four), and the save
+// captures the one that reads as a whole grid with the most full tiles. Reads go
+// through process_vm_readv on ourselves: unmapped memory (a freed grid's records
+// are one large, unmapped-on-free allocation) is an error, never a fault.
+inline bool SafeRead(const void* src, void* dst, size_t n) {
+    struct iovec l{dst, n}, r{const_cast<void*>(src), n};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == ssize_t(n);
+}
+struct Seen { std::mutex m; void* t[4] = {}; };
+inline Seen& SeenTerrains() { static Seen* s = new Seen; return *s; }
+inline void NoteTerrain(void* terrain) {
+    Seen& s = SeenTerrains();
+    std::lock_guard<std::mutex> l(s.m);
+    if (s.t[0] == terrain) return;
+    int at = 3;
+    for (int i = 0; i < 4; ++i) if (s.t[i] == terrain) at = i;
+    for (int i = at; i > 0; --i) s.t[i] = s.t[i - 1];
+    s.t[0] = terrain;
+}
+inline void ForgetTerrains() { Seen& s = SeenTerrains(); std::lock_guard<std::mutex> l(s.m); for (auto& t : s.t) t = nullptr; }
+// The full tiles of `terrain`, read without trusting it; negative if it is not a readable grid.
+inline long FullTiles(void* terrain) {
+    uint8_t* grid = nullptr; uint8_t head[0x18];
+    if (!terrain || !SafeRead(static_cast<uint8_t*>(terrain) + 0x18, &grid, sizeof grid) || !grid || !SafeRead(grid, head, sizeof head)) return -1;
+    int32_t nx, ny; uint8_t* records;
+    memcpy(&nx, head + 8, 4); memcpy(&ny, head + 0xc, 4); memcpy(&records, head + 0x10, 8);
+    if (nx <= 0 || ny <= 0 || nx > 4096 || ny > 4096 || !records) return -2;
+    const size_t n = size_t(nx) * size_t(ny);
+    std::vector<uint8_t> rec(n * 40);
+    if (!SafeRead(records, rec.data(), rec.size())) return -3;
+    long full = 0;
+    constexpr size_t Batch = 512;                    // under IOV_MAX
+    std::vector<TerrainSidecar::TileVector> vecs(Batch);
+    std::vector<struct iovec> local(Batch), remote(Batch);
+    for (size_t at = 0; at < n; at += Batch) {
+        size_t k = 0;
+        for (size_t i = at; i < n && i < at + Batch; ++i) {
+            void* v; memcpy(&v, rec.data() + i * 40 + 8, 8);
+            if (!v) continue;
+            local[k] = {&vecs[k], sizeof(TerrainSidecar::TileVector)};
+            remote[k] = {v, sizeof(TerrainSidecar::TileVector)};
+            ++k;
+        }
+        for (size_t i = 0; i < k; ++i) {                // one call per vector: a bad one fails alone
+            if (process_vm_readv(getpid(), &local[i], 1, &remote[i], 1, 0) != ssize_t(sizeof(TerrainSidecar::TileVector))) continue;
+            if (TerrainSidecar::Eligible(&vecs[i])) ++full;
+        }
+    }
+    return full;
+}
+// The live CTerrain among those seen, or nullptr. `why` lists each candidate's count.
+inline void* PickTerrain(char* why, size_t cap) {
+    void* cands[4];
+    { Seen& s = SeenTerrains(); std::lock_guard<std::mutex> l(s.m); memcpy(cands, s.t, sizeof cands); }
+    void* best = nullptr; long bestFull = 0; size_t w = 0;
+    if (cap) why[0] = 0;
+    for (void* t : cands) {
+        if (!t) continue;
+        const long full = FullTiles(t);
+        if (w + 40 < cap) w += size_t(snprintf(why + w, cap - w, "%s%p=%ld", w ? " " : "", t, full));
+        if (full > bestFull) { best = t; bestFull = full; }
+    }
+    return best;
+}
 inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     static std::atomic<uint32_t> cursor{0};
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
@@ -167,17 +237,21 @@ inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
 inline void AddTileHook(void* terrain, int entity, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     OriginalAddTile()(terrain, entity, a, b, c, d);
     if (!terrain) return;
-    LastTerrain() = terrain;
+    NoteTerrain(terrain);
     static std::mutex beginLock;
     if (TerrainSidecar::g_pending) {
         std::lock_guard<std::mutex> l(beginLock);
         if (TerrainSidecar::g_pending) { S().Reset(); TerrainSidecar::BeginIfPending(terrain, nullptr); }
     }
-    if (!TerrainSidecar::Loaded()) return;
+    if (!TerrainSidecar::Loaded() && !TerrainSidecar::TryStream(terrain)) return;
     const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records()) return;
     const long idx = FindRecord(g, entity);
-    if (idx < 0 || !TerrainSidecar::Has(uint32_t(idx))) return;
+    if (idx < 0) return;
+    if (!TerrainSidecar::Has(uint32_t(idx))) {
+        TerrainSidecar::RefreshIfDue();              // a stream: maybe it has arrived since
+        if (!TerrainSidecar::Has(uint32_t(idx))) return;
+    }
     static thread_local BlockCodec::DecodeScratch* scratch = nullptr;
     if (!scratch) scratch = new (std::nothrow) BlockCodec::DecodeScratch;
     if (!scratch || !TerrainSidecar::ApplyTile(g, uint32_t(idx), *scratch)) return;
@@ -231,7 +305,9 @@ inline Ret16 SaveHook(void* meta, void* shot, void* cfg, void* res, void* state,
     std::string sav = WriteOn() ? SavPath(id) : std::string(), tmp;
     long tiles = -1; uint64_t bytes = 0; long long ms = 0;
     struct timespec before{}; const bool hadBefore = !sav.empty() && Mtime(sav, &before);
-    void* terrain = LastTerrain();
+    char picked[200] = {0};
+    void* terrain = sav.empty() ? nullptr : PickTerrain(picked, sizeof picked);
+    if (!sav.empty() && !terrain && Log()) Log()("terrain sidecar: no live terrain among those seen (%s); no sidecar for this save", picked);
     if (!sav.empty() && terrain) {
         const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
         if (g.base && g.records() && g.nx() > 0 && g.ny() > 0) {
@@ -273,7 +349,7 @@ inline Ret16 SaveHook(void* meta, void* shot, void* cfg, void* res, void* state,
 using LoadFn = void* (*)(void*, void*, void*, const SaveGameId*, void*, void*, void*, void*, void*, void*, void*);
 inline LoadFn& OriginalLoad() { static LoadFn f = nullptr; return f; }
 inline void* LoadHook(void* ret, void* ctx, void* mods, const SaveGameId* id, void* a4, void* a5, void* s0, void* s1, void* s2, void* s3, void* s4) {
-    LastTerrain() = nullptr;
+    ForgetTerrains();
     S().Reset();
     TerrainSidecar::EndApply();
     TerrainSidecar::g_pending = false;
@@ -285,19 +361,80 @@ inline void* LoadHook(void* ret, void* ctx, void* mods, const SaveGameId* id, vo
         if (Log()) Log()("terrain sidecar: loading %s, fingerprint %016llx in %lld ms; %s", sav.c_str(),
                          (unsigned long long)TerrainSidecar::g_saveFingerprint, ms,
                          TerrainSidecar::g_pending && TerrainSidecar::FingerprintOfPath(TerrainSidecar::g_sidecarPath) == TerrainSidecar::g_saveFingerprint
-                             ? TerrainSidecar::g_sidecarPath : "no matching sidecar");
-        if (TerrainSidecar::g_pending && TerrainSidecar::FingerprintOfPath(TerrainSidecar::g_sidecarPath) != TerrainSidecar::g_saveFingerprint)
-            TerrainSidecar::g_pending = false;
+                             ? TerrainSidecar::g_sidecarPath : TerrainSidecar::g_streamDir[0] ? "no sidecar beside it; a stream from the host may follow" : "no matching sidecar");
     } else if (Log()) Log()("terrain sidecar: this load's save path could not be resolved; loading stock");
     return OriginalLoad()(ret, ctx, mods, id, a4, a5, s0, s1, s2, s3, s4);
 }
 
 // ---- the alignment pass: skip it when the sidecar served every tile ----------
+inline bool VersionFinished(void* terrain) {
+    const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+    if (!g.base || g.nx() <= 0 || g.ny() <= 0) return false;
+    Served& s = S(); std::lock_guard<std::mutex> l(s.m);
+    const Served::Grid* slot = s.Slot(g.base, uint32_t(g.nx()) * uint32_t(g.ny()), false);
+    return slot && slot->finished;
+}
+// Serve every tile the sidecar holds that AddTile did not (a stream that had not
+// arrived yet), on several threads. Returns the tiles served here.
+inline uint32_t CatchUp(void* terrain) {
+    const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+    if (!g.base || !g.records() || g.nx() <= 0 || g.ny() <= 0) return 0;
+    const uint32_t n = uint32_t(g.nx()) * uint32_t(g.ny());
+    std::vector<uint32_t> todo;
+    {
+        Served& s = S(); std::lock_guard<std::mutex> l(s.m);
+        const Served::Grid* slot = s.Slot(g.base, n, false);
+        for (uint32_t i = 0; i < n; ++i)
+            if ((!slot || slot->range[i] == Served::kNone) && TerrainSidecar::Has(i)) todo.push_back(i);
+    }
+    if (todo.empty()) return 0;
+    std::atomic<size_t> next{0};
+    std::atomic<uint32_t> served{0};
+    auto work = [&] {
+        auto* sc = new (std::nothrow) BlockCodec::DecodeScratch;
+        if (!sc) return;
+        for (size_t k; (k = next.fetch_add(1)) < todo.size();) {
+            const uint32_t i = todo[k];
+            if (!TerrainSidecar::ApplyTile(g, i, *sc)) continue;
+            Note(g, i, TerrainSidecar::VectorOf(g.record(i)));
+            served.fetch_add(1);
+        }
+        delete sc;
+    };
+    const unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < threads && todo.size() > 64; ++t) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    return served.load();
+}
+// The pass is here and the sidecar is a stream still arriving: wait for it when
+// that beats the pass, then serve what arrived. On Linux the pass computes every
+// tile unless all are served (no per-tile publication skip), so the whole pass
+// is what waiting saves.
+constexpr double kPassMsPerTile = 1.0;
+inline void SettleStream(void* terrain) {
+    TerrainSidecar::TryStream(terrain, true);
+    const TerrainSidecar::StreamState s = TerrainSidecar::Progress();
+    if (!s.loaded) return;
+    if (s.streaming) {
+        const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
+        const uint32_t n = g.base && g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
+        char why[200] = {0};
+        const bool complete = TerrainSidecar::WaitForStream(n, kPassMsPerTile, 5000, 300000, why, sizeof why);
+        if (Log()) Log()("terrain stream: %s at the pass: %s", complete ? "complete" : "not waited for", why);
+    }
+    const uint32_t caught = CatchUp(terrain);
+    if (caught && Log()) Log()("terrain stream: %u tiles served at the pass", caught);
+}
 // Called from the redirected UpdateSubterrains call. True when the pass must
 // not run (the caller then returns without calling it).
 inline bool SkipPass(void* self, size_t blocks) {
     if (!self || blocks <= 512) return false;
     void* terrain = *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 8);
+    if (!terrain) return false;
+    if (VersionFinished(terrain)) return false;      // it passed already: a pass in play, never the load's
+    SettleStream(terrain);
     if (!AllServedFinish(terrain)) return false;
     if (Log()) Log()("alignment pass: %zu blocks skipped -- every tile was served from the sidecar (its min/max and version written from the served cache)", blocks);
     return true;
