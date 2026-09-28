@@ -129,3 +129,10 @@ Logs: `<prefix>/data/tpf2mp_host.log`. Look for `tpf2_bigmap ... -> OK (0)` and
 Experimental `alignment_batch_tiles=512` enables native alignment batching.
 It defaults to 0 (stock): loaded-world lifetime and memory acceptance remain
 unvalidated because the revisit lab could not initialize Steam. See PORT.md.
+
+Native terrain sidecars are experimental and default off (`terrain_sidecar=0`).
+For controlled lab trials, `terrain_sidecar=1` enables matching `.terr` capture
+and restore; `terrain_sidecar_write=0` disables capture while retaining reads.
+`terrain_sidecar_threads=0` selects up to eight encoding workers automatically.
+See [the port evidence](PORT.md#terrain-sidecar-dev-2b4fd093-experimental-default-off)
+for the outstanding live ownership and completion checks.

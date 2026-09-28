@@ -537,9 +537,55 @@ creation-time API. Native timestamp regression tests pass; the lab launch
 failed before game startup, so preview stability is not yet observed locally.
 See [the RE record](../../../docs/re/linux/DEV_568E7EA7.md).
 
-## Terrain sidecar
+## Tight-budget shortfall — dev 2b8505c7
 
-`sidecar_linux.h` brings the Windows terrain sidecar (`../src/terrain_sidecar.h`, same file format) to build 35924: every save writes `<save>.terr` beside `<save>.sav`, and a load of that same save (fingerprint = hash of the `.sav`) restores each tile at AddTile and skips the alignment pass when every tile of the terrain was served. The records' minZ/maxZ are then written from the ranges noted at AddTile times the height scale, and each version is bumped, as publication does. A partial sidecar is applied and then overwritten by the stock pass, which gives the stock result.
+Windows now releases only the commit shortfall from resident terrain/material
+bytes, retaining its emergency/load floor. Native automatic terrain budgeting
+already releases only its MemAvailable shortfall from current resident bytes;
+it has no flat 256 MiB pressure clamp. Added regression coverage for 2724 ->
+1188 MiB under a 1536 MiB shortfall, repeated samples and reclaim progress.
+Native policy is unchanged. Windows commit accounting and Linux physical-memory
+headroom are different inputs; this does not add a native material pager or
+Windows load/commit controller. See [comparison and evidence](../../../docs/re/linux/DEV_2B8505C7.md).
+No new game run or performance measurement was made for this integration.
+
+## Complete-sidecar alignment bypass (dev 0871bfa6, not ported)
+
+Windows can skip a load's alignment computation when a still-loaded sidecar
+served every tile and recorded every height range. Native serving and its
+lifetime contracts remain absent; native alignment continues unchanged.
+Fresh ELF analysis located the equivalent scaled min/max and version stores,
+but the lab launcher failed before startup, preventing live proof.
+See [RE evidence](../../../docs/re/linux/DEV_0871BFA6.md) and
+[integration/tests](../../../docs/linux/UPSTREAM_dev_0871bfa6.md).
+
+## Threaded sidecar encoding (dev c8dd5157, runtime not ported)
+
+The shared header now compiles with pthread read/write locks and POSIX file
+handling. Native CTest exercises deterministic encoding with 1, 2, 4, 7 and
+automatic threads across two full 2,048-record windows and one partial window,
+plus restore/corruption checks and UTF-8 path/fingerprint lookup.
+This is synthetic-grid validation, not a game-side capture implementation.
+The native plugin still does not read `terrain_sidecar_threads` or call the
+writer. Fresh ELF disassembly confirmed the grid view, but the lab failed
+before startup, preventing capture-lifetime and worker/pager validation.
+See [integration](../../../docs/linux/UPSTREAM_dev_c8dd5157.md) and
+[RE evidence](../../../docs/re/linux/DEV_C8DD5157.md).
+
+## Per-terrain served ranges (dev fdfb79e8, not ported)
+
+Windows now retains ranges for up to four grids. Native runtime sidecar serving
+and alignment bypass remain absent; this change has no native runtime effect.
+Fresh ELF analysis and a blocked lab launch are recorded in
+[the investigation](../../../docs/re/linux/DEV_FDFB79E8.md).
+
+## Terrain sidecar (dev 2b4fd093, experimental, default off)
+
+This supersedes the implementation-absence statements in the historical sections
+above. Live ownership/completion proof remains missing; see
+[the integration evidence](../../../docs/re/linux/DEV_2B4FD093.md).
+
+`sidecar_linux.h` brings the Windows terrain sidecar (`../src/terrain_sidecar.h`, same file format) to build 35924. When explicitly enabled, every eligible save writes `<save>.terr` beside `<save>.sav`, and a load of that same save (fingerprint = hash of the `.sav`) restores each tile at AddTile and skips the alignment pass when every tile of the terrain was served. The records' minZ/maxZ are then written from the ranges noted at AddTile times the height scale, and each version is bumped, as publication does. A partial sidecar is applied and then overwritten by the stock pass, which gives the stock result.
 
 | Site | RVA | Use |
 |---|---|---|
@@ -551,4 +597,79 @@ See [the RE record](../../../docs/re/linux/DEV_568E7EA7.md).
 | publication | `0xcf5805`, `0xcf58ad` | scale at CTerrain+0x34; minZ +0x18, maxZ +0x1c, version +0x20 |
 | pass call | `0x173e443` | the redirect used for batching; now installed whenever the sidecar is on |
 
-cfg: `terrain_sidecar` (1), `terrain_sidecar_write` (1), `terrain_sidecar_threads` (0 = CPUs−1, at most 8). A mismatch at any site disables the sidecar and leaves stock loading. `tests/sidecar_test.cpp` covers the flow end to end on a fake terrain: save, full load and skip, a partial load, a missing tile, a small pass, a changed save, orphan sweep, and writing turned off.
+cfg: `terrain_sidecar` (0; opt in for lab trials), `terrain_sidecar_write` (1), `terrain_sidecar_threads` (0 = CPUs−1, at most 8). A mismatch at any site disables the sidecar and leaves stock loading. `tests/sidecar_test.cpp` covers the flow end to end on a fake terrain: save, full load and skip, a partial load, a missing tile, a small pass, a changed save, orphan sweep, and writing turned off.
+
+Partial hook installation leaves installed callbacks forwarding only, with no
+sidecar writes, reads or pass bypass. The three trampolines are published through
+the host before their respective entry jumps become visible.
+
+## Two-version sidecar release (dev 5b817efb)
+
+The native pass now reports whether it skipped. A skipped pass keeps the file
+while another tracked grid is unfinished; a completed grid cannot skip twice.
+A load-sized pass that runs still releases the file. The native fixture covers
+a partially served second grid, its remaining AddTiles after the first pass,
+independent min/max publication and one-time version increments.
+No new game sites, offsets or ABI assumptions were introduced. Sidecars remain
+experimental and default off: the lab failed before game execution, so no
+native two-pass gameplay or timing result is claimed. See
+[integration](../../../docs/linux/UPSTREAM_dev_5b817efb.md) and
+[evidence](../../../docs/re/linux/DEV_5B817EFB.md).
+
+## Windows commit threshold (dev b6d73041)
+
+Windows now clamps its automatic free-commit threshold to 2..4 GiB (unknown
+RAM: 4 GiB); positive `commit_tight_mb` overrides it. This is separate from
+physical-memory headroom. Native terrain paging retains RAM/7 headroom bounded
+to 2..12 GiB and a RAM/4 cap bounded to 4..8 GiB, using `MemAvailable` without
+swap. `commit_tight_mb` has no native effect. Native UFFD restores do not wait
+on a commit-tight throttle. See [source evidence](../../../docs/re/linux/DEV_B6D73041.md).
+
+## Thread-local sidecar lookup (dev 5fd49a24)
+
+Native record scans retain a thread-local grid/index hint and reset it on each
+load using an atomic generation, including when a grid address is reused.
+The native regression requires 720 probes for 480 alternating-worker lookups
+and checks surviving workers after LoadHook. No engine ABI or patch changes;
+sidecars remain experimental and default off. See the
+[integration record](../../../docs/linux/UPSTREAM_dev_5fd49a24.md).
+
+## Material-index layer cache and dither stepping (dev 7e3d3bfa, not ported)
+
+Windows caches each layer's height-map pointer and ID once per call and steps
+the dither column. Linux still executes the stock selection loop;
+`material_index_fast` has no native implementation. Fresh disassembly located
+the matching loop inside worker `0xcc41f0`, reached from UpdateBoxAsync's
+ThreadPool loop. The lab failed UID-map setup before game startup, so worker
+ownership and a safe replacement boundary remain unproved. No Windows
+address or calling convention was copied into Linux. See the
+[static and live evidence](../../../docs/re/linux/DEV_7E3D3BFA.md).
+
+The [dev `8066c58f` integration](../../../docs/linux/UPSTREAM_dev_8066c58f.md) retains the default-off Windows
+material-index measurement probe. Native `material_index_probe` remains
+unported after static investigation and a lab startup failure; Linux produces
+no `material_probe.txt`. Windows measurements do not establish native tile
+hashes or compression sizes. Release remains 0.7.1.1.
+
+## Windows load-speed findings (dev 7bace802)
+
+The September 28 section of [load-speed-todo.md](../load-speed-todo.md)
+reports Windows profiling, tile hashes and timings. Its 32x32 material-index
+chunk experiment changed 8,164 of 36,992 tiles and was rejected upstream;
+retain stock chunk sizing. The quoted PE addresses are not Linux patch sites.
+No native implementation or setting changes in this integration. Native
+material-index acceleration/probing gaps above and experimental default-off
+sidecars remain unchanged; no native timing or tile-hash result is implied.
+See [integration and validation](../../../docs/linux/UPSTREAM_dev_7bace802.md).
+
+## Windows commit threshold (dev 0eb9eea2)
+
+Windows lowers the automatic threshold from 2..4 to 2..3 GiB, with a 3 GiB
+fallback when installed RAM is unknown; positive `commit_tight_mb` still
+wins. This supersedes the Windows numbers in the b6d73041 entry above.
+Native terrain paging continues to use `MemAvailable`, RAM/7 headroom bounded
+to 2..12 GiB and a RAM/4 resident cap bounded to 4..8 GiB. The Windows change
+adjusts neither of those native quantities. No new Linux setting or hook is
+needed; inherited commit-controller/material-pager differences remain.
+See [integration](../../../docs/linux/UPSTREAM_dev_0eb9eea2.md) and
+[source review](../../../docs/re/linux/DEV_0EB9EEA2.md).

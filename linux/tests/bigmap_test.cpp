@@ -11,7 +11,7 @@ static std::map<std::string,int> config;
 static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
 static std::vector<uintptr_t> order;
-static uintptr_t mismatchSite;
+static uintptr_t mismatchSite, failHook;
 static bool build=true;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
 // Keep fixture initialization independent of host userfaultfd permissions.
@@ -36,11 +36,11 @@ static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
 static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);return Pack(96,96);}
 static std::vector<uintptr_t> sidecarHooks;   // rvas of the sidecar's hooks, in install order
 static int Hook(uintptr_t target,void*,int n,void** out){
-    if(n!=18){assert(n==13 || n==24);sidecarHooks.push_back(target-0x40000000);*out=reinterpret_cast<void*>(Stock);return 1;}
+    if(n!=18){assert(n==13 || n==24);if(target-0x40000000==failHook)return 0;sidecarHooks.push_back(target-0x40000000);*out=reinterpret_cast<void*>(Stock);return 1;}
     ++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Bool,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();config["terrain_sidecar"]=0;sidecarHooks.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();order.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;mismatchSite=0;}
+static void Reset(){config.clear();config["terrain_sidecar"]=0;sidecarHooks.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();order.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;mismatchSite=failHook=0;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -149,18 +149,32 @@ int main(){
     }
     Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && alignmentBatch==0);
     assert(memory.count(0x173e443)==0);
-    // The terrain sidecar (on by default): the pass redirect even without batching,
+    // The experimental terrain sidecar (explicit opt-in): the pass redirect even without batching,
     // then AddTile, SaveGame and LoadGame hooked in that order.
-    Reset();config.erase("terrain_sidecar");
+    Reset();config["terrain_sidecar"]=1;
     assert(Tpf2mpPluginInit(&host,&info)==0 && sidecarOn && alignmentBatch==0);
     assert(memory[0x173e443][0]==0xe8);
     assert((sidecarHooks==std::vector<uintptr_t>{0xcf71d0,0xc7ec00,0xc7ca40}));
+    assert(TerrainSidecar::g_readLocal && linux_sidecar::ServeAtPass());
+    Reset();config["terrain_sidecar"]=1;config["terrain_sidecar_decode_at_pass"]=0;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && sidecarOn && !linux_sidecar::ServeAtPass());
+    Reset();config["terrain_sidecar"]=1;config["terrain_sidecar_read_local"]=0;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && sidecarOn && !TerrainSidecar::g_readLocal);
+    Reset();config["terrain_sidecar"]=1;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && TerrainSidecar::g_readLocal);
     for(uintptr_t site:{0xcf71d0,0xcf73f2,0xc7ec00,0xc7ca40,0xc7ec2a,0xc7ec5c,0xc7ec95,0xcf5805,0xcf58ad}) {
-        Reset();config.erase("terrain_sidecar");mismatchSite=site;
+        Reset();config["terrain_sidecar"]=1;mismatchSite=site;
         assert(Tpf2mpPluginInit(&host,&info)==0 && !sidecarOn && sidecarHooks.empty());
     }
-    Reset();config.erase("terrain_sidecar");mismatchSite=0x173e443;   // no redirect: no sidecar either
+    Reset();config["terrain_sidecar"]=1;mismatchSite=0x173e443;   // no redirect: no sidecar either
     assert(Tpf2mpPluginInit(&host,&info)==0 && !sidecarOn && sidecarHooks.empty());
+    for(uintptr_t site:{0xcf71d0,0xc7ec00,0xc7ca40}) {
+        Reset();config["terrain_sidecar"]=1;failHook=site;
+        assert(Tpf2mpPluginInit(&host,&info)==0 && !sidecarOn && !linux_sidecar::Enabled());
+    }
+    Reset();config.erase("terrain_sidecar");
+    assert(Tpf2mpPluginInit(&host,&info)==0 && !sidecarOn && !linux_sidecar::Enabled());
+    assert(sidecarHooks.empty() && memory.count(0x173e443)==0);
     assert(Tpf2mpPluginInit(nullptr,&info)==TPF2MP_ERR_ABI);
     Reset();build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();config["enabled"]=0;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_DISABLED && writes==0);

@@ -69,9 +69,8 @@
 #endif
 #include <windows.h>
 #else
-// The native Linux build (bigmap/linux/sidecar_linux.cpp, 2026-09-28): the same
-// file format byte for byte, so a sidecar written on one platform serves on the
-// other. Only the file, directory and lock primitives differ.
+// Linux portability for the shared codec and experimental native sidecars.
+// The file format is unchanged; only file, directory and lock primitives differ.
 #include <pthread.h>
 #include <dirent.h>
 #include <strings.h>
@@ -356,18 +355,20 @@ inline bool IndexPiece(LoadState& st, std::vector<uint8_t>&& piece) {
     else data = std::move(piece);
     size_t p = 0, end = data.size();
     const uint32_t chunk = uint32_t(st.chunks.size());
+    bool valid = true;
     while (st.indexed < st.tiles && p + sizeof(TileHeader) <= end) {
         TileHeader th{}; memcpy(&th, data.data() + p, sizeof th);
-        if (th.bytes == 0 || th.bytes > MaxBlob || th.index >= st.count) return false;
+        if (th.bytes == 0 || th.bytes > MaxBlob || th.index >= st.count) { valid = false; break; }
         if (p + sizeof(TileHeader) + th.bytes > end) break;          // this record is still arriving
         st.byIndex[th.index] = Loc{chunk, uint32_t(p + sizeof(TileHeader)), th.bytes};
         p += sizeof(TileHeader) + th.bytes;
         ++st.indexed;
     }
-    if (st.indexed < st.tiles && p < end) st.tail.assign(data.begin() + p, data.end());
+    if (valid && st.indexed < st.tiles && p < end) st.tail.assign(data.begin() + p, data.end());
     data.resize(p);
+    // Even on a malformed suffix, retain storage for every index published above.
     st.chunks.push_back(std::move(data));
-    return true;
+    return valid;
 }
 // Everything `f` holds from its current position on.
 inline int64_t Tell(FILE* f) {

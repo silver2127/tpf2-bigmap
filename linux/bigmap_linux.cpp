@@ -303,7 +303,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     // Experimental until a live load proves the publication/lifetime contract.
     alignmentBatch=size_t(std::clamp(H->cfgInt(Section,"alignment_batch_tiles",0),0,65536));
     // The sidecar needs the redirected UpdateSubterrains call too (to skip it).
-    sidecarOn=H->cfgBool(Section,"terrain_sidecar",1);
+    linux_sidecar::Enabled().store(false);
+    sidecarOn=H->cfgBool(Section,"terrain_sidecar",0);
     if(alignmentBatch || sidecarOn) {
         const uint8_t entry[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x49,0x89,0xfe,0x41,0x55,0x41,0x54,0x49,0x89,0xf4};
         const uint8_t iter[]={0x4c,0x89,0xff,0xe8,0xa3,0xe1,0xf9,0xfe,0x49,0x89,0xc7};
@@ -411,17 +412,19 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         TerrainSidecar::g_writeThreads=H->cfgInt(Section,"terrain_sidecar_threads",0);
         if(H->cfgBool(Section,"terrain_stream",1) && H->dataDir)TerrainSidecar::SetStreamDir(H->dataDir());
         TerrainSidecar::g_readLocal=H->cfgBool(Section,"terrain_sidecar_read_local",1);
+        // sidecarOn already requires the verified pass redirect, even without batching.
         linux_sidecar::ServeAtPass()=H->cfgBool(Section,"terrain_sidecar_decode_at_pass",1);
-        void* t=nullptr;
-        // AddTile first (inert until a load arms a sidecar), LoadGame last: nothing is armed before every hook is in.
+        // Publish each trampoline directly before its entry patch becomes visible.
+        // Until all three succeed, callbacks forward without sidecar activity.
         const bool hooked=sites &&
-            H->installHook(H->moduleBase()+0xcf71d0,reinterpret_cast<void*>(linux_sidecar::AddTileHook),sizeof addTile,&t) &&
-            (linux_sidecar::OriginalAddTile()=reinterpret_cast<linux_sidecar::AddTileFn>(t),
-             H->installHook(H->moduleBase()+0xc7ec00,reinterpret_cast<void*>(linux_sidecar::SaveHook),sizeof save,&t)) &&
-            (linux_sidecar::OriginalSave()=reinterpret_cast<linux_sidecar::SaveFn>(t),
-             H->installHook(H->moduleBase()+0xc7ca40,reinterpret_cast<void*>(linux_sidecar::LoadHook),sizeof load,&t));
+            H->installHook(H->moduleBase()+0xcf71d0,reinterpret_cast<void*>(linux_sidecar::AddTileHook),sizeof addTile,
+                           reinterpret_cast<void**>(&linux_sidecar::OriginalAddTile())) &&
+            H->installHook(H->moduleBase()+0xc7ec00,reinterpret_cast<void*>(linux_sidecar::SaveHook),sizeof save,
+                           reinterpret_cast<void**>(&linux_sidecar::OriginalSave())) &&
+            H->installHook(H->moduleBase()+0xc7ca40,reinterpret_cast<void*>(linux_sidecar::LoadHook),sizeof load,
+                           reinterpret_cast<void**>(&linux_sidecar::OriginalLoad()));
         if(hooked){
-            linux_sidecar::OriginalLoad()=reinterpret_cast<linux_sidecar::LoadFn>(t);
+            linux_sidecar::Enabled().store(true);
             H->log("terrain sidecar: %s beside each save; a load whose sidecar holds every tile skips the alignment pass",
                    linux_sidecar::WriteOn()?"written":"not written (terrain_sidecar_write=0), read");
         } else {
