@@ -172,7 +172,10 @@ int main(){
         Reset();config["terrain_sidecar"]=1;failHook=site;
         assert(Tpf2mpPluginInit(&host,&info)==0 && !sidecarOn && !linux_sidecar::Enabled());
     }
-    Reset();config.erase("terrain_sidecar");
+    Reset();config.erase("terrain_sidecar");                          // on by default from 0.7.1.2
+    assert(Tpf2mpPluginInit(&host,&info)==0 && sidecarOn && linux_sidecar::Enabled());
+    assert((sidecarHooks==std::vector<uintptr_t>{0xcf71d0,0xc7ec00,0xc7ca40}) && memory[0x173e443][0]==0xe8);
+    Reset();config["terrain_sidecar"]=0;                               // and off when asked
     assert(Tpf2mpPluginInit(&host,&info)==0 && !sidecarOn && !linux_sidecar::Enabled());
     assert(sidecarHooks.empty() && memory.count(0x173e443)==0);
     assert(Tpf2mpPluginInit(nullptr,&info)==TPF2MP_ERR_ABI);

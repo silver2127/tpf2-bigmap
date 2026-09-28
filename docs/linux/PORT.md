@@ -631,7 +631,7 @@ Native record scans retain a thread-local grid/index hint and reset it on each
 load using an atomic generation, including when a grid address is reused.
 The native regression requires 720 probes for 480 alternating-worker lookups
 and checks surviving workers after LoadHook. No engine ABI or patch changes;
-sidecars remain experimental and default off. See the
+sidecars were experimental and default off then (on from 0.7.1.2). See the
 [integration record](../../../docs/linux/UPSTREAM_dev_5fd49a24.md).
 
 ## Material-index layer cache and dither stepping (dev 7e3d3bfa, not ported)
