@@ -46,17 +46,40 @@ static void __fastcall MaterialIndexDetour(uint64_t block,uint64_t tile,uint64_t
     const auto extra=reinterpret_cast<const uint8_t*>(overlay[0]);
     const auto mask=reinterpret_cast<const uint32_t*>(overlay[3]);
     auto output=reinterpret_cast<uint8_t*>(outputVector[0]);
+    // Each layer's height map and material ID, read once per call instead of
+    // through two dependent loads per layer per pixel (2026-09-28 profile: this
+    // function was the load's largest plugin cost, ~46 CPU-s on a 36,992-tile
+    // map). The layers do not change during a call: the stock code reads them
+    // as fixed inputs too.
+    constexpr int MaxLayers=256;
+    if (count>MaxLayers) {
+        g_originalMaterialIndex(block,tile,job,origin,overlay,layers,cell,baseVector,outputVector);
+        return;
+    }
+    const float* layerHeights[MaxLayers];
+    uint8_t layerId[MaxLayers];
+    for (int k=0;k<count;++k) {
+        const uint8_t* e=entries+size_t(k)*24;
+        layerHeights[k]=reinterpret_cast<const float*>((*reinterpret_cast<const uintptr_t* const*>(e))[0]);
+        layerId[k]=e[12];
+    }
+    const bool hasOverlay=overlay[0]!=overlay[1];
+    // The dither column (dx*256+x)%63, stepped along the row instead of a 64-bit
+    // division per pixel (dx and x are non-negative: checked above).
+    const int ditherCol0=int((dx*256+x0)%63);
     for (int y=y0;y<y0+h;++y) {
         const float fy=float(y)*0.25f;
         const int iy=int(fy);
         const float ty=fy-float(iy);
-        const int ditherRow=int((dy*256+y)%63)*63;
-        for (int x=x0;x<x0+w;++x) {
+        const float* dither=g_materialDither+int((dy*256+y)%63)*63;
+        int ditherCol=ditherCol0;
+        const int rowIndex=cell[0]*64+1+(iy+cell[1]*64+1)*stride;
+        for (int x=x0;x<x0+w;++x,ditherCol=ditherCol==62?0:ditherCol+1) {
             const int pixel=y*256+x;
             const uint8_t b=base[(y-y0)*w+x-x0];
             uint8_t value=0xe9;
             bool evaluate=false;
-            if (overlay[0]!=overlay[1] && extra[pixel]!=0 && b!=0xff) {
+            if (hasOverlay && extra[pixel]!=0 && b!=0xff) {
                 value=extra[pixel];
                 if (((mask[pixel>>5]>>(pixel&31))&1)==0 && b!=0) value=b;
             } else if (b!=0) value=b;
@@ -68,21 +91,19 @@ static void __fastcall MaterialIndexDetour(uint64_t block,uint64_t tile,uint64_t
                 const float fx=float(x)*0.25f;
                 const int ix=int(fx);
                 const float tx=fx-float(ix);
-                const int index=cell[0]*64+1+ix+(iy+cell[1]*64+1)*stride;
-                const float threshold=g_materialDither[ditherRow+int((dx*256+x)%63)];
+                const int index=rowIndex+ix;
+                const float threshold=dither[ditherCol];
                 for (int batch=0;batch<count;batch+=8) {
                     if (batch ? value!=0xe9 : !evaluate) continue;
                     int last=count-batch-9;
                     if (last<0) last=0;
                     bool found=false;
                     for (int k=count-batch-1;k>=last;--k) {
-                        const uint8_t* e=entries+size_t(k)*24;
-                        const auto map=*reinterpret_cast<const uintptr_t* const*>(e);
-                        const auto heights=reinterpret_cast<const float*>(map[0]);
+                        const float* heights=layerHeights[k];
                         const float top=(heights[index+1]-heights[index])*tx+heights[index];
                         const float bottom=(heights[index+stride+1]-heights[index+stride])*tx+heights[index+stride];
                         if (threshold < (bottom-top)*ty+top) {
-                            value=e[12]; found=true; break;
+                            value=layerId[k]; found=true; break;
                         }
                     }
                     if (!found && count<=batch+8) value=fallback;
