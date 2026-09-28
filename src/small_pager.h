@@ -321,7 +321,8 @@ static void Tick(unsigned attempts=0) {
             Guard g;
             if(stats.residentBytes<=budget || ringHead==ringTail)return;
             auto tick=GetTickCount64();
-            bool loading=stats.lastBulkAllocation && tick-stats.lastBulkAllocation<15000;
+            // throttled faults are a load too (pager_impl.inl Tick, 2026-09-28)
+            bool loading=(stats.lastBulkAllocation && tick-stats.lastBulkAllocation<15000) || throttle;
             minAge=loading?LoadingMinAgeMs:MinAgeMs;
             i=ring[ringHead&RingMask];
             Record& r=records[i];

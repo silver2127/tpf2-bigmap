@@ -483,6 +483,28 @@ int main(int argc,char** argv) {
         assert(Release(a));assert(Release(r));
         printf("throttle: waited %llu ms\n",Snapshot().throttleMillis);
     }
+    // A throttled fault with NO recent allocation burst (the load's tail, commit
+    // tight): the evictor takes the fast loading path, so the fault waits for one
+    // eviction, not the full ThrottleMaxMs (2026-09-28: one tile a second).
+    {
+        assert(EnableLazyZero());
+        std::vector<uint16_t*> old(8);
+        for(auto& p:old){p=Allocate();assert(p);p[0]=3;}
+        SetBudget(7*SlotBytes);
+        Sleep(DWORD(LoadingMinAgeMs+200));          // old enough to evict while loading
+        auto n=Allocate();assert(n);
+        {Guard g;stats.lastBulkAllocation=0;}       // no burst: before the fix, the steady path
+        SetThrottle(true);
+        std::atomic<bool> stop{false};
+        std::thread evictor([&]{while(!stop){Tick();Sleep(25);}});
+        auto t0=GetTickCount64();n[0]=7;auto dt=GetTickCount64()-t0;
+        stop=true;evictor.join();
+        SetThrottle(false);
+        printf("throttled fault at the load's tail: %llu ms\n",dt);
+        assert(n[0]==7 && dt<ThrottleMaxMs/2);
+        for(auto p:old)assert(Release(p));
+        assert(Release(n));SetBudget(4*SlotBytes);SetLazyZero(false);
+    }
     // Scale up together to exercise placeholder splitting, O(1) lookup and
     // complete release of both mapped and compressed backing at world teardown.
     DWORD beforeHandles=0,afterHandles=0;
