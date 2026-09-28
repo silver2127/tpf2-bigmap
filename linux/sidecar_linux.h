@@ -224,21 +224,25 @@ inline void* PickTerrain(char* why, size_t cap) {
 // one shared cursor made every scan start where the other thread had been
 // (Windows 2026-09-28: ~30,000 probes per tile; see terrain_serve.h FindRecord).
 inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
-    struct Cursor { const uint8_t* grid; uint32_t next; };
+    // Outward from this thread's last hit (last+1, last-1, last+2, ...): the
+    // Windows load showed a forward scan costing ~35,000 probes per tile.
+    struct Cursor { const uint8_t* grid; uint32_t last; };
     static thread_local Cursor c = {nullptr, 0};
     const uint32_t n = g.nx() > 0 && g.ny() > 0 ? uint32_t(g.nx()) * uint32_t(g.ny()) : 0;
     if (!n) return -1;
-    if (c.grid != g.base) { c.grid = g.base; c.next = 0; }
-    const uint32_t start = c.next % n;
-    for (uint32_t k = 0; k < n; ++k) {
-        uint32_t i = start + k; if (i >= n) i -= n;
+    if (c.grid != g.base) { c.grid = g.base; c.last = n - 1; }
+    auto is = [&](uint32_t i) {
         const uint8_t* r = g.record(i);
-        if (*reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8)) {
-            c.next = i + 1 < n ? i + 1 : 0;
-            return long(i);
-        }
+        return *reinterpret_cast<const int32_t*>(r) == entity && *reinterpret_cast<uint8_t* const*>(r + 8);
+    };
+    const uint32_t last = c.last % n;
+    for (uint32_t d = 1; d <= n / 2 + 1; ++d) {
+        const uint32_t up = last + d < n ? last + d : last + d - n;
+        const uint32_t down = last >= d ? last - d : last + n - d;
+        if (is(up)) { c.last = up; return long(up); }
+        if (down != up && is(down)) { c.last = down; return long(down); }
     }
-    return -1;
+    return is(last) ? long(last) : -1;
 }
 inline void AddTileHook(void* terrain, int entity, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     OriginalAddTile()(terrain, entity, a, b, c, d);

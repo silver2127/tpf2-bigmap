@@ -99,7 +99,7 @@ int main() {
     assert(g_addCalls == nx * ny && c[0] == nx * ny);
     assert(c[1] == written && g_marked.size() == size_t(written));           // applied + marked per stored tile
     assert(c[3] == nx * ny - written && c[4] == 0 && c[2] == 0 && c[6] == 0);  // absent tiles untouched, every record found
-    assert(c[5] == nx * ny);                                                  // in grid order the cursor hits first probe every time
+    assert(c[5] == nx * ny);                                                  // in grid order the search hits on the first probe every time
     size_t m = 0;
     for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) {
         if (stored[i]) { assert(live.caches[i] == save.caches[i]); assert(g_marked[m++] == live.caches[i].data()); }
@@ -138,6 +138,19 @@ int main() {
         printf("two AddTile threads: %lld probes for %d tiles\n", probed, nx * ny);
         assert(probed <= 2LL * nx * ny);
         for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) if (stored[i]) assert(live4.caches[i] == save.caches[i]);
+    }
+    // 3c. DESCENDING order (a forward scan wrapped almost the whole grid per tile:
+    //     ~35,000 probes each on a 36,992-tile load): two probes per tile.
+    {
+        FakeTerrain live5(nx, ny); g_live = &live5;
+        long long b5[7]{}; BigmapTestServeCounters(b5);
+        std::thread([&] {                                                   // a fresh thread: its own cursor
+            for (int i = nx * ny - 1; i >= 0; --i) BigmapTestServeDetour(live5.cterrain, 1000 + i, FakeAddTile, MarkFails);
+        }).join();
+        BigmapTestServeCounters(c);
+        printf("descending AddTile: %lld probes for %d tiles\n", c[5] - b5[5], nx * ny);
+        assert(c[5] - b5[5] <= 3LL * nx * ny && c[4] == b5[4]);
+        for (uint32_t i = 0; i < uint32_t(nx * ny); ++i) if (stored[i]) assert(live5.caches[i] == save.caches[i]);
     }
     // 4. Not loaded (EndApply): AddTile runs, nothing is applied or probed.
     EndApply(); assert(!Loaded());
