@@ -33,7 +33,7 @@ static void* g_alignmentTerrain = nullptr;
 static volatile LONG64 g_alignmentPassMs = 0;
 // Called after a batched pass (a load's) has published its last batch; the
 // terrain sidecar (terrain_serve.h) releases the loaded file here.
-static void (*g_alignmentPassDone)() = nullptr;
+static void (*g_alignmentPassDone)(bool skipped) = nullptr;
 // SKIPPING A PASS THE SIDECAR ALREADY ANSWERED (2026-09-28). When every tile of
 // the terrain was served from the save's sidecar, the load's alignment pass
 // computes ~800,000 blocks (44-75 s on a player's 49,928-tile map) whose
@@ -92,7 +92,7 @@ static void __fastcall Detour(void* self, SetObject* set) {
         InterlockedIncrement64(&skippedPasses); InterlockedAdd64(&skippedTiles, LONG64(total));
         InterlockedExchange64(&g_alignmentPassMs, 0);
         if (H) H->log("alignment pass: %llu blocks skipped -- every tile was served from the sidecar (its min/max and version written from the served cache)", (unsigned long long)total);
-        if (g_alignmentPassDone) g_alignmentPassDone();
+        if (g_alignmentPassDone) g_alignmentPassDone(true);
         return;
     }
     auto keys = static_cast<SetValue*>(HeapAlloc(GetProcessHeap(), 0, total * sizeof(SetValue)));
@@ -117,7 +117,7 @@ static void __fastcall Detour(void* self, SetObject* set) {
     if (H) H->log("alignment pass: %llu blocks in %llu batches of %llu, %lld ms (compute + publish)", (unsigned long long)n, (unsigned long long)((n + batch - 1) / batch), (unsigned long long)batch, ms);
     HeapFree(GetProcessHeap(), 0, keys);
     HeapFree(GetProcessHeap(), 0, nodes);
-    if (g_alignmentPassDone) g_alignmentPassDone();
+    if (g_alignmentPassDone) g_alignmentPassDone(false);
 }
 }  // namespace AlignmentBatch
 static bool InstallAlignmentBatch() {

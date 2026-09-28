@@ -66,7 +66,7 @@ void Load(Fake& f, const linux_sidecar::SaveGameId& id, int tiles) {
 bool Pass(Fake& f, size_t blocks = 4096) {
     void* self[2] = {nullptr, f.terrain};
     const bool skipped = linux_sidecar::SkipPass(self, blocks);
-    linux_sidecar::PassDone(blocks);
+    linux_sidecar::PassDone(blocks, skipped);
     return skipped;
 }
 }  // namespace
@@ -145,6 +145,27 @@ int main() {
     linux_sidecar::SaveHook(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &id, 0, nullptr);
     assert(stat((g_dir + "/gone.terr").c_str(), &st) != 0);
     assert(TerrainSidecar::FingerprintOfPath(terr.c_str()) == TerrainSidecar::HashFile((g_dir + "/ServerSave.sav").c_str()));
+
+    // 9. Two terrain versions, as a real load builds: the first skip keeps the
+    //    file for the second, both skip, and neither skips twice.
+    {
+        g_savContent = "save v3";
+        f.Fill(7);
+        linux_sidecar::WriteOn() = true;
+        linux_sidecar::SaveHook(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &id, 0, nullptr);
+        Fake second;
+        f.Clear();
+        Load(f, id, N);
+        for (int i = 0; i < N; ++i) linux_sidecar::AddTileHook(second.terrain, 1000 + i, 0, 0, 0, 0);
+        const int32_t v0 = f.Version(0);
+        assert(Pass(f) && TerrainSidecar::Loaded() && f.Version(0) == v0 + 1);
+        assert(!Pass(f) && TerrainSidecar::Loaded() == false);   // the same version again: runs (and a pass that runs releases)
+        f.Clear(); second.Clear();
+        Load(f, id, N);
+        for (int i = 0; i < N; ++i) linux_sidecar::AddTileHook(second.terrain, 1000 + i, 0, 0, 0, 0);
+        assert(Pass(f) && TerrainSidecar::Loaded());
+        assert(Pass(second) && !TerrainSidecar::Loaded());
+    }
 
     // 8. Writing off: a save leaves no sidecar.
     linux_sidecar::WriteOn() = false;

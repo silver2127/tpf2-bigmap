@@ -83,7 +83,8 @@ inline bool Mtime(const std::string& p, struct timespec* out) {
 // A load builds two CTerrain versions (Windows served 68,086 tiles of a
 // 36,992-tile map), each with its own grid, so the ranges are kept per grid.
 struct Served {
-    struct Grid { uint8_t* base = nullptr; std::vector<uint32_t> range; uint32_t applied = 0; };
+    // finished: this version's pass was skipped once; a later big pass on it must run.
+    struct Grid { uint8_t* base = nullptr; std::vector<uint32_t> range; uint32_t applied = 0; bool finished = false; };
     std::mutex m;
     Grid grids[4];
     static constexpr uint32_t kNone = 0x0000FFFFu;   // lo | hi << 16 with lo > hi: never a real range
@@ -92,7 +93,7 @@ struct Served {
     Grid* Slot(uint8_t* base, uint32_t n, bool make) {
         for (auto& g : grids) if (g.base == base && g.range.size() == n) return &g;
         if (!make) return nullptr;
-        for (auto& g : grids) if (!g.base) { g.base = base; g.range.assign(n, kNone); g.applied = 0; return &g; }
+        for (auto& g : grids) if (!g.base) { g.base = base; g.range.assign(n, kNone); g.applied = 0; g.finished = false; return &g; }
         return nullptr;
     }
 };
@@ -122,8 +123,8 @@ inline bool AllServedFinish(void* terrain) {
     const float scale = *reinterpret_cast<const float*>(static_cast<uint8_t*>(terrain) + 0x34);
     if (!(scale >= 0.0f)) return false;
     Served& s = S(); std::lock_guard<std::mutex> l(s.m);
-    const Served::Grid* slot = s.Slot(g.base, n, false);
-    if (!slot || slot->applied != n) return false;
+    Served::Grid* slot = s.Slot(g.base, n, false);
+    if (!slot || slot->finished || slot->applied != n) return false;
     for (uint32_t i = 0; i < n; ++i)
         if (!TerrainSidecar::Eligible(TerrainSidecar::VectorOf(g.record(i))) || slot->range[i] == Served::kNone) return false;
     for (uint32_t i = 0; i < n; ++i) {
@@ -132,7 +133,16 @@ inline bool AllServedFinish(void* terrain) {
         *reinterpret_cast<float*>(r + 0x1c) = float(slot->range[i] >> 16) * scale;
         *reinterpret_cast<int32_t*>(r + 0x20) += 1;
     }
+    slot->finished = true;
     return true;
+}
+// A served version whose pass has not come yet: the load builds two and passes
+// each, so the first skip must not release the file (Windows 2026-09-27: the
+// second version's last 4,859 AddTiles went unserved and its pass ran).
+inline bool VersionPending() {
+    Served& s = S(); std::lock_guard<std::mutex> l(s.m);
+    for (const auto& g : s.grids) if (g.base && !g.finished) return true;
+    return false;
 }
 
 // ---- AddTile: begin the armed sidecar, apply this tile ------------------------
@@ -292,9 +302,11 @@ inline bool SkipPass(void* self, size_t blocks) {
     if (Log()) Log()("alignment pass: %zu blocks skipped -- every tile was served from the sidecar (its min/max and version written from the served cache)", blocks);
     return true;
 }
-// After a load-sized pass (run or skipped): release the sidecar.
-inline void PassDone(size_t blocks) {
+// After a load-sized pass: release the sidecar, unless it was skipped and
+// another served version is still to pass.
+inline void PassDone(size_t blocks, bool skipped) {
     if (blocks <= 512) return;
+    if (skipped && VersionPending()) { if (Log()) Log()("terrain sidecar: pass skipped; kept for the load's other terrain version"); return; }
     const uint32_t applied = [] { Served& s = S(); std::lock_guard<std::mutex> l(s.m); uint32_t a = 0; for (auto& g : s.grids) a += g.applied; return a; }();
     if (TerrainSidecar::EndApply() && Log()) Log()("terrain sidecar: load done, %u tiles applied from the sidecar; file released", applied);
 }
