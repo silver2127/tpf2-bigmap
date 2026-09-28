@@ -2,6 +2,10 @@
 // Loop interchange only: retain 8-step batches with their 9-layer overlap,
 // overlay/mask precedence, 0xe9 sentinel and exact scalar interpolation order.
 #pragma once
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 using MaterialIndexFn = void (__fastcall*)(uint64_t,uint64_t,uint64_t,uint64_t,
     const uintptr_t*,const uint8_t*,const int32_t*,const uintptr_t*,const uintptr_t*);
 static MaterialIndexFn g_originalMaterialIndex = nullptr;
@@ -12,6 +16,58 @@ static int32_t MaterialHi(uint64_t a) { return int32_t(a >> 32); }
 static bool MaterialOverlap(uintptr_t a,size_t an,uintptr_t b,size_t bn) {
     return an && bn && (a<b ? b-a<an : a-b<bn);
 }
+
+// ---- THE PROBE (material_index_probe=1, measurement only, 2026-09-28) ----------
+// Can the material index be cached in the sidecar like the terrain? Per tile
+// (the `tile` argument), each computed rectangle is copied aside; once all
+// 65,536 pixels are in, the tile's run-length size, zero-order entropy and
+// FNV-1a hash go to <data>/material_probe.txt. Two loads of one save give the
+// same hashes if the output is a pure function of the save; the sizes say what
+// a sidecar of it would cost.
+static bool g_materialProbe = false;
+namespace MaterialProbe {
+struct Acc { std::vector<uint8_t> px; std::vector<uint8_t> seen; uint32_t filled = 0; };
+static std::mutex m;
+static std::unordered_map<uint64_t, Acc>* open = nullptr;
+static FILE* out = nullptr;
+static uint64_t tiles = 0, rleBytes = 0, calls = 0, pixels = 0, recomputed = 0;
+static double entropyBits = 0;
+static void Finish(uint64_t key, const uint8_t* px) {
+    uint64_t runs = 0; uint32_t hist[256] = {};
+    for (int i = 0; i < 65536; ++i) { ++hist[px[i]]; if (!i || px[i] != px[i - 1]) ++runs; }
+    double bits = 0;
+    for (uint32_t c : hist) if (c) { const double p = c / 65536.0; bits -= c * log2(p); }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (int i = 0; i < 65536; ++i) { h ^= px[i]; h *= 0x100000001b3ull; }
+    ++tiles; rleBytes += runs * 2; entropyBits += bits;
+    if (out) fprintf(out, "%d %d %016llx %llu %.0f\n", int32_t(key), int32_t(key >> 32), (unsigned long long)h, (unsigned long long)(runs * 2), bits / 8);
+    if (tiles % 2000 == 0 && H)
+        H->log("material probe: %llu tiles complete, %llu calls, %.2f pixels computed per tile pixel; raw %.0f MiB, run-length %.1f MiB, entropy %.1f MiB",
+               (unsigned long long)tiles, (unsigned long long)calls, double(pixels) / (double(tiles) * 65536.0), tiles * 65536.0 / 1048576.0,
+               rleBytes / 1048576.0, entropyBits / 8 / 1048576.0);
+}
+static void Record(uint64_t tile, int x0, int y0, int w, int h, const uint8_t* output) {
+    std::lock_guard<std::mutex> l(m);
+    if (!open) {
+        open = new std::unordered_map<uint64_t, Acc>;
+        if (H && H->dataDir) { std::string p = std::string(H->dataDir()) + "material_probe.txt"; out = fopen(p.c_str(), "w"); }
+    }
+    ++calls; pixels += uint64_t(w) * h;
+    Acc& a = (*open)[tile];
+    if (a.px.empty()) { a.px.assign(65536, 0); a.seen.assign(65536, 0); }
+    for (int y = y0; y < y0 + h; ++y)
+        for (int x = x0; x < x0 + w; ++x) {
+            const int p = y * 256 + x;
+            a.px[p] = output[p];
+            if (!a.seen[p]) { a.seen[p] = 1; ++a.filled; } else ++recomputed;
+        }
+    if (a.filled == 65536) {
+        Finish(tile, a.px.data());
+        if (out) fflush(out);
+        open->erase(tile);
+    }
+}
+}  // namespace MaterialProbe
 
 static void __fastcall MaterialIndexDetour(uint64_t block,uint64_t tile,uint64_t job,
     uint64_t origin,const uintptr_t* overlay,const uint8_t* layers,const int32_t* cell,
@@ -113,6 +169,7 @@ static void __fastcall MaterialIndexDetour(uint64_t block,uint64_t tile,uint64_t
             output[pixel]=value;
         }
     }
+    if (g_materialProbe) MaterialProbe::Record(tile,x0,y0,w,h,output);
 }
 static bool InstallMaterialIndexFast() {
     if (!g_materialIndexFast || g_gog) return false;

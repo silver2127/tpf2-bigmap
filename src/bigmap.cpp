@@ -1252,6 +1252,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_placementAttempts = H->cfgInt("tpf2_bigmap", "placement_attempts", 200);
     g_worldEntryTimings = H->cfgBool("tpf2_bigmap", "world_entry_timings", 0) != 0;
     g_materialIndexFast = H->cfgBool("tpf2_bigmap", "material_index_fast", 0) != 0;
+    g_materialProbe = H->cfgBool("tpf2_bigmap", "material_index_probe", 0) != 0;
     g_terrainRefineFast = H->cfgBool("tpf2_bigmap", "terrain_refine_fast", 0) != 0;
     g_terrainMinMaxFast = H->cfgBool("tpf2_bigmap", "terrain_minmax_fast", 0) != 0;
     g_terrainAlignFast = H->cfgBool("tpf2_bigmap", "terrain_align_fast", 0) != 0;
