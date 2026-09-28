@@ -86,12 +86,13 @@ inline bool Mtime(const std::string& p, struct timespec* out) {
 // A load builds two CTerrain versions (Windows served 68,086 tiles of a
 // 36,992-tile map), each with its own grid, so the ranges are kept per grid.
 struct Served {
+    std::vector<void*> finished;   // CTerrains whose load pass was skipped
     // finished: this version's pass was skipped once; a later big pass on it must run.
     struct Grid { uint8_t* base = nullptr; std::vector<uint32_t> range; uint32_t applied = 0; bool finished = false; };
     std::mutex m;
     Grid grids[4];
     static constexpr uint32_t kNone = 0x0000FFFFu;   // lo | hi << 16 with lo > hi: never a real range
-    void Reset() { std::lock_guard<std::mutex> l(m); for (auto& g : grids) g = Grid{}; }
+    void Reset() { std::lock_guard<std::mutex> l(m); for (auto& g : grids) g = Grid{}; finished.clear(); }
     // Caller holds m. The slot for `base` (n records), made if new; nullptr when all four are taken.
     Grid* Slot(uint8_t* base, uint32_t n, bool make) {
         for (auto& g : grids) if (g.base == base && g.range.size() == n) return &g;
@@ -137,15 +138,21 @@ inline bool AllServedFinish(void* terrain) {
         *reinterpret_cast<int32_t*>(r + 0x20) += 1;
     }
     slot->finished = true;
+    s.finished.push_back(terrain);
     return true;
 }
 // A served version whose pass has not come yet: the load builds two and passes
 // each, so the first skip must not release the file (Windows 2026-09-27: the
 // second version's last 4,859 AddTiles went unserved and its pass ran).
+// With decoding at the pass (ServeAtPass), a version AddTile populated has no
+// slot until its own pass: a terrain seen at AddTile and not finished counts.
+inline bool SeenUnfinished();
 inline bool VersionPending() {
-    Served& s = S(); std::lock_guard<std::mutex> l(s.m);
-    for (const auto& g : s.grids) if (g.base && !g.finished) return true;
-    return false;
+    {
+        Served& s = S(); std::lock_guard<std::mutex> l(s.m);
+        for (const auto& g : s.grids) if (g.base && !g.finished) return true;
+    }
+    return SeenUnfinished();
 }
 
 // ---- AddTile: begin the armed sidecar, apply this tile ------------------------
@@ -175,6 +182,16 @@ inline void NoteTerrain(void* terrain) {
     s.t[0] = terrain;
 }
 inline void ForgetTerrains() { Seen& s = SeenTerrains(); std::lock_guard<std::mutex> l(s.m); for (auto& t : s.t) t = nullptr; }
+inline bool& ServeAtPass();
+inline bool SeenUnfinished() {
+    if (!ServeAtPass()) return false;
+    void* seen[4];
+    { Seen& s = SeenTerrains(); std::lock_guard<std::mutex> l(s.m); memcpy(seen, s.t, sizeof seen); }
+    Served& s = S(); std::lock_guard<std::mutex> l(s.m);
+    for (void* t : seen)
+        if (t && std::find(s.finished.begin(), s.finished.end(), t) == s.finished.end()) return true;
+    return false;
+}
 // The full tiles of `terrain`, read without trusting it; negative if it is not a readable grid.
 inline long FullTiles(void* terrain) {
     uint8_t* grid = nullptr; uint8_t head[0x18];
@@ -244,6 +261,10 @@ inline long FindRecord(const TerrainSidecar::Grid& g, int entity) {
     }
     return is(last) ? long(last) : -1;
 }
+// terrain_sidecar_decode_at_pass: AddTile only notes the terrain; every tile is
+// decoded in parallel at the pass (CatchUp), off the load's own thread (see
+// terrain_serve.h g_serveAtPass).
+inline bool& ServeAtPass() { static bool on = false; return on; }
 inline void AddTileHook(void* terrain, int entity, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     OriginalAddTile()(terrain, entity, a, b, c, d);
     if (!terrain) return;
@@ -254,6 +275,7 @@ inline void AddTileHook(void* terrain, int entity, uint64_t a, uint64_t b, uint6
         if (TerrainSidecar::g_pending) { S().Reset(); TerrainSidecar::BeginIfPending(terrain, nullptr); }
     }
     if (!TerrainSidecar::Loaded() && !TerrainSidecar::TryStream(terrain)) return;
+    if (ServeAtPass()) return;
     const TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records()) return;
     const long idx = FindRecord(g, entity);
@@ -411,7 +433,7 @@ inline uint32_t CatchUp(void* terrain) {
         }
         delete sc;
     };
-    const unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    const unsigned threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::vector<std::thread> pool;
     for (unsigned t = 1; t < threads && todo.size() > 64; ++t) pool.emplace_back(work);
     work();
@@ -434,8 +456,10 @@ inline void SettleStream(void* terrain) {
         const bool complete = TerrainSidecar::WaitForStream(n, kPassMsPerTile, 5000, 300000, why, sizeof why);
         if (Log()) Log()("terrain stream: %s at the pass: %s", complete ? "complete" : "not waited for", why);
     }
+    const auto t0 = std::chrono::steady_clock::now();
     const uint32_t caught = CatchUp(terrain);
-    if (caught && Log()) Log()("terrain stream: %u tiles served at the pass", caught);
+    if (caught && Log()) Log()("terrain sidecar: %u tiles served at the pass in %lld ms", caught,
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
 }
 // Called from the redirected UpdateSubterrains call. True when the pass must
 // not run (the caller then returns without calling it).

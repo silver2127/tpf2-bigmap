@@ -27,6 +27,14 @@
 // the tile ends up stock), or with terrain_sidecar=0.
 #pragma once
 static int g_terrainServe = 1;   // terrain_sidecar cfg: 0 = never apply a sidecar
+// terrain_sidecar_decode_at_pass (2026-09-28): AddTile only notes the terrain;
+// every tile is decoded at the pass, on up to 16 threads (CatchUp). Decoding at
+// AddTile ran on the load's own thread -- 54% of it for ~8 s of a 36,992-tile
+// load, serial -- and nothing reads the tiles between AddTile and the pass (the
+// logs' "0 copies skipped"). Set only where the pass consults the sidecar
+// (alignment batching with alignment_skip_served); otherwise tiles would never
+// be served.
+static bool g_serveAtPass = false;
 namespace TerrainServe {
 using AddTileFn = void(__fastcall*)(void* terrain, int entity, uint64_t a2, uint64_t a3);
 static AddTileFn original = nullptr;
@@ -39,7 +47,7 @@ static const uint8_t kRecordStoreBytes[18] = {0x48, 0x8d, 0x0c, 0x80, 0x49, 0x8b
 static const uint8_t kDetachBytes[9] = {0x48, 0x8d, 0x4e, 0x08, 0xe8, 0x87, 0x10, 0x00, 0x00};
 // Coupling to the tile arena (set by InstallTerrainServe; the offline test supplies its own).
 static bool (*mark)(const void* first) = nullptr;
-static volatile LONG64 calls = 0, applied = 0, unmarked = 0, absent = 0, notFound = 0, probes = 0, decodeFailed = 0;
+static volatile LONG64 calls = 0, applied = 0, unmarked = 0, absent = 0, notFound = 0, probes = 0, decodeFailed = 0, deferred = 0;
 static volatile LONG cursor = 0;   // generation of the per-thread cursors (FindRecord); bumped per load
 static thread_local BlockCodec::DecodeScratch* scratch = nullptr;
 
@@ -55,9 +63,11 @@ static SRWLOCK rangeLock = SRWLOCK_INIT;
 // terraform in play) must run.
 struct RangeSlot { uint8_t* grid; uint32_t count; uint32_t applied; uint32_t* ranges; bool finished; };
 static RangeSlot rangeSlots[4] = {};
+static void* finishedTerrains[4] = {};   // CTerrains whose load pass was skipped (under rangeLock)
 static void ResetRanges() {
     AcquireSRWLockExclusive(&rangeLock);
     for (auto& r : rangeSlots) { if (r.ranges) HeapFree(GetProcessHeap(), 0, r.ranges); r = RangeSlot{}; }
+    for (void*& t : finishedTerrains) t = nullptr;
     ReleaseSRWLockExclusive(&rangeLock);
 }
 // Caller holds rangeLock. The slot for `grid` (n records), made if new and `make`.
@@ -131,7 +141,7 @@ static uint32_t CatchUp(void* terrain) {
         }
         delete sc;
     };
-    const unsigned threads = (std::max)(1u, (std::min)(8u, std::thread::hardware_concurrency()));
+    const unsigned threads = (std::max)(1u, (std::min)(16u, std::thread::hardware_concurrency()));
     std::vector<std::thread> pool;
     for (unsigned t = 1; t < threads && todo.size() > 64; ++t) pool.emplace_back(work);
     work();
@@ -156,8 +166,10 @@ static void SettleStream(void* terrain) {
         const bool complete = TerrainSidecar::WaitForStream(missing, kPassMsPerTile, 5000, 300000, why, sizeof why);
         if (H) H->log("terrain stream: %s at the pass (%u tiles of this terrain unserved): %s", complete ? "complete" : "not waited for", missing, why);
     }
+    const auto t0 = std::chrono::steady_clock::now();
     const uint32_t caught = CatchUp(terrain);
-    if (caught && H) H->log("terrain stream: %u tiles served at the pass", caught);
+    if (caught && H) H->log("terrain sidecar: %u tiles served at the pass in %lld ms", caught,
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
 }
 static bool AllServedFinish(void* terrain) {
     // Only the load's own pass: the sidecar is released when it finishes, and a
@@ -187,6 +199,7 @@ static bool AllServedFinish(void* terrain) {
             *reinterpret_cast<int32_t*>(r + 0x20) += 1;
         }
         slot->finished = true;
+        for (void*& t : finishedTerrains) if (!t || t == terrain) { t = terrain; break; }
     }
     ReleaseSRWLockExclusive(&rangeLock);
     return ok;
@@ -195,12 +208,15 @@ static bool AllServedFinish(void* terrain) {
 // versions and passes each: releasing the sidecar at the first skip left the
 // second's last AddTiles unserved and its pass ran (5.8 s of 36,992 tiles,
 // 2026-09-27: 69,125 of 73,984 AddTiles served, none failed).
+// With decoding at the pass, a version AddTile populated has no slot until
+// its own pass: a CTerrain seen at AddTile and not yet finished is pending too.
+static bool SeenUnfinished();
 static bool ServedVersionPending() {
     AcquireSRWLockShared(&rangeLock);
     bool pending = false;
     for (const auto& r : rangeSlots) if (r.grid && !r.finished) pending = true;
     ReleaseSRWLockShared(&rangeLock);
-    return pending;
+    return pending || (g_serveAtPass && SeenUnfinished());
 }
 
 // The record AddTile just filled for `entity`, or -1: searched OUTWARD from
@@ -254,6 +270,20 @@ static void NoteTerrain(void* t) {
     ReleaseSRWLockExclusive(&seenLock);
 }
 static void ForgetTerrains() { AcquireSRWLockExclusive(&seenLock); for (void*& s : seenTerrains) s = nullptr; ReleaseSRWLockExclusive(&seenLock); }
+static bool SeenUnfinished() {
+    void* seen[4];
+    AcquireSRWLockShared(&seenLock); for (int i = 0; i < 4; ++i) seen[i] = seenTerrains[i]; ReleaseSRWLockShared(&seenLock);
+    AcquireSRWLockShared(&rangeLock);
+    bool any = false;
+    for (void* t : seen) {
+        if (!t) continue;
+        bool done = false;
+        for (void* f : finishedTerrains) if (f == t) done = true;
+        if (!done) any = true;
+    }
+    ReleaseSRWLockShared(&rangeLock);
+    return any;
+}
 static SRWLOCK beginLock = SRWLOCK_INIT;
 static volatile LONG64 beginMs = 0;   // wall time of the sidecar's open + verify, in the first AddTile of the load
 // The LoadGame hook armed a fingerprint (TerrainSidecar::ArmForLoad); the
@@ -282,6 +312,7 @@ static void __fastcall Detour(void* terrain, int entity, uint64_t a2, uint64_t a
     NoteTerrain(terrain);
     BeginIfArmed(terrain);
     if (!TerrainSidecar::Loaded() && !TerrainSidecar::TryStream(terrain)) return;
+    if (g_serveAtPass) { InterlockedIncrement64(&deferred); return; }   // decoded in parallel at the pass
     TerrainSidecar::Grid g = TerrainSidecar::GridOf(terrain);
     if (!g.base || !g.records()) return;
     long idx = FindRecord(g, entity);
@@ -345,6 +376,7 @@ extern "C" __declspec(dllexport) void BigmapTestServeDetour(void* terrain, int e
 }
 extern "C" __declspec(dllexport) int BigmapTestServeAllServedFinish(void* terrain) { return TerrainServe::AllServedFinish(terrain) ? 1 : 0; }
 extern "C" __declspec(dllexport) int BigmapTestServeVersionPending() { return TerrainServe::ServedVersionPending() ? 1 : 0; }
+extern "C" __declspec(dllexport) void BigmapTestServeAtPass(int on) { g_serveAtPass = on != 0; }
 extern "C" __declspec(dllexport) void BigmapTestServeCounters(long long* out) {
     out[0] = TerrainServe::calls; out[1] = TerrainServe::applied; out[2] = TerrainServe::unmarked; out[3] = TerrainServe::absent;
     out[4] = TerrainServe::notFound; out[5] = TerrainServe::probes; out[6] = TerrainServe::decodeFailed;
