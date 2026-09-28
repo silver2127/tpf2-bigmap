@@ -97,6 +97,16 @@ one and exact multiples, and the byte anchors in the real executable.
   copies_skipped=`). Whether the compute itself can be skipped per served
   tile depends on mapping a dirty-set block to its tile, not yet done; the
   pass's wall time (`alignment pass: ... ms`) says what that would save.
+  **Done 2026-09-28 for a complete sidecar** (`alignment_skip_served`): when
+  every record of the terrain is served, the load's pass is not called at all.
+  Publication's only other effect, each touched tile's `minZ`/`maxZ`/`version`
+  (`0x33cf2c`, `0x33cf32`, `0x33cf38`: `float(min)*scale`, `float(max)*scale`,
+  `++version`, scale at `CTerrain+0x34`), is written from each tile's height
+  range, taken at AddTile while the decoded cache is hot
+  (`TerrainServe::AllServedFinish`). Only while the sidecar is loaded, so a
+  big pass in play always runs; a partial sidecar runs the pass as before.
+  Reported load: 798,848 blocks, 44.5 s and 75 s. Per-block skipping for a
+  partial sidecar still needs the block-to-tile mapping.
   The sidecar's SaveGame/LoadGame hooks and fingerprint are the other
   session's; until they load a file, `terrain_sidecar=1` is inert.
   (Wired 2026-09-21: `src/terrain_sidecar_io.h`, see `docs/terrain-sidecar.md`.)

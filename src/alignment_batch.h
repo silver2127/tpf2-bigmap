@@ -34,6 +34,15 @@ static volatile LONG64 g_alignmentPassMs = 0;
 // Called after a batched pass (a load's) has published its last batch; the
 // terrain sidecar (terrain_serve.h) releases the loaded file here.
 static void (*g_alignmentPassDone)() = nullptr;
+// SKIPPING A PASS THE SIDECAR ALREADY ANSWERED (2026-09-28). When every tile of
+// the terrain was served from the save's sidecar, the load's alignment pass
+// computes ~800,000 blocks (44-75 s on a player's 49,928-tile map) whose
+// publication into served tiles is skipped anyway. Its only other effect,
+// publication's per-tile minZ/maxZ/version (0x33cf2c..0x33cf38), is written by
+// g_alignmentAllServed from the served caches; it returns false -- and the pass
+// runs as before -- unless every tile of this terrain is served.
+static bool (*g_alignmentAllServed)(void* terrain) = nullptr;
+static int g_alignmentSkipServed = 1;   // alignment_skip_served; 0 = always run the pass
 namespace AlignmentBatch {
 struct SetValue { uint64_t key; void* vfirst; void* vlast; void* vend; };   // CVec2i block + std::vector<16-byte item>
 struct SetNode { SetNode* left; SetNode* parent; SetNode* right; uint8_t color, isnil, pad[6]; SetValue value; };
@@ -42,7 +51,7 @@ static_assert(offsetof(SetNode, isnil) == 0x19 && offsetof(SetNode, value) == 0x
 using UpdateFn = void(__fastcall*)(void* self, SetObject* set);
 static UpdateFn original = nullptr;
 static uintptr_t base = 0;
-static volatile LONG64 calls = 0, batchedCalls = 0, batchedTiles = 0;
+static volatile LONG64 calls = 0, batchedCalls = 0, batchedTiles = 0, skippedPasses = 0, skippedTiles = 0;
 constexpr uintptr_t kUpdateRva = 0xaad6c0, kCallerSiteRva = 0xaac82b, kStepRva = 0xaadb78;
 static const uint8_t kUpdateBytes[17] = {0x48, 0x8b, 0xc4, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xa0};
 static const uint8_t kCallerSiteBytes[11] = {0x48, 0x83, 0x7f, 0x08, 0x00, 0x74, 0x09, 0x48, 0x8b, 0xd7, 0xe8};   // cmp [rdi+8],0; je; mov rdx,rdi; call
@@ -79,6 +88,13 @@ static void __fastcall Detour(void* self, SetObject* set) {
     size_t total = set && set->head ? set->size : 0;
     size_t batch = g_alignmentBatch > 0 ? size_t(g_alignmentBatch) : 0;
     if (!batch || total <= batch || total > (size_t(64) << 20)) { original(self, set); return; }
+    if (g_alignmentSkipServed && g_alignmentAllServed && g_alignmentTerrain && g_alignmentAllServed(g_alignmentTerrain)) {
+        InterlockedIncrement64(&skippedPasses); InterlockedAdd64(&skippedTiles, LONG64(total));
+        InterlockedExchange64(&g_alignmentPassMs, 0);
+        if (H) H->log("alignment pass: %llu blocks skipped -- every tile was served from the sidecar (its min/max and version written from the served cache)", (unsigned long long)total);
+        if (g_alignmentPassDone) g_alignmentPassDone();
+        return;
+    }
     auto keys = static_cast<SetValue*>(HeapAlloc(GetProcessHeap(), 0, total * sizeof(SetValue)));
     auto nodes = static_cast<SetNode*>(HeapAlloc(GetProcessHeap(), 0, (batch + 1) * sizeof(SetNode)));
     if (!keys || !nodes) {
