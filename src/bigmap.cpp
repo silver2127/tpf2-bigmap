@@ -189,6 +189,7 @@ static const int OCTREE_STOCK_TILES  = 256;    // what the shipped box holds
 static const int OCTREE_PATCH_TILES  = 512;    // what the patched box holds
 static bool g_octreeOn = true;
 
+#include "gog_rva.h"
 #include "octree_depth12.h"
 #include "placement_distance.h"
 #include "world_entry.h"
@@ -318,6 +319,37 @@ static const uint8_t EXPECT_STRVEC_DTOR[15] = {
 // The E8 call in front of the gated return address, so the gate can only ever
 // match the one call it was measured on.
 static const uint8_t CALL_SIZE_COMBO[5] = { 0xE8,0x12,0x94,0xCB,0x01 };
+
+// The same four sites on the GOG 2024-12-12 binary, measured on its
+// TransportFever2.exe. Prologues are byte-identical to Steam's (the EXPECT_*
+// arrays above verify both); only the RVAs and the call's rel32 move:
+//   combo factory   0x2328dc0  the only match of EXPECT_COMBO_FAC in .text
+//   size combo call 0x66d099   +0x220, the same shift as GetNumTilesNew; the
+//                              ~vector<string> call follows it at 0x66d0b0
+//                              exactly as on Steam
+//   vector ctor     0x9da10    +0x210: (last-first)>>5, allocate, copy 0x20 each
+//   vector dtor     0xbbfa0    +0x210, the one the New Game page calls
+static const uintptr_t RVA_COMBO_FAC_GOG     = 0x2328dc0;
+static const uintptr_t RET_SIZE_COMBO_GOG    = 0x66d09e;
+static const uintptr_t RVA_STRVEC_CTOR_GOG   = 0x9da10;
+static const uintptr_t RVA_STRVEC_DTOR_GOG   = 0xbbfa0;
+static const uint8_t CALL_SIZE_COMBO_GOG[5] = { 0xE8,0x22,0xBD,0xCB,0x01 };
+
+// The sites in use, chosen once g_gog is known (SelectSizeRowSites).
+static uintptr_t g_rvaComboFac   = RVA_COMBO_FAC;
+static uintptr_t g_retSizeCombo  = RET_SIZE_COMBO;
+static uintptr_t g_rvaStrVecCtor = RVA_STRVEC_CTOR;
+static uintptr_t g_rvaStrVecDtor = RVA_STRVEC_DTOR;
+static const uint8_t* g_callSizeCombo = CALL_SIZE_COMBO;
+
+static void SelectSizeRowSites(bool gog)
+{
+    g_rvaComboFac   = gog ? RVA_COMBO_FAC_GOG   : RVA_COMBO_FAC;
+    g_retSizeCombo  = gog ? RET_SIZE_COMBO_GOG  : RET_SIZE_COMBO;
+    g_rvaStrVecCtor = gog ? RVA_STRVEC_CTOR_GOG : RVA_STRVEC_CTOR;
+    g_rvaStrVecDtor = gog ? RVA_STRVEC_DTOR_GOG : RVA_STRVEC_DTOR;
+    g_callSizeCombo = gog ? CALL_SIZE_COMBO_GOG : CALL_SIZE_COMBO;
+}
 // The Towns switch in the params refresh:
 //   8B 88 60 04 00 00        mov   ecx, [rax+0x460]     ; the Towns combo's selected index
 //   85 C9 / 75 0A            test  ecx, ecx / jne case 1
@@ -529,21 +561,30 @@ static bool AppendStrings(StrVec* vec, const MsvcString* extra, int k)
     return true;
 }
 
+#include "gigantomaniac.h"
+
 // Combo factory: for the New Game size dropdown only, note how many stock rows
-// it has and append ours before the widget copies the list.
+// it has and append ours before the widget copies the list. With the
+// Gigantomaniac row live there is one added row, and the combo it returns is
+// remembered so the ratio dropdown can follow its selection.
 static void* __fastcall ComboDetour(StrVec* items, void* onChange, int initialSel, void* aux, int p5)
 {
-    if ((uintptr_t)_ReturnAddress() == g_base + RET_SIZE_COMBO && items) {
+    const bool sizeCombo = (uintptr_t)_ReturnAddress() == g_base + g_retSizeCombo && items;
+    if (sizeCombo) {
         const long stock = (long)(items->last - items->first);
         if (stock > 0 && stock < 64) {
             InterlockedExchange(&g_stockSizeRows, stock);
-            const bool ok = AppendStrings(items, g_extraRowStrings, g_numExtraSizeRows);
+            const MsvcString* rows = g_gigaLive ? &g_gigaRowString : g_extraRowStrings;
+            const int k = g_gigaLive ? 1 : g_numExtraSizeRows;
+            const bool ok = AppendStrings(items, rows, k);
             if (g_logEvery)
                 H->log("size dropdown: %ld stock row(s) + %d added%s", stock,
-                       ok ? g_numExtraSizeRows : 0, ok ? "" : " (append FAILED)");
+                       ok ? k : 0, ok ? "" : " (append FAILED)");
         }
     }
-    return g_origCombo(items, onChange, initialSel, aux, p5);
+    void* combo = g_origCombo(items, onChange, initialSel, aux, p5);
+    if (sizeCombo) GigaNoteSizeCombo(combo);
+    return combo;
 }
 
 // The claim for (size, format), else that size's lowest-format claim; -1 when
@@ -628,7 +669,21 @@ static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
     // was built with (4 with experimental map sizes off, 7 with it on), and with
     // the flag off that overlaps what the ladder calls size 4..6 -- so it has to
     // be recognised before any claim is consulted.
-    if (g_sizeRowsLive) {
+    if (g_sizeRowsLive && g_gigaLive && sizeIndex == (int)g_stockSizeRows) {
+        // The Gigantomaniac row: the ratio dropdown lists the ladder's sizes,
+        // so its index picks the size and that size's own format-0 shape.
+        int f = formatIndex;
+        if (f >= g_numExtraSizeRows) f = g_numExtraSizeRows - 1;
+        int tx = 96, ty = 96;
+        RowShape(g_extraSizeRows[f].size, 0, &tx, &ty);
+        if (g_logEvery) {
+            H->log("size=%d format=%d -> %d x %d tiles (%.1f x %.1f km) [%s, '%s']",
+                   sizeIndex, formatIndex, tx, ty, tx * 0.256, ty * 0.256,
+                   g_gigaLabel, g_extraSizeRows[f].label);
+        }
+        return ((uint64_t)(uint32_t)ty << 32) | (uint32_t)tx;
+    }
+    if (g_sizeRowsLive && !g_gigaLive) {
         const int row = sizeIndex - (int)g_stockSizeRows;
         if (row >= 0 && row < g_numExtraSizeRows) {
             int tx = 96, ty = 96;
@@ -1078,13 +1133,13 @@ static bool g_vecHelpersOk = false;
 static bool ResolveVectorHelpers()
 {
     if (g_vecHelpersOk) return true;
-    if (!H->verifyBytes(RVA_STRVEC_CTOR, EXPECT_STRVEC_CTOR, sizeof EXPECT_STRVEC_CTOR)
-        || !H->verifyBytes(RVA_STRVEC_DTOR, EXPECT_STRVEC_DTOR, sizeof EXPECT_STRVEC_DTOR)) {
+    if (!H->verifyBytes(g_rvaStrVecCtor, EXPECT_STRVEC_CTOR, sizeof EXPECT_STRVEC_CTOR)
+        || !H->verifyBytes(g_rvaStrVecDtor, EXPECT_STRVEC_DTOR, sizeof EXPECT_STRVEC_DTOR)) {
         H->log("new game rows: vector<string> ctor/dtor do not byte-verify -- no rows added");
         return false;
     }
-    g_strVecCtor = (StrVecCtorFn)(g_base + RVA_STRVEC_CTOR);
-    g_strVecDtor = (StrVecDtorFn)(g_base + RVA_STRVEC_DTOR);
+    g_strVecCtor = (StrVecCtorFn)(g_base + g_rvaStrVecCtor);
+    g_strVecDtor = (StrVecDtorFn)(g_base + g_rvaStrVecDtor);
     g_vecHelpersOk = true;
     return true;
 }
@@ -1202,20 +1257,21 @@ static int InstallSizeRows()
         H->log("size rows: add_size_rows=1 but no size7_format0 claim -- nothing to add");
         return 0;
     }
-    if (g_gog) {
-        H->log("size rows: Steam build only -- not on the GOG build");
-        return 0;
-    }
+    SelectSizeRowSites(g_gog);
     if (!ResolveVectorHelpers()
-        || !H->verifyBytes(RVA_COMBO_FAC, EXPECT_COMBO_FAC, sizeof EXPECT_COMBO_FAC)
-        || !H->verifyBytes(RET_SIZE_COMBO - 5, CALL_SIZE_COMBO, sizeof CALL_SIZE_COMBO)) {
-        H->log("size rows: the size dropdown code does not byte-verify -- OFF");
+        || !H->verifyBytes(g_rvaComboFac, EXPECT_COMBO_FAC, sizeof EXPECT_COMBO_FAC)
+        || !H->verifyBytes(g_retSizeCombo - 5, g_callSizeCombo, sizeof CALL_SIZE_COMBO)) {
+        H->log("size rows: the size dropdown code does not byte-verify on the %s build -- OFF",
+               g_gog ? "GOG" : "Steam");
         return 0;
     }
     for (int i = 0; i < g_numExtraSizeRows; ++i)
         SsoString(&g_extraRowStrings[i], g_extraSizeRows[i].label);
+    // GOG: one Gigantomaniac row instead of one row per size, when its own
+    // sites verify; otherwise the rows below stay one per size.
+    InstallGigantomaniac();
     void* t = nullptr;
-    if (!H->installHook(g_base + RVA_COMBO_FAC, (void*)&ComboDetour, sizeof EXPECT_COMBO_FAC, &t)) {
+    if (!H->installHook(g_base + g_rvaComboFac, (void*)&ComboDetour, sizeof EXPECT_COMBO_FAC, &t)) {
         H->log("size rows: installHook failed on the combo factory -- OFF");
         return 0;
     }
@@ -1342,6 +1398,11 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     // Added size rows: cfg add_size_rows=1, and each row is a claimed size >= 7
     // (contiguous from 7) with an optional size_label<N>.
     g_addSizeRows    = H->cfgBool("tpf2_bigmap", "add_size_rows", 1);
+    g_gigaOn         = H->cfgBool("tpf2_bigmap", "gigantomaniac", 1) != 0;
+    {
+        const char* gl = H->cfgStr("tpf2_bigmap", "gigantomaniac_label", nullptr);
+        if (gl && *gl) { int j = 0; for (; gl[j] && j < 15; ++j) g_gigaLabel[j] = gl[j]; g_gigaLabel[j] = 0; }
+    }
     g_newgameDensity = H->cfgBool("tpf2_bigmap", "newgame_density", 1);
     g_numExtraSizeRows = 0;
     if (g_addSizeRows) {
@@ -1400,17 +1461,18 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallPlacementSpacing();
     installed += InstallFastPlacement();
     installed += InstallWorldEntryTimings();
-    installed += InstallMaterialIndexFast();
-    installed += InstallTerrainRefineFast();
-    installed += InstallTerrainMinMaxFast();
-    installed += InstallTerrainAlignFast();
+    // Written against Steam RVAs; on GOG they run through the translating host (gog_rva.h).
+    installed += RunWithSteamSites([] { return InstallMaterialIndexFast(); });
+    installed += RunWithSteamSites([] { return InstallTerrainRefineFast(); });
+    installed += RunWithSteamSites([] { return InstallTerrainMinMaxFast(); });
+    installed += RunWithSteamSites([] { return InstallTerrainAlignFast(); });
     installed += InstallTerrainCache();
     installed += InstallTerrainCompression();
     installed += InstallTerrainBlocks();
     installed += InstallMaterialCompression();
     installed += InstallSaveFast();
     installed += InstallTravelTime();
-    installed += InstallAlignmentBatch();
+    installed += RunWithSteamSites([] { return InstallAlignmentBatch(); });
     installed += InstallTerrainServe();
     installed += InstallSidecarIo();
     installed += InstallInstanceShrink();

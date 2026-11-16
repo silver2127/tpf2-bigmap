@@ -12,7 +12,7 @@
 //     Stock copies element by element; for non-overlapping source/destination
 //     spans a per-row memcpy writes the same values in the same row order.
 //     Anything else goes to the original.
-// Included after H and g_gog. Steam only; refuses on GOG or any byte mismatch.
+// Included after H and g_gog. Steam RVAs; GOG through gog_rva.h. Refuses on any byte mismatch.
 #pragma once
 #include <emmintrin.h>
 
@@ -180,12 +180,12 @@ static const uint8_t kTerrainBlockCopyBytes[208] = {
 enum { TERRAIN_BLOCK_COPY_STEAL = 14 }; // push rbx/r14/r15; sub rsp,10h; mov ebx,[rsp+68h]
 
 static bool InstallTerrainMinMaxFast() {
-    if (!g_terrainMinMaxFast || g_gog) return false;
+    if (!g_terrainMinMaxFast) return false;   // GOG: installed through RunWithSteamSites
     // Preflight every site before touching anything.
     if (!H->verifyBytes(0x33ce80, kTerrainMinMaxLoopBytes, sizeof kTerrainMinMaxLoopBytes) ||
         !H->verifyBytes(0x33cfe6, kTerrainMinMaxEpilogueBytes, sizeof kTerrainMinMaxEpilogueBytes) ||
         !H->verifyBytes(0x30a540, kTerrainBlockCopyBytes, sizeof kTerrainBlockCopyBytes)) {
-        H->log("terrain minmax fast: Steam 35924 byte mismatch; OFF"); return false;
+        H->log("terrain minmax fast: byte mismatch; OFF"); return false;
     }
     // Each half is independently bit-identical, so a partial install is safe.
     uint8_t patch[MINMAX_SCAN_SIZE];
@@ -224,7 +224,7 @@ int BigmapTestInstallTerrainMinMax(const Tpf2mpHost* host, int gog, int enabled)
     const auto oldHost = H; const bool oldGog = g_gog, oldEnabled = g_terrainMinMaxFast;
     const auto oldOriginal = g_originalTerrainBlockCopy;
     H = host; g_gog = gog != 0; g_terrainMinMaxFast = enabled != 0;
-    const bool result = InstallTerrainMinMaxFast();
+    const bool result = RunWithSteamSites([] { return InstallTerrainMinMaxFast(); });   // GOG: translated host
     H = oldHost; g_gog = oldGog; g_terrainMinMaxFast = oldEnabled; g_originalTerrainBlockCopy = oldOriginal;
     return result;
 }

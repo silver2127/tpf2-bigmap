@@ -154,35 +154,40 @@ if (-not (Test-Path $Msi)) { Fail "wix reported success but $Msi is missing" }
 Copy-Item $Msi (Join-Path $OutDir "TpF2BigMaps-$Version.msi") -Force
 Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $Version)" Green
 
-  # ---- the GOG variant -------------------------------------------------------
-  # The same package with the game-folder check left out (Package.wxs,
-  # GogVariant). tpf2ca.dll only knows the Steam 35924 executable values, so on
-  # a GOG install its UI action refuses and the wizard's Next button stops
-  # responding -- an install there used to need TPF2_SKIP_GAMEDIR_CHECK=1 on the
-  # msiexec command line. Identical components and GUIDs otherwise, so the two
-  # packages upgrade each other cleanly.
-  $MsiGog = Join-Path $OutDir "TpF2BigMaps-$Version-gog.msi"
-  $wixArgsGog = @()
-  for ($i = 0; $i -lt $wixArgs.Count; $i++) {
-      if ($wixArgs[$i] -eq "-o") { $wixArgsGog += @("-o", $MsiGog); $i++; continue }
-      $wixArgsGog += $wixArgs[$i]
-  }
-  $wixArgsGog += @("-d", "GogVariant=1")
-  Push-Location $Installer
-  try {
-      $wixOut = & $Wix @wixArgsGog 2>&1 | ForEach-Object { "$_" }
-      $rc = $LASTEXITCODE
-  } finally { Pop-Location }
-  $wixOut | ForEach-Object { Write-Host "    $_" }
-  if (($wixOut -join "`n") -match "WIX7015") { Fail "WiX v7 needs its OSMF EULA accepted: run 'wix eula accept wix7' once, or pass -AcceptWixEula. See https://wixtoolset.org/osmf/" }
-  if ($rc -ne 0) { Fail "wix build (GOG variant) failed (exit $rc)" }
-  if (-not (Test-Path $MsiGog)) { Fail "wix reported success but $MsiGog is missing" }
-  Say "built $MsiGog (-d GogVariant=1, version $Version)" Green
-      foreach ($m in @($Msi, $MsiGog)) {
-          $tmp = Join-Path $env:TEMP ("tpf2bigmap_msi_" + (Get-Random))
-          Say "administrative install into $tmp"
-          $p = Start-Process msiexec -ArgumentList @('/a', $m, '/qn', "TARGETDIR=$tmp") -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Fail "msiexec /a exit $($p.ExitCode)" }
-          Get-ChildItem $tmp -Recurse -File | ForEach-Object { "    " + $_.FullName.Substring($tmp.Length + 1) + "  ($($_.Length) bytes)" }
-          Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
-      }
+# ---- the GOG variant -------------------------------------------------------
+# The same package built with -d GogVariant=1 (Package.wxs). tpf2ca.dll's
+# game-folder check knows the Steam 35924 executable and, when TPF2_ALLOW_GOG
+# is set, the GOG 2024-12-12 one too; the standard package leaves it unset and
+# refuses a GOG folder, the GOG package sets it and also looks for the folder
+# GOG registered. Identical components, GUIDs and UpgradeCode otherwise, so the
+# two packages upgrade each other as one product.
+$MsiGog = Join-Path $OutDir "TpF2BigMaps-$Version-gog.msi"
+$wixArgsGog = @()
+for ($i = 0; $i -lt $wixArgs.Count; $i++) {
+    if ($wixArgs[$i] -eq "-o") { $wixArgsGog += @("-o", $MsiGog); $i++; continue }
+    $wixArgsGog += $wixArgs[$i]
+}
+$wixArgsGog += @("-d", "GogVariant=1")
+Say "wix $($wixArgsGog -join ' ')"
+Push-Location $Installer
+try {
+    $wixOut = & $Wix @wixArgsGog 2>&1 | ForEach-Object { "$_" }
+    $rc = $LASTEXITCODE
+} finally { Pop-Location }
+$wixOut | ForEach-Object { Write-Host "    $_" }
+if (($wixOut -join "`n") -match "WIX7015") { Fail "WiX v7 needs its OSMF EULA accepted: run 'wix eula accept wix7' once, or pass -AcceptWixEula. See https://wixtoolset.org/osmf/" }
+if ($rc -ne 0) { Fail "wix build (GOG variant) failed (exit $rc)" }
+if (-not (Test-Path $MsiGog)) { Fail "wix reported success but $MsiGog is missing" }
+Say "built $MsiGog ($([math]::Round((Get-Item $MsiGog).Length / 1MB, 1)) MB, -d GogVariant=1, version $Version)" Green
+
+# ---- validate --------------------------------------------------------------
+if ($Validate) {
+    foreach ($m in @($Msi, $MsiGog)) {
+        $tmp = Join-Path $env:TEMP ("tpf2bigmap_msi_" + (Get-Random))
+        Say "administrative install of $(Split-Path $m -Leaf) into $tmp"
+        $p = Start-Process msiexec -ArgumentList @('/a', "`"$m`"", '/qn', "TARGETDIR=`"$tmp`"") -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Fail "msiexec /a $(Split-Path $m -Leaf) exit $($p.ExitCode)" }
+        Get-ChildItem $tmp -Recurse -File | ForEach-Object { "    " + $_.FullName.Substring($tmp.Length + 1) + "  ($($_.Length) bytes)" }
+        Remove-Item $tmp -Recurse -Force -EA SilentlyContinue
+    }
+}

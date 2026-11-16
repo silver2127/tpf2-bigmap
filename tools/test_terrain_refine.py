@@ -355,7 +355,7 @@ def main():
     install = dll.BigmapTestInstallTerrainRefine
     install.argtypes = [C.POINTER(Host), C.c_int, C.c_int]
     expected_verify = [(FUNC, 20)] + REGIONS
-    failures = ['none', 'disabled', 'gog', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
+    failures = ['none', 'disabled', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
     for failure in failures:
         events, errors = [], []
 
@@ -393,7 +393,7 @@ def main():
         else:
             assert events == verified + [('hook',)], events
     print(f'PASS: installer verifies the 20-byte prologue (5 whole instructions, no RIP/branches) and '
-          f'{sum(n for _, n in REGIONS)} bytes of body/product/constants; disabled, GOG, each mismatch and hook failure refuse')
+          f'{sum(n for _, n in REGIONS)} bytes of body/product/constants; disabled, each mismatch and hook failure refuse')
 
     # 8. Warm-cache native microbenchmark (ctypes call overhead included, same for both).
     print('benchmark (per call, best of 5 rounds):')

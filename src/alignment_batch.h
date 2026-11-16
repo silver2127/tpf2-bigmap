@@ -122,11 +122,11 @@ static void __fastcall Detour(void* self, SetObject* set) {
 }  // namespace AlignmentBatch
 static bool InstallAlignmentBatch() {
     using namespace AlignmentBatch;
-    if (g_alignmentBatch <= 0 || g_gog) return false;
+    if (g_alignmentBatch <= 0) return false;   // GOG: installed through RunWithSteamSites
     if (!H->verifyBytes(kUpdateRva, kUpdateBytes, sizeof kUpdateBytes) ||
         !H->verifyBytes(kCallerSiteRva, kCallerSiteBytes, sizeof kCallerSiteBytes) ||
         !H->verifyBytes(kStepRva, kStepBytes, sizeof kStepBytes)) {
-        H->log("alignment batch: Steam byte mismatch; OFF"); return false;
+        H->log("alignment batch: byte mismatch; OFF"); return false;
     }
     base = H->moduleBase();
     if (!H->installHook(base + kUpdateRva, reinterpret_cast<void*>(Detour), sizeof kUpdateBytes, reinterpret_cast<void**>(&original))) {
@@ -134,6 +134,15 @@ static bool InstallAlignmentBatch() {
     }
     H->log("alignment batch: terrain alignment updates run in batches of %d tiles (compute, publish, free per batch)", g_alignmentBatch);
     return true;
+}
+extern "C" __declspec(dllexport) int BigmapTestInstallAlignmentBatch(const Tpf2mpHost* host, int gog, int batch) {
+    const auto oldHost = H; const bool oldGog = g_gog; const int oldBatch = g_alignmentBatch;
+    const auto oldOriginal = AlignmentBatch::original; const uintptr_t oldBase = AlignmentBatch::base;
+    H = host; g_gog = gog != 0; g_alignmentBatch = batch;
+    const bool result = RunWithSteamSites([] { return InstallAlignmentBatch(); });   // GOG: translated host
+    H = oldHost; g_gog = oldGog; g_alignmentBatch = oldBatch;
+    AlignmentBatch::original = oldOriginal; AlignmentBatch::base = oldBase;
+    return result;
 }
 extern "C" __declspec(dllexport) void BigmapTestAlignmentDetour(void* self, AlignmentBatch::SetObject* set, AlignmentBatch::UpdateFn fn, int batch) {
     AlignmentBatch::original = fn; const int old = g_alignmentBatch; g_alignmentBatch = batch;

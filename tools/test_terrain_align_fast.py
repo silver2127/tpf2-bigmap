@@ -412,7 +412,7 @@ def main():
     install = dll.BigmapTestInstallTerrainAlign
     install.argtypes = [C.POINTER(Host), C.c_int, C.c_int]
     expected_verify = [(FUNC, len(PROLOGUE))] + REGIONS + [(rva, 16) for rva, _ in VTABLES]
-    failures = ['none', 'disabled', 'gog', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
+    failures = ['none', 'disabled', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
     for failure in failures:
         events, errors = [], []
 
@@ -451,7 +451,7 @@ def main():
             assert events == wanted + [('hook',)], events
     print(f'PASS: installer verifies the 21-byte prologue (9 whole instructions, no RIP/branches), '
           f'{sum(n for _, n in REGIONS)} bytes of body/constructor/resize/constants and both predicate '
-          f'vtables at the running base; disabled, GOG, each mismatch and a hook failure refuse')
+          f'vtables at the running base; disabled, each mismatch and a hook failure refuse')
 
     # 9. Warm native microbenchmark (ctypes overhead included, identical for both).
     print(f'benchmark (257x257 block, per call, best of 5 rounds; {trapped} unused imports trapped):')

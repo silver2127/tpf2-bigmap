@@ -300,7 +300,7 @@ static void CalculateHeightModImpl(CalculateHeightModFn original, uintptr_t base
     const float invScale = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(1.0f), _mm_set_ss(scale)));
     AlignTarget targets[3] = {};
     for (int t = 0; t < 3; ++t) {
-        targets[t].vtable = base + (t == 2 ? kAlignVtableGreaterEqual : kAlignVtableLessEqual);
+        targets[t].vtable = base + GameRva(t == 2 ? kAlignVtableGreaterEqual : kAlignVtableLessEqual);
         targets[t].sizeX = sizeX;
         targets[t].sizeY = sizeY;
         targets[t].scale = scale;
@@ -318,8 +318,8 @@ static void CalculateHeightModImpl(CalculateHeightModFn original, uintptr_t base
     }
 
     __declspec(align(16)) unsigned char rasterizers[3][0x30] = {};
-    const auto rasterInit = reinterpret_cast<AlignRasterInitFn>(base + kAlignRasterInit);
-    const auto rasterTriangle = reinterpret_cast<AlignRasterTriangleFn>(base + kAlignRasterTriangle);
+    const auto rasterInit = reinterpret_cast<AlignRasterInitFn>(base + GameRva(kAlignRasterInit));
+    const auto rasterTriangle = reinterpret_cast<AlignRasterTriangleFn>(base + GameRva(kAlignRasterTriangle));
     for (int t = 0; t < 3; ++t) rasterInit(rasterizers[t], &targets[t], box, box + 2, size, 1);
 
     static const float kDefaultWeights[3] = {1.0f, 1.0f, 1.0f};   // the stock (1,1,1) scratch vector
@@ -366,10 +366,10 @@ static void CalculateHeightModImpl(CalculateHeightModFn original, uintptr_t base
     const int64_t failed = AlignBlend(result->first, words, samples, k);
     ReleaseAlignScratch(scratch);
     if (failed >= 0) {          // unreachable: see the exactness argument in the doc
-        const auto fail = reinterpret_cast<AlignAssertFn>(base + kAlignAssert);
-        fail(reinterpret_cast<const char*>(base + kAlignAssertExpr),
-             reinterpret_cast<const char*>(base + kAlignAssertFile), 0x4d7,
-             reinterpret_cast<const char*>(base + kAlignAssertFunction));
+        const auto fail = reinterpret_cast<AlignAssertFn>(base + GameRva(kAlignAssert));
+        fail(reinterpret_cast<const char*>(base + GameRva(kAlignAssertExpr)),
+             reinterpret_cast<const char*>(base + GameRva(kAlignAssertFile)), 0x4d7,
+             reinterpret_cast<const char*>(base + GameRva(kAlignAssertFunction)));
     }
 }
 
@@ -469,11 +469,12 @@ static bool VerifyTerrainAlignRegion(const TerrainAlignRegion& region) {
         if (value < 0) return false;
         bytes[i] = uint8_t(value);
     }
+    if (!GogFixRegion(region.rva, bytes, region.size)) return false;   // GOG: relative fields only
     return H->verifyBytes(region.rva, bytes, region.size) != 0;
 }
 
 static bool InstallTerrainAlignFast() {
-    if (!g_terrainAlignFast || g_gog) return false;
+    if (!g_terrainAlignFast) return false;   // GOG: installed through RunWithSteamSites
     if (!H->verifyBytes(kAlignFunc, kCalculateHeightModPrologue, sizeof kCalculateHeightModPrologue)) {
         H->log("terrain align fast: prologue mismatch; OFF"); return false;
     }
@@ -486,8 +487,8 @@ static bool InstallTerrainAlignFast() {
     const uintptr_t base = H->moduleBase();
     // The two predicate vtables carry relocated pointers, so they are checked
     // against the running base, not against fixed bytes.
-    const uintptr_t vtables[2][2] = {{base + 0x3b09a0, base + 0x3b7440},
-                                     {base + 0x3b09a0, base + 0x3b6ee0}};
+    const uintptr_t vtables[2][2] = {{base + GameRva(0x3b09a0), base + GameRva(0x3b7440)},
+                                     {base + GameRva(0x3b09a0), base + GameRva(0x3b6ee0)}};
     const uintptr_t vtableRva[2] = {kAlignVtableLessEqual, kAlignVtableGreaterEqual};
     for (int i = 0; i < 2; ++i) {
         if (!H->verifyBytes(vtableRva[i], reinterpret_cast<const uint8_t*>(vtables[i]),
@@ -520,7 +521,7 @@ int BigmapTestInstallTerrainAlign(const Tpf2mpHost* host, int gog, int enabled) 
     const auto oldOriginal = g_originalCalculateHeightMod;
     const uintptr_t oldBase = g_terrainAlignBase;
     H = host; g_gog = gog != 0; g_terrainAlignFast = enabled != 0;
-    const bool result = InstallTerrainAlignFast();
+    const bool result = RunWithSteamSites([] { return InstallTerrainAlignFast(); });   // GOG: translated host
     H = oldHost; g_gog = oldGog; g_terrainAlignFast = oldEnabled;
     g_originalCalculateHeightMod = oldOriginal; g_terrainAlignBase = oldBase;
     return result;

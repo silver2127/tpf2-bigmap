@@ -90,6 +90,18 @@
                       Name="InstallLocation"
                       Type="directory"
                       Bitness="always64" />
+      <?ifdef GogVariant ?>
+      <!-- GOG Galaxy and the GOG offline installer register the game here
+           (product 1129986694). "Search1_" sorts after "Search1S", so on the
+           GOG package a GOG copy beats a Steam one, and a remembered folder
+           still beats both. -->
+      <RegistrySearch Id="Search1_GogInstallPath"
+                      Root="HKLM"
+                      Key="SOFTWARE\WOW6432Node\GOG.com\Games\1129986694"
+                      Name="path"
+                      Type="directory"
+                      Bitness="always64" />
+      <?endif?>
       <RegistrySearch Id="Search2RememberedInstallFolder"
                       Root="HKLM"
                       Key="SOFTWARE\silver2127\TpF2 Big Maps"

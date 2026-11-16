@@ -239,11 +239,12 @@ static bool VerifyBicubicRefineRegion(const BicubicRefineRegion& r) {
         if (v < 0) return false;
         bytes[i] = uint8_t(v);
     }
+    if (!GogFixRegion(r.rva, bytes, r.size)) return false;   // GOG: relative fields only
     return H->verifyBytes(r.rva, bytes, r.size) != 0;
 }
 
 static bool InstallTerrainRefineFast() {
-    if (!g_terrainRefineFast || g_gog) return false;
+    if (!g_terrainRefineFast) return false;   // GOG: installed through RunWithSteamSites
     if (!H->verifyBytes(0x3ac6c0, kBicubicRefinePrologue, sizeof kBicubicRefinePrologue)) {
         H->log("terrain refine fast: prologue mismatch; OFF"); return false;
     }
@@ -273,7 +274,7 @@ int BigmapTestInstallTerrainRefine(const Tpf2mpHost* host, int gog, int enabled)
     const auto oldHost = H; const bool oldGog = g_gog, oldEnabled = g_terrainRefineFast;
     const auto oldOriginal = g_originalBicubicRefine;
     H = host; g_gog = gog != 0; g_terrainRefineFast = enabled != 0;
-    const bool result = InstallTerrainRefineFast();
+    const bool result = RunWithSteamSites([] { return InstallTerrainRefineFast(); });   // GOG: translated host
     H = oldHost; g_gog = oldGog; g_terrainRefineFast = oldEnabled; g_originalBicubicRefine = oldOriginal;
     return result;
 }

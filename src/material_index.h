@@ -172,13 +172,13 @@ static void __fastcall MaterialIndexDetour(uint64_t block,uint64_t tile,uint64_t
     if (g_materialProbe) MaterialProbe::Record(tile,x0,y0,w,h,output);
 }
 static bool InstallMaterialIndexFast() {
-    if (!g_materialIndexFast || g_gog) return false;
+    if (!g_materialIndexFast) return false;   // GOG: installed through RunWithSteamSites
     const uint8_t expected[]={0x48,0x89,0x4c,0x24,0x08,0x55,0x56,0x57,
         0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57};
     if (!H->verifyBytes(0x315f20,expected,sizeof expected)) {
         H->log("material index fast: byte mismatch; OFF"); return false;
     }
-    g_materialDither=reinterpret_cast<const float*>(H->moduleBase()+0x2f87d20);
+    g_materialDither=reinterpret_cast<const float*>(H->moduleBase()+GameRva(0x2f87d20));
     void* original=nullptr;
     if (!H->installHook(H->moduleBase()+0x315f20,(void*)&MaterialIndexDetour,sizeof expected,&original)) {
         H->log("material index fast: hook failed; OFF"); return false;
@@ -200,7 +200,7 @@ extern "C" __declspec(dllexport)
 int BigmapTestInstallMaterialIndex(const Tpf2mpHost* host,int gog,int enabled) {
     const auto oldHost=H;const bool oldGog=g_gog,oldEnabled=g_materialIndexFast;
     H=host;g_gog=gog!=0;g_materialIndexFast=enabled!=0;
-    const bool result=InstallMaterialIndexFast();
+    const bool result = RunWithSteamSites([] { return InstallMaterialIndexFast(); });   // GOG: translated host
     H=oldHost;g_gog=oldGog;g_materialIndexFast=oldEnabled;
     return result;
 }
