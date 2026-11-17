@@ -1346,7 +1346,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     if (H->cfgBool("tpf2_bigmap", "terrain_stream", 1) && H->dataDir) TerrainSidecar::SetStreamDir(H->dataDir());
     TerrainSidecar::g_readLocal = H->cfgBool("tpf2_bigmap", "terrain_sidecar_read_local", 1) != 0;
     g_serveAtPass = H->cfgBool("tpf2_bigmap", "terrain_sidecar_decode_at_pass", 1) != 0 &&
-                                  g_alignmentBatch > 0 && g_alignmentSkipServed;
+                                  g_alignmentBatch != 0 && g_alignmentSkipServed;
     g_terrainServe = H->cfgBool("tpf2_bigmap", "terrain_sidecar", 1) != 0;
     g_sidecarWrite = H->cfgBool("tpf2_bigmap", "terrain_sidecar_write", 1) != 0;
     g_sidecarMaxTiles = H->cfgInt("tpf2_bigmap", "terrain_sidecar_max_tiles", 0);

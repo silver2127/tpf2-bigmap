@@ -74,6 +74,52 @@ class CONTEXT(C.Structure):
                 ('LastExceptionFromRip', C.c_uint64)]
 
 
+class ADDRESS64(C.Structure):
+    _fields_ = [('Offset', C.c_uint64), ('Segment', W.WORD), ('Mode', W.DWORD)]
+
+
+class KDHELP64(C.Structure):
+    _fields_ = [('Thread', C.c_uint64), ('ThCallbackStack', W.DWORD), ('ThCallbackBStore', W.DWORD),
+                ('NextCallback', W.DWORD), ('FramePointer', W.DWORD), ('KiCallUserMode', C.c_uint64),
+                ('KeUserCallbackDispatcher', C.c_uint64), ('SystemRangeStart', C.c_uint64),
+                ('KiUserExceptionDispatcher', C.c_uint64), ('StackBase', C.c_uint64), ('StackLimit', C.c_uint64),
+                ('BuildVersion', W.DWORD), ('RetpolineStubFunctionTableSize', W.DWORD),
+                ('RetpolineStubFunctionTable', C.c_uint64), ('RetpolineStubOffset', W.DWORD),
+                ('RetpolineStubSize', W.DWORD), ('Reserved0', C.c_uint64 * 2)]
+
+
+class STACKFRAME64(C.Structure):
+    _fields_ = [('AddrPC', ADDRESS64), ('AddrReturn', ADDRESS64), ('AddrFrame', ADDRESS64),
+                ('AddrStack', ADDRESS64), ('AddrBStore', ADDRESS64), ('FuncTableEntry', C.c_void_p),
+                ('Params', C.c_uint64 * 4), ('Far', W.BOOL), ('Virtual', W.BOOL),
+                ('Reserved', C.c_uint64 * 3), ('KdHelp', KDHELP64)]
+
+
+dbghelp = C.WinDLL('dbghelp', use_last_error=True)
+dbghelp.StackWalk64.argtypes = [W.DWORD, W.HANDLE, W.HANDLE, C.POINTER(STACKFRAME64), C.c_void_p,
+                                C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p]
+dbghelp.SymInitialize.argtypes = [W.HANDLE, C.c_wchar_p, W.BOOL]
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+
+
+def unwind(hproc, hthread, ctx, max_frames):
+    """Return addresses of a suspended thread, innermost first (rip included)."""
+    c = CONTEXT.from_buffer_copy(bytes(ctx))
+    f = STACKFRAME64()
+    f.AddrPC.Offset, f.AddrPC.Mode = c.Rip, 3
+    f.AddrStack.Offset, f.AddrStack.Mode = c.Rsp, 3
+    f.AddrFrame.Offset, f.AddrFrame.Mode = c.Rbp, 3
+    out = []
+    fta = C.cast(dbghelp.SymFunctionTableAccess64, C.c_void_p)
+    gmb = C.cast(dbghelp.SymGetModuleBase64, C.c_void_p)
+    while len(out) < max_frames and dbghelp.StackWalk64(IMAGE_FILE_MACHINE_AMD64, hproc, hthread, C.byref(f),
+                                                        C.byref(c), None, fta, gmb, None):
+        if not f.AddrPC.Offset:
+            break
+        out.append(f.AddrPC.Offset)
+    return out
+
+
 k32.OpenThread.restype = W.HANDLE
 k32.OpenProcess.restype = W.HANDLE
 k32.CreateToolhelp32Snapshot.restype = W.HANDLE
@@ -105,6 +151,28 @@ KNOWN = {
 GOG_REGIONS = [(0x090000, 0x0c0000, 0x210), (0x100000, 0x700000, 0x220),
                (0x800000, 0xb00000, 0x0f0), (0x2320000, 0x2330000, 0x2b30)]
 GOG_STAMP = 0x675ad7cc
+NAMED_DLLS = {'ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'ucrtbase.dll', 'vcruntime140.dll',
+              'msvcp140.dll', 'win32u.dll'}
+
+
+def map_symbols(path):
+    """(sorted RVAs, names) of the functions in an MSVC linker .map file."""
+    dbghelp = C.WinDLL('dbghelp')
+    base, rows = 0x180000000, []
+    for line in Path(path).read_text(errors='replace').splitlines():
+        if 'Preferred load address is' in line:
+            base = int(line.split()[-1], 16)
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].startswith('0001:') and ' f ' in f' {line} ':
+            try:
+                rva = int(parts[2], 16) - base
+            except ValueError:
+                continue
+            out = C.create_string_buffer(512)
+            dbghelp.UnDecorateSymbolName(parts[1].encode(), out, 512, 0x1000)   # UNDNAME_NAME_ONLY
+            rows.append((rva, out.value.decode(errors='replace') or parts[1]))
+    rows.sort()
+    return ([r[0] for r in rows], [r[1] for r in rows]) if rows else None
 
 
 def enum_processes(name):
@@ -207,8 +275,11 @@ def main():
     ap.add_argument('--interval', type=float, default=0.01)
     ap.add_argument('--stack', type=int, default=4096, help='stack bytes scanned for return addresses')
     ap.add_argument('--out', default='profile_load_report.txt')
+    ap.add_argument('--frames', type=int, default=40, help='frames unwound per sample (0 = stack scan only)')
     ap.add_argument('--process', default='TransportFever2.exe', help='process name to attach to')
     ap.add_argument('--pid', type=int, default=0, help='attach to this process id instead')
+    ap.add_argument('--map', default=str(Path(__file__).resolve().parents[1] / 'out' / 'tpf2_bigmap.map'),
+                    help='linker map of the running tpf2_bigmap.dll, to name its functions')
     args = ap.parse_args()
 
     print(f'waiting for {args.process} ...', flush=True)
@@ -240,9 +311,38 @@ def main():
         psapi.GetModuleFileNameExW(hproc, None, buf, 1024)
         exe_path = buf.value
     fn = Functions(exe_path)
+    if args.frames:
+        dbghelp.SymSetOptions(0x2 | 0x4)   # undecorated names, deferred loads: unwind tables only, no symbols
+        if not dbghelp.SymInitialize(hproc, None, True):
+            print('SymInitialize failed; falling back to the stack scan'); args.frames = 0
     print(f'pid {pid}, exe {exe_path} at {exe_base:#x} ({"GOG" if fn.gog else "Steam/other"} build), '
           f'{len(fn.starts)} functions; sampling every {args.interval * 1000:.0f} ms -- Ctrl+C to stop', flush=True)
     mod_starts = [m[0] for m in mods]
+
+    # System and runtime DLLs are named by their nearest export, read from the
+    # same file on disk the process mapped (ntdll!RtlAllocateHeap and so on).
+    export_cache = {}
+
+    def exports_of(name):
+        if name in export_cache:
+            return export_cache[name]
+        table = None
+        if name.lower() == 'tpf2_bigmap.dll' and args.map and Path(args.map).exists():
+            table = map_symbols(args.map)
+        elif name.lower() in NAMED_DLLS:
+            path = C.create_unicode_buffer(1024)
+            base_mod = next((m for m in mods if m[2] == name), None)
+            if base_mod and psapi.GetModuleFileNameExW(hproc, W.HMODULE(base_mod[0]), path, 1024):
+                try:
+                    pe = pefile.PE(path.value, fast_load=True)
+                    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']])
+                    rows = sorted((e.address, (e.name or b'#%d' % e.ordinal).decode(errors='replace'))
+                                  for e in getattr(pe, 'DIRECTORY_ENTRY_EXPORT', None).symbols if e.address)
+                    table = ([r[0] for r in rows], [r[1] for r in rows])
+                except Exception:
+                    table = None
+        export_cache[name] = table
+        return table
 
     def where(addr):
         if exe_base <= addr < exe_base + exe_size:
@@ -251,7 +351,14 @@ def main():
             return ('exe', f if f is not None else r)
         i = bisect.bisect_right(mod_starts, addr) - 1
         if i >= 0 and addr < mods[i][0] + mods[i][1]:
-            return (mods[i][2], None)
+            name = mods[i][2]
+            table = exports_of(name)
+            if table:
+                j = bisect.bisect_right(table[0], addr - mods[i][0]) - 1
+                if j >= 0:
+                    off = addr - mods[i][0] - table[0][j]
+                    return (f'{name}!{table[1][j]}+{off:#x}', None)
+            return (name, None)
         return ('?', None)
 
     handles, last_cpu = {}, {}
@@ -259,6 +366,9 @@ def main():
     win_incl = collections.defaultdict(lambda: collections.Counter())
     win_threads = collections.defaultdict(lambda: collections.Counter())
     total_self, total_incl = collections.Counter(), collections.Counter()
+    callers = collections.defaultdict(lambda: collections.Counter())
+    stacks = collections.defaultdict(lambda: collections.Counter())
+    total_callers = collections.Counter()
     ctx = CONTEXT(); ctx.ContextFlags = CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER
     stackbuf = (C.c_ubyte * args.stack)()
     t0 = time.perf_counter(); rounds = 0; samples = 0
@@ -269,6 +379,9 @@ def main():
                  'self = the sampled instruction is in that function; incl = the function is also on the scanned stack', '']
         lines.append('== whole run: self (top 40)')
         for k, v in total_self.most_common(40):
+            lines.append(f'{v:7d} {100.0 * v / max(1, samples):5.1f}%  {k}')
+        lines.append(''); lines.append('== whole run: samples outside the exe, by the first game function on the stack (top 30)')
+        for k, v in total_callers.most_common(30):
             lines.append(f'{v:7d} {100.0 * v / max(1, samples):5.1f}%  {k}')
         lines.append(''); lines.append('== whole run: inclusive (top 40)')
         for k, v in total_incl.most_common(40):
@@ -282,6 +395,10 @@ def main():
                 lines.append(f'   self {v:6d} {100.0 * v / max(1, n):5.1f}%  {k}')
             for k, v in win_incl[w].most_common(8):
                 lines.append(f'   incl {v:6d} {100.0 * v / max(1, n):5.1f}%  {k}')
+            for k, v in callers[w].most_common(4):
+                lines.append(f'   via  {v:6d} {100.0 * v / max(1, n):5.1f}%  {k}')
+            for k, v in stacks[w].most_common(5):
+                lines.append(f'   stk  {v:6d} {100.0 * v / max(1, n):5.1f}%  {k}')
         Path(args.out).write_text('\n'.join(lines) + '\n', encoding='utf-8')
         Path(args.out).with_suffix('.json').write_text(json.dumps({
             'pid': pid, 'gog': fn.gog, 'elapsed': elapsed, 'samples': samples, 'window': args.window,
@@ -321,7 +438,8 @@ def main():
                         continue
                     rip, rsp = ctx.Rip, ctx.Rsp
                     got = C.c_size_t()
-                    ok_stack = k32.ReadProcessMemory(hproc, C.c_void_p(rsp), stackbuf, args.stack, C.byref(got))
+                    frames = unwind(hproc, h, ctx, args.frames) if args.frames else []
+                    ok_stack = False if frames else k32.ReadProcessMemory(hproc, C.c_void_p(rsp), stackbuf, args.stack, C.byref(got))
                 finally:
                     k32.ResumeThread(h)
                 samples += 1
@@ -329,7 +447,26 @@ def main():
                 key = fn.name(f) if m == 'exe' else m
                 windows[win][key] += 1; total_self[key] += 1; win_threads[win][tid] += 1
                 seen = {key}
-                if ok_stack or got.value:
+                first_exe = None
+                if frames:
+                    # the summary: the first frame outside ntdll/KernelBase (a
+                    # runtime lock or wait, say) and the first two game frames
+                    chain, outside, exes = [], None, []
+                    for addr in frames[1:]:
+                        fm, ff = where(addr)
+                        name = fn.name(ff) if fm == 'exe' else fm
+                        seen.add(name)
+                        if fm == 'exe':
+                            if first_exe is None:
+                                first_exe = name
+                            if len(exes) < 2 and name not in exes:
+                                exes.append(name)
+                        elif outside is None and not fm.lower().startswith(('ntdll', 'kernelbase', 'kernel32')):
+                            outside = name
+                    chain = ([outside] if outside else []) + exes
+                    if m != 'exe':
+                        stacks[win][key + ' <- ' + ' <- '.join(chain)] += 1
+                elif ok_stack or got.value:
                     data = bytes(stackbuf[:got.value or args.stack])
                     for off in range(0, len(data) - 7, 8):
                         v = struct.unpack_from('<Q', data, off)[0]
@@ -339,6 +476,11 @@ def main():
                                 fs = fn.func(r)
                                 if fs is not None:
                                     seen.add(fn.name(fs))
+                                    if first_exe is None:
+                                        first_exe = fn.name(fs)
+                if m != 'exe':
+                    callers[win][f'{m.split("!")[0]} <- {first_exe or "?"}'] += 1
+                    total_callers[f'{m.split("!")[0]} <- {first_exe or "?"}'] += 1
                 for k in seen:
                     win_incl[win][k] += 1; total_incl[k] += 1
             rounds += 1
