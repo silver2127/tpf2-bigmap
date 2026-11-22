@@ -202,6 +202,8 @@ static bool g_octreeOn = true;
 #include "terrain_blocks.h"
 #include "material_compression.h"
 #include "save_fast.h"
+#include "alloc_trace.h"
+#include "gametime_lean.h"
 #include "travel_time.h"
 #include "alignment_batch.h"
 #include "terrain_sidecar.h"
@@ -1306,6 +1308,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_octreeOn    = H->cfgBool("tpf2_bigmap", "octree",        1);
     g_octreeDepth = H->cfgInt ("tpf2_bigmap", "octree_depth", 11);
     g_placementAttempts = H->cfgInt("tpf2_bigmap", "placement_attempts", 200);
+    g_allocTrace = H->cfgInt("tpf2_bigmap", "alloc_trace", 0);
+    g_gameTimeLean = H->cfgInt("tpf2_bigmap", "gametime_lua_copy_lean", 1);
     g_worldEntryTimings = H->cfgBool("tpf2_bigmap", "world_entry_timings", 0) != 0;
     g_materialIndexFast = H->cfgBool("tpf2_bigmap", "material_index_fast", 0) != 0;
     g_materialProbe = H->cfgBool("tpf2_bigmap", "material_index_probe", 0) != 0;
@@ -1467,16 +1471,18 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += RunWithSteamSites([] { return InstallTerrainMinMaxFast(); });
     installed += RunWithSteamSites([] { return InstallTerrainAlignFast(); });
     installed += InstallTerrainCache();
-    installed += InstallTerrainCompression();
+    installed += RunWithSteamSites([] { return InstallTerrainCompression(); });
     installed += InstallTerrainBlocks();
-    installed += InstallMaterialCompression();
-    installed += InstallSaveFast();
+    installed += RunWithSteamSites([] { return InstallMaterialCompression(); });
+    installed += RunWithSteamSites([] { return InstallSaveFast(); });
     installed += InstallTravelTime();
     installed += RunWithSteamSites([] { return InstallAlignmentBatch(); });
     installed += InstallTerrainServe();
     installed += InstallSidecarIo();
     installed += InstallInstanceShrink();
     installed += InstallMinimap();
+    installed += InstallAllocTrace();
+    installed += InstallGameTimeLean();
     installed += InstallGeneratorMemory();
 
     // ---- street occupancy raster: scale cell size with map size -----------

@@ -278,6 +278,9 @@ def main():
     ap.add_argument('--frames', type=int, default=40, help='frames unwound per sample (0 = stack scan only)')
     ap.add_argument('--process', default='TransportFever2.exe', help='process name to attach to')
     ap.add_argument('--pid', type=int, default=0, help='attach to this process id instead')
+    ap.add_argument('--focus', action='append', default=[],
+                    help='also record the full unwound stack of samples whose own frame contains this text '
+                         '(repeatable; e.g. RtlAllocateHeap, ZwAllocateVirtualMemory) -- the "focus" section')
     ap.add_argument('--map', default=str(Path(__file__).resolve().parents[1] / 'out' / 'tpf2_bigmap.map'),
                     help='linker map of the running tpf2_bigmap.dll, to name its functions')
     args = ap.parse_args()
@@ -368,6 +371,7 @@ def main():
     total_self, total_incl = collections.Counter(), collections.Counter()
     callers = collections.defaultdict(lambda: collections.Counter())
     stacks = collections.defaultdict(lambda: collections.Counter())
+    focus = collections.Counter()   # --focus: full stacks of matching samples
     total_callers = collections.Counter()
     ctx = CONTEXT(); ctx.ContextFlags = CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER
     stackbuf = (C.c_ubyte * args.stack)()
@@ -399,6 +403,10 @@ def main():
                 lines.append(f'   via  {v:6d} {100.0 * v / max(1, n):5.1f}%  {k}')
             for k, v in stacks[w].most_common(5):
                 lines.append(f'   stk  {v:6d} {100.0 * v / max(1, n):5.1f}%  {k}')
+        if args.focus:
+            lines.append(''); lines.append('== focus (' + ', '.join(args.focus) + '): full stacks, top 25')
+            for k, v in focus.most_common(25):
+                lines.append(f'{v:7d}  {k}')
         Path(args.out).write_text('\n'.join(lines) + '\n', encoding='utf-8')
         Path(args.out).with_suffix('.json').write_text(json.dumps({
             'pid': pid, 'gog': fn.gog, 'elapsed': elapsed, 'samples': samples, 'window': args.window,
@@ -466,6 +474,16 @@ def main():
                     chain = ([outside] if outside else []) + exes
                     if m != 'exe':
                         stacks[win][key + ' <- ' + ' <- '.join(chain)] += 1
+                    if args.focus and any(s in key or any(s in (fn.name(ff) if fm == 'exe' else fm) for fm, ff in (where(a) for a in frames[1:])) for s in args.focus):
+                        full = [key]
+                        for fm, ff in (where(a) for a in frames[1:]):
+                            nm = fn.name(ff) if fm == 'exe' else fm
+                            if full[-1] == nm or full[-1].startswith(nm + ' x'):   # collapse recursion
+                                k = int(full[-1].rsplit(' x', 1)[1]) + 1 if ' x' in full[-1] else 2
+                                full[-1] = f'{nm} x{k}'
+                            elif len(full) < 70:
+                                full.append(nm)
+                        focus[' <- '.join(full)] += 1
                 elif ok_stack or got.value:
                     data = bytes(stackbuf[:got.value or args.stack])
                     for off in range(0, len(data) - 7, 8):

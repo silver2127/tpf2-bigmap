@@ -94,6 +94,9 @@ static TerrainResizeFn g_originalTerrainResize;
 static TerrainCopyFn g_originalTerrainCopy;
 static TerrainDestroyFn g_originalTerrainDestroy;
 static uintptr_t g_terrainCompressionBase;
+// Running addresses of the three filtered call sites (Steam RVAs translated
+// through GameRva at install, so the GOG build matches its own return addresses).
+static uintptr_t g_terrainRetAlignResult,g_terrainRetAddTile,g_terrainRetCopy;
 static void ResizeTerrainOwned(TerrainOwnedVector* v,size_t n,bool eligible,bool toSmall=false) {
     using namespace TerrainPager;
     if(SmallPager::Contains(v->first)) {
@@ -131,9 +134,9 @@ static void __fastcall TerrainCompressedResize(TerrainOwnedVector* v,size_t n) {
     // peak); a plain vector, released through the CRT free import that
     // terrain_blocks.h routes to the pager, so only with terrain_blocks on.
     auto ret=reinterpret_cast<uintptr_t>(_ReturnAddress());
-    bool result=ret==g_terrainCompressionBase+0xaac4d9;
+    bool result=ret==g_terrainRetAlignResult;
     if(result)InterlockedIncrement64(&g_resultResizes);
-    bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) && ret==g_terrainCompressionBase+0x33ccaa;
+    bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) && ret==g_terrainRetAddTile;
     bool toSmall=result && InterlockedCompareExchange(&g_smallPagerActive,0,0);
     ResizeTerrainOwned(v,n,eligible,toSmall);
 }
@@ -165,7 +168,7 @@ static TerrainOwnedVector* CopyTerrainOwned(TerrainOwnedVector* dst,const Terrai
 }
 static TerrainOwnedVector* __fastcall TerrainCompressedCopy(TerrainOwnedVector* dst,const TerrainOwnedVector* src) {
     bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) &&
-        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_terrainCompressionBase+0x33dd91;
+        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_terrainRetCopy;
     return CopyTerrainOwned(dst,src,eligible);
 }
 static void __fastcall TerrainCompressedDestroy(void* control) {
@@ -531,15 +534,15 @@ static bool InstallTerrainCompression() {
         H->log("terrain compression: auto budgets for %llu MiB RAM -> hot %d MiB, warm %d MiB",
                (unsigned long long)(total>>20),g_terrainHotMB,g_terrainWarmMB);
     }
-    if(g_gog || g_terrainCompress!=1 || g_terrainCacheSpacing!=1 || g_terrainHotMB<128 || g_terrainHotMB>8192 || g_terrainWarmMB<0 || g_terrainWarmMB>8192) {
-        H->log("terrain compression: requires Steam, spacing=1, compress=1, hot_mb=128..8192, warm_mb=0..8192; OFF");return false;
+    if(g_terrainCompress!=1 || g_terrainCacheSpacing!=1 || g_terrainHotMB<128 || g_terrainHotMB>8192 || g_terrainWarmMB<0 || g_terrainWarmMB>8192) {
+        H->log("terrain compression: requires spacing=1, compress=1, hot_mb=128..8192, warm_mb=0..8192; OFF");return false;
     }
     if(!H->verifyBytes(0x1d5c50,kTerrainResizeBytes,sizeof kTerrainResizeBytes) ||
        !H->verifyBytes(0x1dedd0,kTerrainCopyBytes,sizeof kTerrainCopyBytes) ||
        !H->verifyBytes(0x33de30,kTerrainDestroyBytes,sizeof kTerrainDestroyBytes) ||
        !H->verifyBytes(0x33cca5,kTerrainResizeCall,sizeof kTerrainResizeCall) ||
        !H->verifyBytes(0x33dd8c,kTerrainCopyCall,sizeof kTerrainCopyCall)) {
-        H->log("terrain compression: Steam byte mismatch; OFF");return false;
+        H->log("terrain compression: byte mismatch; OFF");return false;
     }
     if(!TerrainPager::Init(size_t(g_terrainHotMB)*1024*1024)) {
         H->log("terrain compression: placeholder/handler initialization failed; OFF");return false;
@@ -548,6 +551,9 @@ static bool InstallTerrainCompression() {
     if(g_terrainDedup && !TerrainPager::EnableDedup()){H->log("terrain compression: dedup index allocation failed; dedup OFF");g_terrainDedup=0;}
     if(g_terrainLazyZero && !TerrainPager::EnableLazyZero()){H->log("terrain compression: zero blob encode failed; lazy zero OFF");g_terrainLazyZero=0;}
     g_terrainCompressionBase=H->moduleBase();
+    g_terrainRetAlignResult=g_terrainCompressionBase+GameRva(0xaac4d9);
+    g_terrainRetAddTile=g_terrainCompressionBase+GameRva(0x33ccaa);
+    g_terrainRetCopy=g_terrainCompressionBase+GameRva(0x33dd91);
     // Destruction first; allocation remains disabled until EVERY hook and the
     // worker succeed. Partial installation cannot create managed allocations.
     if(!H->installHook(H->moduleBase()+0x33de30,reinterpret_cast<void*>(TerrainCompressedDestroy),sizeof kTerrainDestroyBytes,reinterpret_cast<void**>(&g_originalTerrainDestroy)) ||
@@ -592,5 +598,5 @@ extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetLive(int hot,int war
 extern "C" __declspec(dllexport) int BigmapTestWarmUpdate(TerrainWarmup* state,uint64_t now,int busy,uint64_t bulk,uint64_t ui,int signal){return state->Update(now,busy!=0,bulk,ui,signal!=0);}
 extern "C" __declspec(dllexport) int BigmapTestInstallCompression(const Tpf2mpHost* host,int gog,int spacing,int enabled,int hotMB) {
     H=host;g_gog=gog!=0;g_terrainCacheSpacing=spacing;g_terrainCompress=enabled;g_terrainHotMB=hotMB;
-    return InstallTerrainCompression();
+    return RunWithSteamSites([]{return InstallTerrainCompression();});
 }

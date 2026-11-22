@@ -25,6 +25,7 @@ static MaterialAssignFn g_originalMaterialAssign;
 static MaterialInternDestroyFn g_originalMaterialInternDestroy;
 static MaterialGridDtorFn g_originalMaterialGridDtor;
 static uintptr_t g_materialCompressionBase;
+static uintptr_t g_materialRetResize;   // running address of the cell resize call site (GameRva at install)
 // Runtime checks from the lifetime report: every one of these except
 // releases is expected to stay at zero.
 static volatile LONG64 g_materialReleases=0, g_materialMigrations=0, g_materialLateReleases=0;
@@ -65,7 +66,7 @@ static void ResizeMaterialOwned(MaterialOwnedVector* v,size_t n,bool eligible) {
 }
 static void __fastcall MaterialCompressedResize(MaterialOwnedVector* v,size_t n) {
     bool eligible=InterlockedCompareExchange(&g_materialCompressActive,0,0) &&
-        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_materialCompressionBase+0x3303e6;
+        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_materialRetResize;
     ResizeMaterialOwned(v,n,eligible);
 }
 static void AssignMaterialOwned(MaterialOwnedVector* dst,const uint8_t* first,const uint8_t* last) {
@@ -195,20 +196,21 @@ static bool InstallMaterialCompression() {
         H->log("material compression: auto budgets for %llu MiB RAM -> hot %d MiB, warm %d MiB",
                (unsigned long long)(total>>20),g_materialHotMB,g_materialWarmMB);
     }
-    if(g_gog || g_materialCompress!=1 || g_materialHotMB<64 || g_materialHotMB>8192 || g_materialWarmMB<0 || g_materialWarmMB>8192) {
-        H->log("material compression: requires Steam, compress=1, hot_mb=64..8192, warm_mb=0..8192; OFF");return false;
+    if(g_materialCompress!=1 || g_materialHotMB<64 || g_materialHotMB>8192 || g_materialWarmMB<0 || g_materialWarmMB>8192) {
+        H->log("material compression: requires compress=1, hot_mb=64..8192, warm_mb=0..8192; OFF");return false;
     }
     if(!H->verifyBytes(0x1d5830,kMaterialResizeBytes,sizeof kMaterialResizeBytes) ||
        !H->verifyBytes(0x3303de,kMaterialResizeCall,sizeof kMaterialResizeCall) ||
        !H->verifyBytes(0x330350,kMaterialInternDestroyBytes,sizeof kMaterialInternDestroyBytes) ||
        !H->verifyBytes(0x32a6f0,kMaterialGridDtorBytes,sizeof kMaterialGridDtorBytes) ||
        !H->verifyBytes(0x1b3d90,kMaterialAssignBytes,sizeof kMaterialAssignBytes)) {
-        H->log("material compression: Steam byte mismatch; OFF");return false;
+        H->log("material compression: byte mismatch; OFF");return false;
     }
     if(!MaterialPager::Init(size_t(g_materialHotMB)*1024*1024)) {
         H->log("material compression: placeholder/handler initialization failed; OFF");return false;
     }
     g_materialCompressionBase=H->moduleBase();
+    g_materialRetResize=g_materialCompressionBase+GameRva(0x3303e6);
     // Every release/migration path first; allocation stays disabled until
     // EVERY hook and the worker succeed, so a partial install owns nothing.
     if(!H->installHook(H->moduleBase()+0x330350,reinterpret_cast<void*>(MaterialCompressedInternDestroy),sizeof kMaterialInternDestroyBytes,reinterpret_cast<void**>(&g_originalMaterialInternDestroy)) ||
@@ -235,7 +237,14 @@ extern "C" __declspec(dllexport) void BigmapTestMaterialInternDestroy(void* grid
 extern "C" __declspec(dllexport) void BigmapTestMaterialGridCells(void* grid){ReleaseMaterialGridCells(grid);}
 extern "C" __declspec(dllexport) int BigmapTestMaterialEvict(void* p){return MaterialPager::Contains(p)&&MaterialPager::Evict(MaterialPager::Index(p),true);}
 extern "C" __declspec(dllexport) int64_t BigmapTestMaterialCounter(int which){return which==0?g_materialReleases:which==1?g_materialMigrations:g_materialLateReleases;}
+// The filtered return addresses the installers computed, as RVAs (0 before install).
+extern "C" __declspec(dllexport) void BigmapTestPagerReturnSites(uintptr_t* out) {
+    out[0]=g_terrainRetAlignResult?g_terrainRetAlignResult-g_terrainCompressionBase:0;
+    out[1]=g_terrainRetAddTile?g_terrainRetAddTile-g_terrainCompressionBase:0;
+    out[2]=g_terrainRetCopy?g_terrainRetCopy-g_terrainCompressionBase:0;
+    out[3]=g_materialRetResize?g_materialRetResize-g_materialCompressionBase:0;
+}
 extern "C" __declspec(dllexport) int BigmapTestInstallMaterial(const Tpf2mpHost* host,int gog,int enabled,int hotMB,int warmMB) {
     H=host;g_gog=gog!=0;g_materialCompress=enabled;g_materialHotMB=hotMB;g_materialWarmMB=warmMB;
-    return InstallMaterialCompression();
+    return RunWithSteamSites([]{return InstallMaterialCompression();});
 }

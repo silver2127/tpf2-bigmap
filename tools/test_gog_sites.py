@@ -42,10 +42,21 @@ EXPECTED = {
     'BigmapTestInstallTerrainMinMax': ({0x30a760}, {0x33d0e1}),
     'BigmapTestInstallTerrainAlign': ({0x3b3690}, set()),
     'BigmapTestInstallAlignmentBatch': ({0xaad7b0}, set()),
+    'BigmapTestInstallCompression': ({0x33e050, 0x1deff0, 0x1d5e70}, set()),
+    'BigmapTestInstallMaterial': ({0x330570, 0x32a910, 0x1b3fb0, 0x1d5a50}, set()),
+    'BigmapTestInstallSaveFast': (set(), {0x2e8861, 0x2e89cd}),
+    'BigmapTestInstallGameTimeLean': (set(), {0xd65885}),   # GOG RVAs given directly (no Steam translation)
+}
+# installer export -> its arguments after the host (default: gog=1, enabled/batch)
+ARGS = {
+    'BigmapTestInstallAlignmentBatch': (1, 512),
+    'BigmapTestInstallCompression': (1, 1, 1, 1024),   # gog, spacing, enabled, hot_mb
+    'BigmapTestInstallMaterial': (1, 1, 256, 0),        # gog, enabled, hot_mb, warm_mb
 }
 
 
-PORTED = ['material_index.h', 'terrain_refine.h', 'terrain_minmax.h', 'terrain_align_fast.h', 'alignment_batch.h']
+PORTED = ['material_index.h', 'terrain_refine.h', 'terrain_minmax.h', 'terrain_align_fast.h', 'alignment_batch.h',
+          'terrain_compression.h', 'material_compression.h', 'save_fast.h']
 
 
 def lint_sources():
@@ -117,17 +128,27 @@ def main():
 
         host = Host(C.sizeof(Host), 1, log, None, None, None, getbase, None, verify, hook, patch, None)
         fn = getattr(dll, name)
-        fn.argtypes = [C.POINTER(Host), C.c_int, C.c_int]
-        ok = bool(fn(C.byref(host), 1, 512 if 'AlignmentBatch' in name else 1))
+        args = ARGS.get(name, (1, 1))
+        fn.argtypes = [C.POINTER(Host)] + [C.c_int] * len(args)
+        ok = bool(fn(C.byref(host), *args))
         line = (f'{name}: install={ok} verified={verified} mismatches={bad} '
                 f'hooks={sorted(hex(h) for h in hooks)} patches={sorted(hex(p) for p in patches)}')
         print(line)
         if not ok or bad or hooks != want_hooks or patches != want_patches:
             failures.append(line + ' | log: ' + ' / '.join(logs))
+    # The pagers only manage vectors resized/copied from these call sites: a
+    # wrong return address leaves compression installed but owning nothing.
+    rets = (C.c_size_t * 4)()
+    dll.BigmapTestPagerReturnSites(rets)
+    want = [0xaac5c9, 0x33ceca, 0x33dfb1, 0x330606]   # GOG: call 0x1d5e70 / 0x1d5e70 / 0x1deff0 / 0x1d5a50 ends here
+    print('pager return sites:', [hex(r) for r in rets])
+    if list(rets) != want:
+        failures.append(f'pager return sites {[hex(r) for r in rets]} != {[hex(w) for w in want]}')
     if failures:
         print('FAIL:'); [print('  ' + f) for f in failures]
         sys.exit(1)
-    print('PASS: material index, terrain refine, terrain minmax, terrain align and alignment batch install on the GOG '
+    print('PASS: material index, terrain refine, terrain minmax, terrain align, alignment batch, terrain and '
+          'material compression and fast saves install on the GOG '
           'executable through the Steam->GOG table; every byte check matches and every hook/patch '
           'lands on its measured GOG address')
 
