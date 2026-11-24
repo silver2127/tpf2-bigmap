@@ -71,6 +71,14 @@ int main() {
     assert(g_calls.size() == 1 && g_calls[0] == expected);
     g_calls.clear(); BigmapTestAlignmentDetour(self, obj, Recorder, 0);
     assert(g_calls.size() == 1 && g_calls[0] == expected);
+    // Auto size (-1): batches of 512..65,536 from free memory; still the set in order, nothing lost.
+    if (s.size() > 512) {
+        g_calls.clear(); BigmapTestAlignmentDetour(self, obj, Recorder, -1);
+        assert(!g_calls.empty());
+        std::vector<uint64_t> autoGot;
+        for (auto& c : g_calls) { assert(c.size() >= 1 && c.size() <= 65536); autoGot.insert(autoGot.end(), c.begin(), c.end()); }
+        assert(autoGot == expected);
+    }
     // A single-element chain and an exact multiple.
     std::set<Entry> one; one.insert(Entry{40, {}}); g_calls.clear();
     BigmapTestAlignmentDetour(self, reinterpret_cast<AlignmentBatch::SetObject*>(&one), Recorder, 1);

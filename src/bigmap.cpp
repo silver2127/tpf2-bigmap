@@ -49,7 +49,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cwchar>
-#include "tpf2mp_plugin.h"
+#include "tpf2mp_plugin.h"   // the plugin ABI, shared with the host
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -189,6 +189,7 @@ static const int OCTREE_STOCK_TILES  = 256;    // what the shipped box holds
 static const int OCTREE_PATCH_TILES  = 512;    // what the patched box holds
 static bool g_octreeOn = true;
 
+#include "gog_rva.h"
 #include "octree_depth12.h"
 #include "placement_distance.h"
 #include "world_entry.h"
@@ -201,10 +202,13 @@ static bool g_octreeOn = true;
 #include "terrain_blocks.h"
 #include "material_compression.h"
 #include "save_fast.h"
+#include "alloc_trace.h"
+#include "gametime_lean.h"
 #include "travel_time.h"
 #include "alignment_batch.h"
 #include "terrain_sidecar.h"
 #include "terrain_serve.h"
+#include "terrain_sidecar_io.h"
 #include "instance_shrink.h"
 
 typedef void* (__fastcall *RasterCtorFn)(void* self, const float* bbox, float cellSize);
@@ -317,6 +321,37 @@ static const uint8_t EXPECT_STRVEC_DTOR[15] = {
 // The E8 call in front of the gated return address, so the gate can only ever
 // match the one call it was measured on.
 static const uint8_t CALL_SIZE_COMBO[5] = { 0xE8,0x12,0x94,0xCB,0x01 };
+
+// The same four sites on the GOG 2024-12-12 binary, measured on its
+// TransportFever2.exe. Prologues are byte-identical to Steam's (the EXPECT_*
+// arrays above verify both); only the RVAs and the call's rel32 move:
+//   combo factory   0x2328dc0  the only match of EXPECT_COMBO_FAC in .text
+//   size combo call 0x66d099   +0x220, the same shift as GetNumTilesNew; the
+//                              ~vector<string> call follows it at 0x66d0b0
+//                              exactly as on Steam
+//   vector ctor     0x9da10    +0x210: (last-first)>>5, allocate, copy 0x20 each
+//   vector dtor     0xbbfa0    +0x210, the one the New Game page calls
+static const uintptr_t RVA_COMBO_FAC_GOG     = 0x2328dc0;
+static const uintptr_t RET_SIZE_COMBO_GOG    = 0x66d09e;
+static const uintptr_t RVA_STRVEC_CTOR_GOG   = 0x9da10;
+static const uintptr_t RVA_STRVEC_DTOR_GOG   = 0xbbfa0;
+static const uint8_t CALL_SIZE_COMBO_GOG[5] = { 0xE8,0x22,0xBD,0xCB,0x01 };
+
+// The sites in use, chosen once g_gog is known (SelectSizeRowSites).
+static uintptr_t g_rvaComboFac   = RVA_COMBO_FAC;
+static uintptr_t g_retSizeCombo  = RET_SIZE_COMBO;
+static uintptr_t g_rvaStrVecCtor = RVA_STRVEC_CTOR;
+static uintptr_t g_rvaStrVecDtor = RVA_STRVEC_DTOR;
+static const uint8_t* g_callSizeCombo = CALL_SIZE_COMBO;
+
+static void SelectSizeRowSites(bool gog)
+{
+    g_rvaComboFac   = gog ? RVA_COMBO_FAC_GOG   : RVA_COMBO_FAC;
+    g_retSizeCombo  = gog ? RET_SIZE_COMBO_GOG  : RET_SIZE_COMBO;
+    g_rvaStrVecCtor = gog ? RVA_STRVEC_CTOR_GOG : RVA_STRVEC_CTOR;
+    g_rvaStrVecDtor = gog ? RVA_STRVEC_DTOR_GOG : RVA_STRVEC_DTOR;
+    g_callSizeCombo = gog ? CALL_SIZE_COMBO_GOG : CALL_SIZE_COMBO;
+}
 // The Towns switch in the params refresh:
 //   8B 88 60 04 00 00        mov   ecx, [rax+0x460]     ; the Towns combo's selected index
 //   85 C9 / 75 0A            test  ecx, ecx / jne case 1
@@ -431,10 +466,14 @@ static int g_logEvery    = 1;
 // A rectangle's long axis may use all of it -- its
 // area (the street-raster product, handled by the raster hook / warned
 // below) is a separate limit. max_tiles stays an explicit lower cap.
+// Depths 12/13 cannot be installed on the GOG build, so the ceiling there is
+// the patched box (EffectiveOctreeDepth drops them to 11). A menu that offered
+// 2,048 tiles over a 512-tile root would hand the user a broken world.
 static int EffectiveMaxTiles()
 {
-    int octCap = g_octreeOn ? (g_octreeDepth == 13 ? 2048 :
-                              g_octreeDepth == 12 ? 1024 : OCTREE_PATCH_TILES)
+    const int depth = EffectiveOctreeDepth();
+    int octCap = g_octreeOn ? (depth == 13 ? 2048 :
+                              depth == 12 ? 1024 : OCTREE_PATCH_TILES)
                             : OCTREE_STOCK_TILES;
     return (g_maxTiles > 0 && g_maxTiles < octCap) ? g_maxTiles : octCap;
 }
@@ -478,6 +517,19 @@ void BigmapTestOctreeSize(int depth, int maxTiles, int enabled, int* tx, int* ty
     g_octreeDepth = oldDepth; g_maxTiles = oldMax; g_octreeOn = oldOn;
 }
 
+extern "C" __declspec(dllexport)
+int BigmapTestOctreeCeiling(int gog, int depth, int maxTiles, int enabled)
+{
+    int oldDepth = g_octreeDepth, oldMax = g_maxTiles;
+    bool oldOn = g_octreeOn, oldGog = g_gog;
+    g_gog = gog != 0; g_octreeDepth = depth; g_maxTiles = maxTiles;
+    g_octreeOn = enabled != 0;
+    const int cap = EffectiveMaxTiles();
+    g_gog = oldGog; g_octreeDepth = oldDepth;
+    g_maxTiles = oldMax; g_octreeOn = oldOn;
+    return cap;
+}
+
 // A std::string holding `s` in its inline buffer (SSO: at most 15 chars).
 static void SsoString(MsvcString* out, const char* s)
 {
@@ -511,21 +563,30 @@ static bool AppendStrings(StrVec* vec, const MsvcString* extra, int k)
     return true;
 }
 
+#include "gigantomaniac.h"
+
 // Combo factory: for the New Game size dropdown only, note how many stock rows
-// it has and append ours before the widget copies the list.
+// it has and append ours before the widget copies the list. With the
+// Gigantomaniac row live there is one added row, and the combo it returns is
+// remembered so the ratio dropdown can follow its selection.
 static void* __fastcall ComboDetour(StrVec* items, void* onChange, int initialSel, void* aux, int p5)
 {
-    if ((uintptr_t)_ReturnAddress() == g_base + RET_SIZE_COMBO && items) {
+    const bool sizeCombo = (uintptr_t)_ReturnAddress() == g_base + g_retSizeCombo && items;
+    if (sizeCombo) {
         const long stock = (long)(items->last - items->first);
         if (stock > 0 && stock < 64) {
             InterlockedExchange(&g_stockSizeRows, stock);
-            const bool ok = AppendStrings(items, g_extraRowStrings, g_numExtraSizeRows);
+            const MsvcString* rows = g_gigaLive ? &g_gigaRowString : g_extraRowStrings;
+            const int k = g_gigaLive ? 1 : g_numExtraSizeRows;
+            const bool ok = AppendStrings(items, rows, k);
             if (g_logEvery)
                 H->log("size dropdown: %ld stock row(s) + %d added%s", stock,
-                       ok ? g_numExtraSizeRows : 0, ok ? "" : " (append FAILED)");
+                       ok ? k : 0, ok ? "" : " (append FAILED)");
         }
     }
-    return g_origCombo(items, onChange, initialSel, aux, p5);
+    void* combo = g_origCombo(items, onChange, initialSel, aux, p5);
+    if (sizeCombo) GigaNoteSizeCombo(combo);
+    return combo;
 }
 
 // The claim for (size, format), else that size's lowest-format claim; -1 when
@@ -610,7 +671,21 @@ static uint64_t __fastcall Detour(int sizeIndex, int formatIndex, void* cfg)
     // was built with (4 with experimental map sizes off, 7 with it on), and with
     // the flag off that overlaps what the ladder calls size 4..6 -- so it has to
     // be recognised before any claim is consulted.
-    if (g_sizeRowsLive) {
+    if (g_sizeRowsLive && g_gigaLive && sizeIndex == (int)g_stockSizeRows) {
+        // The Gigantomaniac row: the ratio dropdown lists the ladder's sizes,
+        // so its index picks the size and that size's own format-0 shape.
+        int f = formatIndex;
+        if (f >= g_numExtraSizeRows) f = g_numExtraSizeRows - 1;
+        int tx = 96, ty = 96;
+        RowShape(g_extraSizeRows[f].size, 0, &tx, &ty);
+        if (g_logEvery) {
+            H->log("size=%d format=%d -> %d x %d tiles (%.1f x %.1f km) [%s, '%s']",
+                   sizeIndex, formatIndex, tx, ty, tx * 0.256, ty * 0.256,
+                   g_gigaLabel, g_extraSizeRows[f].label);
+        }
+        return ((uint64_t)(uint32_t)ty << 32) | (uint32_t)tx;
+    }
+    if (g_sizeRowsLive && !g_gigaLive) {
         const int row = sizeIndex - (int)g_stockSizeRows;
         if (row >= 0 && row < g_numExtraSizeRows) {
             int tx = 96, ty = 96;
@@ -876,6 +951,7 @@ static bool WriteWholeFile(const wchar_t* path, const char* data, size_t len)
 // The in-game minimap: native terrain texture behind a Lua ImageView. Uses
 // ReadWholeFile / WriteWholeFile above for its game script.
 #include "minimap.h"
+#include "generator_memory.h"
 
 // The stock text with the inserts, malloc'd; nullptr (and `why`) when an anchor
 // is missing, repeated or out of order.
@@ -1042,9 +1118,13 @@ void WINAPI BigmapRestoreStockBaseMod(HWND, HINSTANCE, LPSTR, int)
     if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\res\\config\\base_mod.lua", self) < 0) return;
     char why[320];
     SyncBaseMod(path, false, why, sizeof why);
-    // The minimap game script goes too (only if it is ours).
+    // The minimap game script and its style sheet go too (only if they are ours).
     wchar_t script[MAX_PATH];
-    if (MinimapScriptPathIn(self, script, MAX_PATH)) SyncMinimapScript(script, false);
+    if (MinimapScriptPathIn(self, script, MAX_PATH)) {
+        SyncMinimapScript(script, false);
+        SyncMinimapStyle(script, false);
+        SyncMinimapIcon(script, false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,13 +1135,13 @@ static bool g_vecHelpersOk = false;
 static bool ResolveVectorHelpers()
 {
     if (g_vecHelpersOk) return true;
-    if (!H->verifyBytes(RVA_STRVEC_CTOR, EXPECT_STRVEC_CTOR, sizeof EXPECT_STRVEC_CTOR)
-        || !H->verifyBytes(RVA_STRVEC_DTOR, EXPECT_STRVEC_DTOR, sizeof EXPECT_STRVEC_DTOR)) {
+    if (!H->verifyBytes(g_rvaStrVecCtor, EXPECT_STRVEC_CTOR, sizeof EXPECT_STRVEC_CTOR)
+        || !H->verifyBytes(g_rvaStrVecDtor, EXPECT_STRVEC_DTOR, sizeof EXPECT_STRVEC_DTOR)) {
         H->log("new game rows: vector<string> ctor/dtor do not byte-verify -- no rows added");
         return false;
     }
-    g_strVecCtor = (StrVecCtorFn)(g_base + RVA_STRVEC_CTOR);
-    g_strVecDtor = (StrVecDtorFn)(g_base + RVA_STRVEC_DTOR);
+    g_strVecCtor = (StrVecCtorFn)(g_base + g_rvaStrVecCtor);
+    g_strVecDtor = (StrVecDtorFn)(g_base + g_rvaStrVecDtor);
     g_vecHelpersOk = true;
     return true;
 }
@@ -1179,20 +1259,21 @@ static int InstallSizeRows()
         H->log("size rows: add_size_rows=1 but no size7_format0 claim -- nothing to add");
         return 0;
     }
-    if (g_gog) {
-        H->log("size rows: Steam build only -- not on the GOG build");
-        return 0;
-    }
+    SelectSizeRowSites(g_gog);
     if (!ResolveVectorHelpers()
-        || !H->verifyBytes(RVA_COMBO_FAC, EXPECT_COMBO_FAC, sizeof EXPECT_COMBO_FAC)
-        || !H->verifyBytes(RET_SIZE_COMBO - 5, CALL_SIZE_COMBO, sizeof CALL_SIZE_COMBO)) {
-        H->log("size rows: the size dropdown code does not byte-verify -- OFF");
+        || !H->verifyBytes(g_rvaComboFac, EXPECT_COMBO_FAC, sizeof EXPECT_COMBO_FAC)
+        || !H->verifyBytes(g_retSizeCombo - 5, g_callSizeCombo, sizeof CALL_SIZE_COMBO)) {
+        H->log("size rows: the size dropdown code does not byte-verify on the %s build -- OFF",
+               g_gog ? "GOG" : "Steam");
         return 0;
     }
     for (int i = 0; i < g_numExtraSizeRows; ++i)
         SsoString(&g_extraRowStrings[i], g_extraSizeRows[i].label);
+    // GOG: one Gigantomaniac row instead of one row per size, when its own
+    // sites verify; otherwise the rows below stay one per size.
+    InstallGigantomaniac();
     void* t = nullptr;
-    if (!H->installHook(g_base + RVA_COMBO_FAC, (void*)&ComboDetour, sizeof EXPECT_COMBO_FAC, &t)) {
+    if (!H->installHook(g_base + g_rvaComboFac, (void*)&ComboDetour, sizeof EXPECT_COMBO_FAC, &t)) {
         H->log("size rows: installHook failed on the combo factory -- OFF");
         return 0;
     }
@@ -1227,14 +1308,18 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_octreeOn    = H->cfgBool("tpf2_bigmap", "octree",        1);
     g_octreeDepth = H->cfgInt ("tpf2_bigmap", "octree_depth", 11);
     g_placementAttempts = H->cfgInt("tpf2_bigmap", "placement_attempts", 200);
+    g_allocTrace = H->cfgInt("tpf2_bigmap", "alloc_trace", 0);
+    g_gameTimeLean = H->cfgInt("tpf2_bigmap", "gametime_lua_copy_lean", 1);
     g_worldEntryTimings = H->cfgBool("tpf2_bigmap", "world_entry_timings", 0) != 0;
     g_materialIndexFast = H->cfgBool("tpf2_bigmap", "material_index_fast", 0) != 0;
+    g_materialProbe = H->cfgBool("tpf2_bigmap", "material_index_probe", 0) != 0;
     g_terrainRefineFast = H->cfgBool("tpf2_bigmap", "terrain_refine_fast", 0) != 0;
     g_terrainMinMaxFast = H->cfgBool("tpf2_bigmap", "terrain_minmax_fast", 0) != 0;
     g_terrainAlignFast = H->cfgBool("tpf2_bigmap", "terrain_align_fast", 0) != 0;
     g_terrainCacheSpacing = H->cfgInt("tpf2_bigmap", "terrain_cache_spacing_m", 0);
     g_terrainCompress = H->cfgInt("tpf2_bigmap", "terrain_cache_compress", 0);
     g_terrainHotMB = H->cfgInt("tpf2_bigmap", "terrain_cache_hot_mb", 0);
+    g_commitTightMB = H->cfgInt("tpf2_bigmap", "commit_tight_mb", 0);
     g_terrainWarmMB = H->cfgInt("tpf2_bigmap", "terrain_cache_warm_mb", -1);
     g_terrainMaxMB = H->cfgInt("tpf2_bigmap", "terrain_cache_max_mb", 0);
     g_simPhysicalMB = H->cfgInt("tpf2_bigmap", "simulate_physical_mb", 0);
@@ -1259,10 +1344,21 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     g_saveFast = H->cfgBool("tpf2_bigmap", "save_fast", 0) != 0;
     g_travelTimeLimit = H->cfgInt("tpf2_bigmap", "travel_time_limit_s", 0);
     g_alignmentBatch = H->cfgInt("tpf2_bigmap", "alignment_batch_tiles", 512);
+    g_alignmentSkipServed = H->cfgInt("tpf2_bigmap", "alignment_skip_served", 1);
+    TerrainSidecar::g_writeThreads = H->cfgInt("tpf2_bigmap", "terrain_sidecar_threads", 0);
+    // A joiner takes the host's sidecar while its load runs (docs/terrain-stream.md).
+    if (H->cfgBool("tpf2_bigmap", "terrain_stream", 1) && H->dataDir) TerrainSidecar::SetStreamDir(H->dataDir());
+    TerrainSidecar::g_readLocal = H->cfgBool("tpf2_bigmap", "terrain_sidecar_read_local", 1) != 0;
+    g_serveAtPass = H->cfgBool("tpf2_bigmap", "terrain_sidecar_decode_at_pass", 1) != 0 &&
+                                  g_alignmentBatch != 0 && g_alignmentSkipServed;
     g_terrainServe = H->cfgBool("tpf2_bigmap", "terrain_sidecar", 1) != 0;
+    g_sidecarWrite = H->cfgBool("tpf2_bigmap", "terrain_sidecar_write", 1) != 0;
+    g_sidecarMaxTiles = H->cfgInt("tpf2_bigmap", "terrain_sidecar_max_tiles", 0);
     g_cargoPathTime = H->cfgInt("tpf2_bigmap", "cargo_path_time_s", 0);
     g_instanceShrink = H->cfgBool("tpf2_bigmap", "instance_shrink", 0) != 0;
     g_minimap = H->cfgBool("tpf2_bigmap", "minimap", 1) != 0;
+    g_generatorMemory = H->cfgBool("tpf2_bigmap", "generator_memory", 1) != 0;
+    g_generatorBudgetPct = H->cfgInt("tpf2_bigmap", "generator_memory_budget_pct", 50);
     if (g_octreeDepth != 11 && g_octreeDepth != 12 && g_octreeDepth != 13) {
         H->log("octree_depth must be 11, 12 or 13; refusing invalid depth");
         return TPF2MP_ERR_FAILED;
@@ -1306,6 +1402,11 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     // Added size rows: cfg add_size_rows=1, and each row is a claimed size >= 7
     // (contiguous from 7) with an optional size_label<N>.
     g_addSizeRows    = H->cfgBool("tpf2_bigmap", "add_size_rows", 1);
+    g_gigaOn         = H->cfgBool("tpf2_bigmap", "gigantomaniac", 1) != 0;
+    {
+        const char* gl = H->cfgStr("tpf2_bigmap", "gigantomaniac_label", nullptr);
+        if (gl && *gl) { int j = 0; for (; gl[j] && j < 15; ++j) g_gigaLabel[j] = gl[j]; g_gigaLabel[j] = 0; }
+    }
     g_newgameDensity = H->cfgBool("tpf2_bigmap", "newgame_density", 1);
     g_numExtraSizeRows = 0;
     if (g_addSizeRows) {
@@ -1364,20 +1465,25 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
     installed += InstallPlacementSpacing();
     installed += InstallFastPlacement();
     installed += InstallWorldEntryTimings();
-    installed += InstallMaterialIndexFast();
-    installed += InstallTerrainRefineFast();
-    installed += InstallTerrainMinMaxFast();
-    installed += InstallTerrainAlignFast();
+    // Written against Steam RVAs; on GOG they run through the translating host (gog_rva.h).
+    installed += RunWithSteamSites([] { return InstallMaterialIndexFast(); });
+    installed += RunWithSteamSites([] { return InstallTerrainRefineFast(); });
+    installed += RunWithSteamSites([] { return InstallTerrainMinMaxFast(); });
+    installed += RunWithSteamSites([] { return InstallTerrainAlignFast(); });
     installed += InstallTerrainCache();
-    installed += InstallTerrainCompression();
+    installed += RunWithSteamSites([] { return InstallTerrainCompression(); });
     installed += InstallTerrainBlocks();
-    installed += InstallMaterialCompression();
-    installed += InstallSaveFast();
+    installed += RunWithSteamSites([] { return InstallMaterialCompression(); });
+    installed += RunWithSteamSites([] { return InstallSaveFast(); });
     installed += InstallTravelTime();
-    installed += InstallAlignmentBatch();
+    installed += RunWithSteamSites([] { return InstallAlignmentBatch(); });
     installed += InstallTerrainServe();
+    installed += InstallSidecarIo();
     installed += InstallInstanceShrink();
     installed += InstallMinimap();
+    installed += InstallAllocTrace();
+    installed += InstallGameTimeLean();
+    installed += InstallGeneratorMemory();
 
     // ---- street occupancy raster: scale cell size with map size -----------
     if (g_rasterOn) {
@@ -1433,10 +1539,20 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
         }
         uintptr_t rva = g_gog ? RVA_OCTREE_GOG : RVA_OCTREE;
         const uint8_t* exp = g_gog ? EXPECTED_OCTREE_GOG : EXPECTED_OCTREE;
+        const int depth = EffectiveOctreeDepth();
+        if (g_octreeOn && depth != g_octreeDepth) {
+            // Depth 12/13 rewrite two Steam-35924 prologues this build does not
+            // have. Refusing to load only punished GOG users whose config asked
+            // for it -- the shipped cfg does -- so keep the widening that does
+            // byte-verify here and say what the shorter root costs.
+            H->log("octree: octree_depth=%d is Steam 35924 only -- this build keeps "
+                   "depth 11 and loads, so the edge ceiling stays %d tiles, not %d",
+                   g_octreeDepth, OCTREE_PATCH_TILES, g_octreeDepth == 13 ? 2048 : 1024);
+        }
         if (!g_octreeOn) {
             H->log("octree: disabled (octree=0); maps over %d tiles will grow "
                    "duplicate street nodes past +-32,768 m", OCTREE_STOCK_TILES);
-        } else if (g_octreeDepth >= 12) {
+        } else if (depth >= 12) {
             // Explicit opt-in also applies on load, even with a small menu
             // ladder: saved worlds do not pass through GetNumTilesNew.
             if (!InstallOctDepth12(rva, exp)) {

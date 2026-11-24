@@ -597,7 +597,7 @@ def main():
     install = dll.BigmapTestInstallTerrainMinMax
     install.argtypes = [C.POINTER(Host), C.c_int, C.c_int]
     sites = [(LOOP, LOOP_END - LOOP), (EPI, EPI_END - EPI), (COPY, COPY_END - COPY)]
-    for failure in ('none', 'disabled', 'gog', 'verify0', 'verify1', 'verify2', 'patch', 'hook', 'both'):
+    for failure in ('none', 'disabled', 'verify0', 'verify1', 'verify2', 'patch', 'hook', 'both'):
         events, errors, logs = [], [], []
 
         @logtype
@@ -642,7 +642,7 @@ def main():
             assert events == full[:int(failure[-1]) + 1] and len(logs) == 1 and not result
         else:
             assert events == full and len(logs) == 1 and result == (failure != 'both'), (failure, events, result)
-    print('PASS: installer preflights all three byte ranges before patching; refuses when disabled, on GOG or on any mismatch; '
+    print('PASS: installer preflights all three byte ranges before patching; refuses when disabled or on any mismatch (GOG: tools/test_gog_sites.py); '
           'one log line; partial install only when one half fails')
 
     # --------------------------------------------------------- benchmarks

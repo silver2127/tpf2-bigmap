@@ -11,7 +11,6 @@ Build the DLL first: build.bat
 import ctypes as C
 import random
 import struct
-import sys
 import time
 from pathlib import Path
 import capstone
@@ -197,7 +196,6 @@ def main():
             lo, hi = rmin * stride + cmin, rmax * stride + cmax
         else:
             lo = hi = 0
-        n_out = hi - lo + 1 + 32
         if alias:   # output region starts inside the source samples
             start_in = max(0, 16 - lo)
             out_index = start_in + rng.randrange(0, max(1, n_in // 2)) - lo
@@ -357,7 +355,7 @@ def main():
     install = dll.BigmapTestInstallTerrainRefine
     install.argtypes = [C.POINTER(Host), C.c_int, C.c_int]
     expected_verify = [(FUNC, 20)] + REGIONS
-    failures = ['none', 'disabled', 'gog', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
+    failures = ['none', 'disabled', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
     for failure in failures:
         events, errors = [], []
 
@@ -395,7 +393,7 @@ def main():
         else:
             assert events == verified + [('hook',)], events
     print(f'PASS: installer verifies the 20-byte prologue (5 whole instructions, no RIP/branches) and '
-          f'{sum(n for _, n in REGIONS)} bytes of body/product/constants; disabled, GOG, each mismatch and hook failure refuse')
+          f'{sum(n for _, n in REGIONS)} bytes of body/product/constants; disabled, each mismatch and hook failure refuse')
 
     # 8. Warm-cache native microbenchmark (ctypes call overhead included, same for both).
     print('benchmark (per call, best of 5 rounds):')

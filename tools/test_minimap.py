@@ -8,7 +8,6 @@ BaseGetVertices. Requires lupa, pefile and capstone.
 """
 import ctypes as C
 import math
-import shutil
 import struct
 import subprocess
 import tempfile
@@ -22,6 +21,8 @@ from test_world_entry import Host, logtype, basetype, verifytype, hooktype
 ROOT = Path(__file__).resolve().parents[1]
 EXE = r'C:\tools\bin\TransportFever2.exe'
 SCRIPT = ROOT / 'mod/minimap/bigmap_minimap.lua'
+STYLE = ROOT / 'mod/minimap/bigmap_minimap_style.lua'
+ICON = ROOT / 'mod/minimap/minimap_button@2x.tga'
 MARKER = b'-- tpf2_bigmap minimap'
 
 
@@ -56,6 +57,19 @@ sync_script.argtypes = [C.c_wchar_p, C.c_int]
 script_text = dll.BigmapTestMinimapScriptText
 script_text.argtypes = [C.c_char_p, C.c_uint64]
 script_text.restype = C.c_uint64
+sync_style = dll.BigmapTestSyncMinimapStyle
+sync_style.argtypes = [C.c_wchar_p, C.c_int]
+style_text = dll.BigmapTestMinimapStyleText
+style_text.argtypes = [C.c_char_p, C.c_uint64]
+style_text.restype = C.c_uint64
+sync_icon = dll.BigmapTestSyncMinimapIcon
+sync_icon.argtypes = [C.c_wchar_p, C.c_int]
+key_event = dll.BigmapTestMinimapKeyEvent
+key_event.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_uint32)]
+typing_in = dll.BigmapTestMinimapTypingIn
+typing_in.argtypes = [C.c_void_p, C.c_uint64]
+climate_colouring = dll.BigmapTestMinimapClimateColoring
+climate_colouring.argtypes = [C.c_void_p, C.POINTER(C.c_float), C.c_char_p, C.c_uint64]
 install = dll.BigmapTestInstallMinimap
 install.argtypes = [C.POINTER(Host), C.c_int, C.c_int, C.c_wchar_p]
 
@@ -467,6 +481,223 @@ def check_script_sync(tmp):
     print('PASS: game script: embedded copy equals the source; written, up to date, rewritten, removed, absent; '
           'a foreign file is never touched')
 
+    # The button's style sheet: beside a script in a game_script folder, nowhere else.
+    ssrc = STYLE.read_bytes().replace(b'\r\n', b'\n')
+    cap = style_text(None, 0)
+    buf = C.create_string_buffer(cap + 1)
+    assert style_text(buf, cap + 1) == len(ssrc) and buf.raw[:cap] == ssrc, 'embedded style sheet differs from the source'
+    assert ssrc.startswith(MARKER) and b'bigmapToolbarDisk' in ssrc
+    config = tmp / 'res' / 'config'
+    (config / 'game_script').mkdir(parents=True)
+    (config / 'style_sheet').mkdir()
+    script = config / 'game_script' / 'bigmap_minimap.lua'
+    style = config / 'style_sheet' / 'bigmap_minimap.lua'
+    assert sync_style(str(script), 1) == 3 and style.read_bytes() == ssrc     # written
+    assert sync_style(str(script), 1) == 2                                    # up to date
+    assert sync_style(str(script), 0) == 1 and not style.exists()             # removed
+    style.write_bytes(b'-- somebody else\n')
+    assert sync_style(str(script), 1) == 4 and style.read_bytes() == b'-- somebody else\n'
+    style.unlink()
+    assert sync_style(str(path), 1) == 0 and not (tmp / 'style_sheet').exists()   # not in game_script: none
+    print('PASS: style sheet: embedded copy equals the source; written beside game_script, up to date, removed; '
+          'a foreign file is never touched; no game_script folder, no style sheet')
+
+    # The button's icon: res/textures/ui/bigmap/, a folder of its own; the folder
+    # goes only when empty, and ui/ (the game's) never.
+    isrc = ICON.read_bytes()
+    ui = tmp / 'res' / 'textures' / 'ui'
+    ui.mkdir(parents=True)
+    icon = ui / 'bigmap' / 'minimap_button@2x.tga'
+    assert sync_icon(str(script), 1) == 3 and icon.read_bytes() == isrc      # written, folder made
+    assert sync_icon(str(script), 1) == 2                                    # up to date
+    icon.write_bytes(b'an old icon')
+    assert sync_icon(str(script), 1) == 3 and icon.read_bytes() == isrc      # rewritten
+    assert sync_icon(str(script), 0) == 1 and not (ui / 'bigmap').exists()   # removed with its folder
+    assert sync_icon(str(script), 0) == 0 and ui.exists()                    # absent; ui/ stays
+    assert sync_icon(str(script), 1) == 3
+    (ui / 'bigmap' / 'somebody_else.tga').write_bytes(b'x')
+    assert sync_icon(str(script), 0) == 1 and (ui / 'bigmap' / 'somebody_else.tga').exists()
+    assert sync_icon(str(path), 1) == 0                                      # not in game_script: none
+    print('PASS: button icon: embedded copy equals the TGA; written into its own folder, up to date, rewritten, '
+          'removed with the folder when empty; another file in it is kept')
+
+
+# ---- the M key ----------------------------------------------------------------
+
+def check_key():
+    KEYDOWN, KEYUP, TEXT, MOTION = 0x300, 0x301, 0x303, 0x400
+    M, N = 16, 17
+
+    def event(kind, scancode=M, mod=0, repeat=0):
+        ev = (C.c_uint8 * 56)()
+        C.c_uint32.from_buffer(ev, 0).value = kind
+        ev[13] = repeat
+        C.c_int32.from_buffer(ev, 16).value = scancode
+        C.c_uint16.from_buffer(ev, 24).value = mod
+        return ev
+
+    count = C.c_uint32()
+
+    def feed(ev, typing=0):
+        return key_event(ev, typing, C.byref(count))
+
+    base = feed(event(MOTION))
+    start = count.value
+    assert base == 0
+    assert feed(event(KEYDOWN)) == 1 and count.value == start + 1                 # a press: taken, counted
+    assert feed(event(KEYDOWN, repeat=1)) == 1 and count.value == start + 1       # its repeat: taken, not counted
+    assert feed(event(KEYUP)) == 1                                                  # its release: taken
+    assert feed(event(KEYUP)) == 0                                                  # a stray release: the game's
+    assert feed(event(KEYDOWN), typing=1) == 0 and count.value == start + 1        # typing: the text field's
+    assert feed(event(KEYDOWN, repeat=1), typing=1) == 0
+    assert feed(event(KEYUP)) == 0                                                  # ...and so is its release
+    for mod in (0x1, 0x2, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800):                  # Shift/Ctrl/Alt/GUI: the game's
+        assert feed(event(KEYDOWN, mod=mod)) == 0, hex(mod)
+    assert feed(event(KEYDOWN, mod=0x1000 | 0x2000)) == 1 and count.value == start + 2   # Num/Caps lock: still M
+    assert feed(event(KEYUP)) == 1
+    assert feed(event(KEYDOWN, scancode=N)) == 0 and feed(event(TEXT)) == 0        # other keys and text: the game's
+
+    # The typing walk: focused component -> parents (+0x350) -> root; a visible
+    # CTextInputField (vtable compare) in editing mode (+0x74c) somewhere on the way.
+    VT = 0x7ff612345678
+    comps = []
+
+    def comp(vt=0x1111, visible=1, editing=0):
+        c = (C.c_uint8 * 0x800)()
+        C.c_uint64.from_buffer(c, 0).value = vt
+        c[0x8f] = visible
+        c[0x74c] = editing
+        comps.append(c)
+        return c
+
+    def link(child, parent):
+        C.c_uint64.from_buffer(child, 0x350).value = C.addressof(parent)
+
+    core = (C.c_uint8 * 0x300)()
+
+    def tree(focus, root):
+        C.c_uint64.from_buffer(core, 0x2e0).value = C.addressof(focus) if focus is not None else 0
+        C.c_uint64.from_buffer(core, 0x280).value = C.addressof(root)
+
+    root, window = comp(), comp()
+    link(window, root)
+    field = comp(vt=VT, editing=1)
+    link(field, window)
+    tree(field, root)
+    assert typing_in(core, VT) == 1                                  # the caret is blinking
+    field[0x74c] = 0
+    assert typing_in(core, VT) == 0                                  # focused, not editing: hotkeys work
+    field[0x74c] = 1
+    inner = comp()                                                   # focus on a part inside the field
+    link(inner, field)
+    tree(inner, root)
+    assert typing_in(core, VT) == 1
+    window[0x8f] = 0
+    assert typing_in(core, VT) == 0                                  # a hidden window's field
+    window[0x8f] = 1
+    button = comp()
+    link(button, window)
+    tree(button, root)
+    assert typing_in(core, VT) == 0                                  # a button has focus
+    orphan = comp(vt=VT, editing=1)
+    tree(orphan, root)
+    assert typing_in(core, VT) == 0                                  # not under the root
+    tree(None, root)
+    assert typing_in(core, VT) == 0 and typing_in(None, VT) == 0      # nothing focused, no core
+    C.c_uint64.from_buffer(core, 0x2e0).value = 0x10
+    assert typing_in(core, VT) == 1                                  # unreadable: leave M to the game
+    print('PASS: M key: a plain press toggles and is taken with its repeats and release; typing, Shift/Ctrl/Alt/GUI '
+          'and other keys go to the game; the typing walk follows focus to the root through visible parents and '
+          'needs an editing CTextInputField; an unreadable walk leaves the key to the game')
+
+
+# ---- the world's climate colouring ---------------------------------------------
+
+def msvc_string(buf, off, text, keep):
+    """An MSVC std::string at buf+off: inline when it fits in 15 bytes, else on the heap."""
+    raw = text.encode()
+    if len(raw) <= 15:
+        C.memmove(C.addressof(buf) + off, raw, len(raw))
+        cap = 15
+    else:
+        heap = C.create_string_buffer(raw, len(raw) + 1)
+        keep.append(heap)
+        C.c_uint64.from_buffer(buf, off).value = C.addressof(heap)
+        cap = len(raw)
+    C.c_uint64.from_buffer(buf, off + 0x10).value = len(raw)
+    C.c_uint64.from_buffer(buf, off + 0x18).value = cap
+
+
+def check_climate():
+    keep = []
+
+    def world(climate_id, climates):
+        """CGameUI -> +0x448 game -> +0x150 GameRes; +0x10 cfg (id at +0x938); +0xd8 ClimateRep."""
+        entries = (C.c_uint8 * (0x30 * len(climates)))()
+        for i, (cname, levels, water, variant) in enumerate(climates):
+            msvc_string(entries, i * 0x30, cname, keep)
+            desc = (C.c_uint8 * 0x200)()
+            pc = 0xc8
+            if levels is not None:
+                arr = (C.c_float * (4 * len(levels)))(*[v for (r, g, b, h) in levels for v in (r / 255, g / 255, b / 255, h)])
+                keep.append(arr)
+                C.c_uint64.from_buffer(desc, pc).value = C.addressof(arr)
+                C.c_uint64.from_buffer(desc, pc + 8).value = C.addressof(arr) + 16 * len(levels)
+            desc[pc + 0x38] = variant
+            # the default ctor (0x36d810) fills every colour; a climate overrides some
+            defaults = [(100, 135, 158), (60, 80, 91), (204, 230, 255), (255, 255, 204)]
+            for k, col in enumerate((water or []) + defaults[len(water or []):]):
+                for j in range(3):
+                    C.c_float.from_buffer(desc, pc + 0x40 + k * 0xc + j * 4).value = col[j] / 255
+            keep.append(desc)
+            C.c_uint64.from_buffer(entries, i * 0x30 + 0x20).value = C.addressof(desc)
+        rep = (C.c_uint8 * 0x60)()
+        C.c_uint64.from_buffer(rep, 0x28).value = C.addressof(entries)
+        C.c_uint64.from_buffer(rep, 0x30).value = C.addressof(entries) + C.sizeof(entries)
+        cfg = (C.c_uint8 * 0x9d0)()
+        msvc_string(cfg, 0x938, climate_id, keep)
+        res = (C.c_uint8 * 0x100)()
+        C.c_uint64.from_buffer(res, 0x10).value = C.addressof(cfg)
+        C.c_uint64.from_buffer(res, 0xd8).value = C.addressof(rep)
+        game = (C.c_uint8 * 0x200)()
+        C.c_uint64.from_buffer(game, 0x150).value = C.addressof(res)
+        ui = (C.c_uint8 * 0x500)()
+        C.c_uint64.from_buffer(ui, 0x448).value = C.addressof(game)
+        keep.extend([entries, rep, cfg, res, game, ui])
+        return ui
+
+    def read(ui):
+        out = (C.c_float * 77)()
+        name = C.create_string_buffer(64)
+        rc = climate_colouring(ui, out, name, 64)
+        return rc, list(out), name.value.decode()
+
+    dry = [(165, 129, 85, 0.0), (175, 153, 105, 150.0), (124, 121, 85, 250.0), (125, 126, 98, 350.0), (242, 235, 220, 550.0)]
+    tropical_water = [(60, 201, 214), (5, 56, 89)]
+    climates = [('temperate.clima.lua', None, None, 0xff),
+                ('dry.clima.lua', dry, None, 1),
+                ('tropical.clima.lua', [(232, 209, 142, 0.0), (93, 112, 66, 1.0)], tropical_water, 1)]
+
+    rc, out, name = read(world('dry.clima.lua', climates))
+    assert rc == 1 and name == 'dry.clima.lua' and out[0] == 5, (rc, name, out[0])
+    for i, (r, g, b, h) in enumerate(dry):
+        assert out[1 + i * 4] == h and all(abs(out[2 + i * 4 + k] - v / 255) < 1e-6 for k, v in enumerate((r, g, b))), i
+    assert abs(out[65] - 100 / 255) < 1e-6, 'dry keeps the default water'
+    rc, out, name = read(world('tropical.clima.lua', climates))
+    assert rc == 1 and out[0] == 2 and abs(out[65] - 60 / 255) < 1e-6 and abs(out[68] - 5 / 255) < 1e-6, out[65:71]
+    rc, out, name = read(world('temperate.clima.lua', climates))   # no levels: the default ramp
+    assert rc == 1 and out[0] == 3 and abs(out[2] - 93 / 255) < 1e-6
+    rc, out, name = read(world('a_mod_climate_with_a_long_name.clima.lua', climates))   # heap string, no match
+    assert rc == 0 and out[0] == 3
+    rc, out, _ = read(None)
+    assert rc == 0 and out[0] == 3
+    bad = world('dry.clima.lua', climates)
+    C.c_uint64.from_buffer(bad, 0x448).value = 0x10   # a pointer into nothing: the fault is caught
+    rc, out, _ = read(bad)
+    assert rc == 0 and out[0] == 3
+    print('PASS: climate colouring: the world\'s climate found by its id (inline and heap strings); dry levels, '
+          'tropical water, temperate and unknown climates keep the default ramp; null and faulting walks keep the default')
+
 
 # ---- installer --------------------------------------------------------------
 
@@ -515,10 +746,11 @@ def check_installer(tmp):
     src = SCRIPT.read_bytes().replace(b'\r\n', b'\n')
     sites = [0x22b4610, 0x5a2900, 0x22b4350, 0x33d130, 0x8bb7f0, 0x8bb820, 0x5a2999,
              0x33d270, 0x33d280, 0x33d560, 0x33d7f0, 0x33d540]
+    climate_sites = [0x5a2959, 0x5a29a4, 0x5a2fa3, 0x318533, 0x318574, 0x36eba9]
 
     events.clear()
     assert install(C.byref(host), 0, 1, str(script))
-    assert [e[1] for e in events if e[0] == 'verify'] == sites
+    assert [e[1] for e in events if e[0] == 'verify'] == sites + climate_sites
     assert [(e[1], e[2]) for e in events if e[0] == 'hook'] == [(0x5a2900, 20), (0x22b4610, 20)]
     assert script.read_bytes() == src
 
@@ -534,6 +766,11 @@ def check_installer(tmp):
         events.clear()
         assert not install(C.byref(host), 0, 1, str(script))
         assert not [e for e in events if e[0] == 'hook'] and not script.exists(), hex(rva)
+    # A climate site that does not verify costs only the climate colours: the minimap stays on.
+    for rva in climate_sites:
+        failure = ('verify', rva)
+        events.clear()
+        assert install(C.byref(host), 0, 1, str(script)) and script.read_bytes() == src, hex(rva)
     failure = ('hook', 0x5a2900)
     script.write_bytes(src)
     events.clear()
@@ -544,9 +781,9 @@ def check_installer(tmp):
     assert not install(C.byref(host), 0, 1, str(script)) and not script.exists()
     failure = None
     assert not errors, errors
-    print('PASS: installer verifies all 12 pinned sites against the Steam exe (whole-instruction 20-byte steals, '
+    print('PASS: installer verifies all 12 pinned sites and the 6 climate sites against the Steam exe (whole-instruction 20-byte steals, '
           'nothing RIP-relative), hooks capture before image, writes the script only when both hooks install, '
-          'and removes it when off, on GOG, on any mismatch or hook failure')
+          'and removes it when off, on GOG, on any mismatch or hook failure; a climate mismatch keeps the minimap')
 
 
 # ---- network overlay ----------------------------------------------------------
@@ -662,6 +899,7 @@ end
 function Comp:setMinimumSize(s) self.minSize = { w = s.w, h = s.h } end
 function Comp:setMaximumSize(s) self.maxSize = { w = s.w, h = s.h } end
 function Comp:setTooltip(t) self.tooltip = t end
+function Comp:setStyleClassList(l) self.styleClasses = l end
 function Comp:insertMouseListener(f) table.insert(self.listeners, f) end
 function Comp:setImage(p, b) self.image = p; IMAGES[#IMAGES + 1] = p end
 function Comp:setText(t) self.text = t end
@@ -930,6 +1168,7 @@ end
 script.guiInit()
 local button = toolbar.items[1]
 assert(button and button.kind == "ToggleButton", "button inserted at the front of the toolbar")
+assert(button.styleClasses and button.styleClasses[1] == "bigmapToolbarDisk", "button in the game's round disk")
 R.buttonIcon = button.arg.arg
 script.guiUpdate()
 assert(#toolbar.items == 1, "button added once")
@@ -1057,7 +1296,7 @@ def check_lua_variant(text, scale, centre, sw, sh, auto, cfg_scale, guess, owner
     rect, size, relief = (C.c_double * 4)(), (C.c_int * 2)(), C.c_double()
     assert parse(R.token.encode(), rect, size, C.byref(relief)), R.token
     assert list(rect) == [-32768, -16384, 32768, 16384] and list(size) == [1024, 512] and relief.value == 4, R.token
-    assert R.buttonIcon == 'ui/button/medium/terrain@2x.tga', R.buttonIcon
+    assert R.buttonIcon == 'ui/bigmap/minimap_button@2x.tga', R.buttonIcon
     assert R.windowVisible
     cr, ir = list(R.cr.values()), list(R.ir.values())
     assert abs(ir[0] - cr[0]) <= tol and abs(ir[1] - cr[1]) <= tol, (cr, ir, logs)
@@ -1245,6 +1484,8 @@ def main():
     check_detour(t)
     check_network(t)
     check_thunk()
+    check_climate()
+    check_key()
     with tempfile.TemporaryDirectory() as td:
         check_script_sync(Path(td))
         check_installer(Path(td))

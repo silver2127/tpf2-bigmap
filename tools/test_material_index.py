@@ -130,7 +130,7 @@ def main():
     from test_world_entry import Host,logtype,basetype,verifytype,hooktype
     install=dll.BigmapTestInstallMaterialIndex
     install.argtypes=[C.POINTER(Host),C.c_int,C.c_int]
-    for failure in ('none','disabled','gog','verify','hook'):
+    for failure in ('none','disabled','verify','hook'):
         events,errors=[],[]
         @logtype
         def log(fmt): pass

@@ -52,8 +52,22 @@ def main():
     tight=dll.BigmapTestCommitTightBytes;tight.argtypes=[C.c_uint64];tight.restype=C.c_uint64
     for phys,want in [(0,12*G),(8*G,2*G),(16*G,(16*G)//7),(32*G,(32*G)//7),(94*G,12*G),(512*G,12*G)]:
         assert headroom(phys)==want,(phys,headroom(phys),want)
-    for phys,want in [(0,10*G),(8*G,2*G),(16*G,2*G),(32*G,4*G),(94*G,10*G)]:
+    for phys,want in [(0,3*G),(8*G,2*G),(16*G,2*G),(20*G,int(2.5*G)),(24*G,3*G),(32*G,3*G),(94*G,3*G)]:
         assert tight(phys)==want,(phys,tight(phys),want)
+    # Commit tight: give back only the deficit (threshold + 1 GiB - free commit),
+    # from what is resident now; never grow; 256 MiB while loading or under half
+    # the threshold. The reported player: 32 GiB, threshold 4 GiB.
+    tb=dll.BigmapTestTightBudgetMB;tb.argtypes=[C.c_int,C.c_uint64,C.c_uint64,C.c_uint64,C.c_int];tb.restype=C.c_int
+    M=1024*1024
+    for args,want in [((2724,2724*M,int(3.5*G),4*G,0),1188),   # 1.5 GiB short: give back 1.5 GiB, not 90%
+                      ((2724,2724*M,4*G,4*G,0),1700),           # at the threshold: 1 GiB margin
+                      ((2724,2724*M,6*G,4*G,0),2724),           # above threshold + margin (sticky): hold, never grow
+                      ((2000,2724*M,6*G,4*G,0),2000),           # eviction lags: never above the current target
+                      ((2724,2724*M,int(1.9*G),4*G,0),256),     # under half the threshold: the emergency floor
+                      ((2724,2724*M,int(3.5*G),4*G,1),256),     # a load burst: the floor, as measured
+                      ((2724,1024*M,int(3.5*G),4*G,0),256),     # holds less than the deficit: the floor
+                      ((300,300*M,int(3.9*G),4*G,0),256)]:      # never below 256
+        assert tb(*args)==want,(args,tb(*args),want)
     assert live(1024,4096,1,0,16*G,20000,32*G)==8192
     assert live(1024,4096,1,0,5*G,20000,32*G)==4096      # under the 4.6 GiB headroom: warm is the floor
     assert live(1024,4096,1,0,16*G,20000,96*G)==4096     # a big machine keeps its measured 12 GiB
@@ -82,6 +96,40 @@ def main():
                       ((9000,1092,1092,150,8*G,32*G,3),9000),   # 8 GiB free: hold under a 10.2 GiB ceiling
                       ((9000,1092,1092,500,8*G,32*G,3),10125)]: # ... or grow by 1/8 inside it
         assert steady(*args)==want,(args,steady(*args),want)
+    # Second chances (2026-11-22, a 224 x 224 GOG save on 32 GiB): the target sat at
+    # the 1055 MiB hot budget with ~2,200 MiB resident and ~2,700 second-chance
+    # faults/s, because only cold decodes counted. They now count 1/8 of a decode,
+    # and the room counts what is resident.
+    soft=dll.BigmapTestTerrainBudgetSteadySoft
+    soft.argtypes=[C.c_int]*3+[C.c_uint64]*3+[C.c_uint]+[C.c_uint64]*2+[C.POINTER(C.c_int)]
+    free47=int(4.7*G)
+    assert soft(1055,1055,1055,0,free47,32*G,3,0,2200,None)==1055          # no second chances: unchanged
+    assert soft(1055,1055,1055,0,free47,32*G,3,2700,2200,None)==2200       # 2,700/s, nearly no cold restores: cover what is resident at once
+    assert soft(1055,1055,1055,0,free47,32*G,3,2700,1055,None)==1186       # nothing more resident: grow by 1/8 (337 decode equivalents)
+    assert soft(1055,1055,1055,0,free47,32*G,3,1600,2200,None)==1055       # 200 equivalents: hold
+    # A closed loop: second chances last while the target is under the ~2,200 MiB in
+    # use (a few hundred cold ones remain above it), and free RAM falls by whatever
+    # the pager holds beyond what was already resident.
+    def climb(resident_arg, seconds=60):
+        t,ws,seen=1055,C.c_int(0),[]
+        for _ in range(seconds):
+            held=max(t,2200)
+            avail=free47-((held-2200)<<20)
+            rate=2700 if t<2200 else 300
+            t=soft(t,1055,1055,0,avail,32*G,3,rate,resident_arg(t),C.byref(ws)); seen.append(t)
+        return t,seen
+    t,seen=climb(lambda t: max(t,2200))
+    assert 2200<=t<=2800,(t,seen)                                     # settles on the set in use, not far above it
+    assert min(seen[-30:])>=2190,seen                                 # and stays there: the working-set floor decays 1/256 a quiet second, so it dips a few MiB under before the next climb
+    # Under pressure (4.0 GiB free < 4.57 GiB headroom on 32 GiB), the same save the
+    # next session: the cut kept the target at hot while 2,200 MiB stayed resident.
+    free40=4*G
+    assert soft(1055,1055,1055,50,free40,32*G,3,2800,2200,None)==2200    # covers what is resident, no more
+    assert soft(1055,1055,1055,50,free40,32*G,3,2800,9000,None)<=2266    # never above the ceiling (room 6.1 GiB - 4.57 reserve, 3/4 on top of hot)
+    assert soft(1055,1055,1055,500,free40,32*G,3,2800,2200,None)==1055   # real decodes under pressure: the cut still wins
+    assert soft(2000,1055,1055,0,free40,32*G,3,0,2200,None)<2000         # no second chances: pressure shrinks as before
+    # the old call (no soft rate, no resident size) behaves exactly as before
+    assert soft(9000,1092,1092,500,8*G,32*G,3,0,0,None)==steady(9000,1092,1092,500,8*G,32*G,3)
     # Adaptive eviction rate: cost cap (a quarter core), stall halving, quiet growth.
     step=dll.BigmapTestEvictRateStep;step.argtypes=[C.POINTER(C.c_uint),C.POINTER(C.c_uint),C.POINTER(C.c_uint64),C.c_uint64,C.c_uint,C.c_int,C.c_uint];step.restype=C.c_uint
     def run(rate,quiet,avg,stalls,ui,ceil,cost=0):

@@ -94,6 +94,9 @@ static TerrainResizeFn g_originalTerrainResize;
 static TerrainCopyFn g_originalTerrainCopy;
 static TerrainDestroyFn g_originalTerrainDestroy;
 static uintptr_t g_terrainCompressionBase;
+// Running addresses of the three filtered call sites (Steam RVAs translated
+// through GameRva at install, so the GOG build matches its own return addresses).
+static uintptr_t g_terrainRetAlignResult,g_terrainRetAddTile,g_terrainRetCopy;
 static void ResizeTerrainOwned(TerrainOwnedVector* v,size_t n,bool eligible,bool toSmall=false) {
     using namespace TerrainPager;
     if(SmallPager::Contains(v->first)) {
@@ -131,9 +134,9 @@ static void __fastcall TerrainCompressedResize(TerrainOwnedVector* v,size_t n) {
     // peak); a plain vector, released through the CRT free import that
     // terrain_blocks.h routes to the pager, so only with terrain_blocks on.
     auto ret=reinterpret_cast<uintptr_t>(_ReturnAddress());
-    bool result=ret==g_terrainCompressionBase+0xaac4d9;
+    bool result=ret==g_terrainRetAlignResult;
     if(result)InterlockedIncrement64(&g_resultResizes);
-    bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) && ret==g_terrainCompressionBase+0x33ccaa;
+    bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) && ret==g_terrainRetAddTile;
     bool toSmall=result && InterlockedCompareExchange(&g_smallPagerActive,0,0);
     ResizeTerrainOwned(v,n,eligible,toSmall);
 }
@@ -165,7 +168,7 @@ static TerrainOwnedVector* CopyTerrainOwned(TerrainOwnedVector* dst,const Terrai
 }
 static TerrainOwnedVector* __fastcall TerrainCompressedCopy(TerrainOwnedVector* dst,const TerrainOwnedVector* src) {
     bool eligible=InterlockedCompareExchange(&g_terrainCompressActive,0,0) &&
-        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_terrainCompressionBase+0x33dd91;
+        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_terrainRetCopy;
     return CopyTerrainOwned(dst,src,eligible);
 }
 static void __fastcall TerrainCompressedDestroy(void* control) {
@@ -206,16 +209,23 @@ static uint64_t PagerHeadroom(uint64_t physical) {
     return h;
 }
 // Free commit below which the pagers back off hard (256 MiB, urgent, throttled):
-// physical/8, clamped to 2..10 GiB. 10 GiB was MEASURED on the 94 GiB box (6
-// came too late, before the alignment pass was batched); a 32 GiB machine with
-// a system-managed page file rarely has 10 GiB of free commit with a big save
-// loaded and would sit throttled for the whole session. Unknown size: 10 GiB.
+// physical/8, clamped to 2..3 GiB (commit_tight_mb overrides). 4 GiB until
+// 2026-09-28, lowered on request to use more of the commit charge. It was 2..10 GiB:
+// 10 GiB was measured on the 94 GiB box before the alignment pass was batched
+// (6 came too late then). With the pass batched and a throttled load evicting on
+// the loading path, 10 GiB only kept that box -- 80 of 94 GB committed by other
+// programs, 33 GB of RAM free -- in the tight budget for whole loads
+// (2026-09-28: two instances, 256 MiB each, 393 s of throttle). A 32 GiB
+// machine with a system-managed page file rarely has 10 GiB of free commit with
+// a big save loaded either. Unknown size: 3 GiB.
+static int g_commitTightMB = 0;        // commit_tight_mb: 0 = automatic
 static uint64_t CommitTightBytes(uint64_t physical) {
     constexpr uint64_t GiB=1024ull*1024*1024;
-    if(!physical)return 10*GiB;
+    if(g_commitTightMB>0)return uint64_t(g_commitTightMB)<<20;
+    if(!physical)return 3*GiB;
     uint64_t t=physical/8;
     if(t<2*GiB)t=2*GiB;
-    if(t>10*GiB)t=10*GiB;
+    if(t>3*GiB)t=3*GiB;
     return t;
 }
 // The automatic resident cap, the same on every machine that can afford it:
@@ -260,6 +270,30 @@ static bool CommitTightSticky(CommitTightState& st,bool raw,uint64_t availPageFi
         st.tight=false;
     }
     return false;
+}
+// THE BUDGET WHILE COMMIT IS TIGHT (2026-09-28). It used to be a flat 256 MiB:
+// every tight second evicted ~90% of the terrain, and the camera decoded it
+// back -- the stutter a player reported on a 49,928-tile map with a small page
+// file (6 tight episodes in a session at 9-11 GB of free RAM, 20,626 -> 1,995
+// resident tiles each time, 195,000 re-decodes). Evicting a tile gives its
+// commit back one for one, so the pager now only lets go of what brings free
+// commit back over the threshold plus a margin, measured from what it holds
+// now (eviction lags the budget, so it never compounds second over second),
+// and never grows while the flag is set. The flat 256 MiB stays where it was
+// measured to be needed: a load burst (sections are created faster than they
+// encode), and free commit under half the threshold (the game's own next
+// allocation is at risk).
+static int TightBudgetMB(int effectiveMB,uint64_t residentBytes,uint64_t availPageFile,uint64_t threshold,bool loading) {
+    constexpr uint64_t MiB=1024ull*1024,GiB=1024*MiB;
+    const int floorMB=256;
+    if(loading || availPageFile<threshold/2)return floorMB;
+    const uint64_t want=threshold+GiB;
+    const uint64_t deficit=availPageFile<want?want-availPageFile:0;
+    uint64_t target=residentBytes>deficit?residentBytes-deficit:0;
+    int next=int((target+MiB-1)/MiB);
+    if(next>effectiveMB)next=effectiveMB;
+    if(next<floorMB)next=floorMB;
+    return next;
 }
 static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t available,uint64_t liveMB=0,uint64_t physical=0) {
     // Memory pressure overrides the warmup allowance. Available RAM is sampled
@@ -314,15 +348,28 @@ static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t availab
 //   1.6 GiB under 1,000-2,100 cold restores/s -- each quiet second drifted
 //   1/16 toward hot, the next burst grew 1/8, and the engine faulted the same
 //   tiles back in over and over. A real 32 GiB machine runs exactly that.
+// - Second chances count (2026-11-22): `softPerSec` is the faults a protection
+//   change alone satisfied (an aged tile the engine touched again), weighted
+//   1/8 of a decode. MEASURED on a 224 x 224 GOG save: the target sat at the
+//   1055 MiB hot budget under ~17,000 tiles (2.2 GiB) in use, with ~2,800
+//   faults/s, 95% of them second chances the rules above never saw, so the
+//   pager never grew; a 2560 MiB budget cut that to ~350/s.
+// - Room counts what is resident (`residentMB`) when that exceeds the target:
+//   tiles in their second chance are still in RAM, so keeping them costs
+//   nothing. (On that save the second-chance demand was what was missing; the
+//   ceiling grows with the target anyway, so this only matters for a first step.)
 // The result never goes below `next`, so the configured budget stays a floor.
-static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical=0,unsigned shareQuarters=2,int* wsFloor=nullptr) {
+static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical=0,unsigned shareQuarters=2,int* wsFloor=nullptr,uint64_t softPerSec=0,uint64_t residentMB=0) {
     uint64_t headroom=PagerHeadroom(physical);
+    const uint64_t coldPerSec=decodesPerSec;
+    decodesPerSec+=softPerSec/8;   // demand, in decode equivalents
     // RAM this pager could own: what is free now PLUS what it holds itself.
     // Counting free RAM alone starved the pager on a full machine: its own
     // resident set made "free" small, the ceiling fell to the hot budget, the
     // pager evicted, and the engine faulted the evicted tiles back in through
     // a decode each (the 32 GiB case of 2026-09-17).
-    uint64_t room=available+(uint64_t(prev)<<20);
+    uint64_t held=residentMB>uint64_t(prev)?residentMB:uint64_t(prev);
+    uint64_t room=available+(held<<20);
     uint64_t reserve=room/4>headroom?room/4:headroom;
     // The terrain pager takes 3/4 of the spare, the material pager 1/2 (their
     // sum overshoots by a quarter at most; the pressure rule below takes it back).
@@ -337,6 +384,14 @@ static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,
     // per second whatever the decode feedback says. Paging the engine out is
     // worse than any decode.
     if(available<headroom){int cut=prev/8>128?prev/8:128;int forced=prev-cut>next?prev-cut:next;if(target>forced)target=forced;}
+    // Second chances under pressure (MEASURED the same day, free RAM 4.0-4.5 GiB
+    // under a 4.57 GiB headroom): the pressure cut held the target at 1055 MiB
+    // while ~17,000 tiles (2.2 GiB) stayed resident anyway -- the engine touched
+    // each again inside its second chance, so the cut freed nothing and cost
+    // ~2,900 protection faults/s. When the demand is nearly all second chances
+    // (few cold restores), the target may cover what is already resident, never
+    // more and never above the ceiling: no RAM is taken, only the churn stops.
+    if(softPerSec/8>=300 && coldPerSec<100 && residentMB>uint64_t(target) && residentMB<=uint64_t(ceiling))target=int(residentMB);
     if(target>ceiling)target=ceiling;
     if(wsFloor) {
         if(decodesPerSec>=300 && target>*wsFloor)*wsFloor=target;
@@ -384,7 +439,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             bool haveStatus=PagerMemoryStatus(&m)!=0;
             uint64_t available=haveStatus?(m.ullAvailPhys<m.ullAvailPageFile?m.ullAvailPhys:m.ullAvailPageFile):0;
             static const uint64_t physical=InstalledPhysicalBytes();
-            // Sized to the machine (CommitTightBytes): 10 GiB here, 4 GiB on 32 GiB;
+            // Sized to the machine (CommitTightBytes): 3 GiB here and from 24 GiB, 2 on 16;
             // sticky (CommitTightSticky), so this pager's own release cannot clear it.
             static CommitTightState tightState;
             bool commitTight=haveStatus && CommitTightSticky(tightState,m.ullAvailPageFile<CommitTightBytes(physical),m.ullAvailPageFile,
@@ -407,8 +462,17 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // Cold restores in the last second: faults minus the ones a
             // protection change alone satisfied.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
+            static uint64_t lastSoft=0;uint64_t softPerSec=s.softRescues-lastSoft;lastSoft=s.softRescues;
             TerrainPager::SetUrgent(commitTight||pressure);
-            TerrainPager::SetThrottle(commitTight);
+            // THE THROTTLE IS FOR LOAD BURSTS (2026-09-22). It makes a fault that needs a
+            // new section sleep, up to 2 s, while the pool is over budget -- the answer to
+            // a load creating ~30,000 sections a second. On a running or paused world it
+            // only froze the game: a PC at 80 of 94 GB committed (no page file, other
+            // programs holding most of it) kept commit_tight on, and every tile the camera
+            // needed waited ~2 s (throttle_waits=1957, throttle_ms=3,862,828 on a live-join
+            // host that looked hung). Eviction stays urgent under a tight commit charge;
+            // only the sleep is limited to loading.
+            TerrainPager::SetThrottle(commitTight && (busy||bulk||loading));
             if(InterlockedCompareExchange(&g_smallPagerActive,0,0)) {
                 // No loading allowance here: MEASURED 2026-09-17, with the tile
                 // pager's allowance the small pager kept 2.28 million spans
@@ -417,14 +481,14 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
                 // drains it to 64 MiB.
                 int smallNext=commitTight?64:g_smallHotMB;
                 SmallPager::SetBudget(size_t(smallNext)*1024*1024);
-                SmallPager::SetThrottle(commitTight);
+                SmallPager::SetThrottle(commitTight && (busy||bulk||loading));
                 if(smallNext!=smallEffectiveMB)H->log("small pager: resident target %d -> %d MiB (commit_tight=%d)",smallEffectiveMB,smallNext,int(commitTight));
                 smallEffectiveMB=smallNext;
             }
-            if(commitTight && next>256)next=256;
+            if(commitTight)next=TightBudgetMB(effectiveMB,s.resident*TerrainPager::SlotBytes,m.ullAvailPageFile,CommitTightBytes(physical),busy||bulk||loading);
             else if(!(busy||bulk||loading)) {
                 static int wsFloor=0;
-                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3,&wsFloor);
+                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3,&wsFloor,softPerSec,(s.resident*TerrainPager::SlotBytes)>>20);
                 if(steady>effectiveMB && decodesPerSec>=300 && now-lastStutterLog>=10000) {
                     lastStutterLog=now;
                     H->log("terrain compression: %llu cold restores/s, resident target %d -> %d MiB (working set exceeds the budget)",decodesPerSec,effectiveMB,steady);
@@ -458,7 +522,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
         }
         if(now-lastLog>=30000) {
             lastLog=now;auto s=TerrainPager::Snapshot();
-            char serve[256];TerrainServeStatus(serve,sizeof serve);
+            char serve[448];TerrainServeStatus(serve,sizeof serve);
             if(s.live)H->log("terrain compression: live=%llu resident=%llu backing=%.1f MiB compressed=%.1f MiB encoded_commit=%.1f MiB faults=%llu evictions=%llu failures=%llu encodes=%llu reused=%llu writes=%llu shared_clones=%llu slot_overflows=%llu soft_blocked=%llu soft_rescues=%llu cancelled=%llu cow_shared=%llu cow_slots=%llu cow_privatized=%llu cow_privatize_mb=%.1f dedup_hits=%llu dedup_rebuilds=%llu restore_retries=%llu restore_giveups=%llu rate_limited=%llu evict_rate=%u/s evict_us=%llu lazy=%llu throttle_waits=%llu throttle_ms=%llu blocks=%lld block_releases=%lld block_stray=%lld block_calls=%lld block_sized=%lld result_resizes=%lld%s",
                 s.live,s.resident,double(s.resident*TerrainPager::SlotBytes)/(1024*1024),
                 double(s.compressedBytes)/(1024*1024),double(s.compressedCommit)/(1024*1024),s.faults,s.evictions,s.failures,
@@ -492,15 +556,15 @@ static bool InstallTerrainCompression() {
         H->log("terrain compression: auto budgets for %llu MiB RAM -> hot %d MiB, warm %d MiB",
                (unsigned long long)(total>>20),g_terrainHotMB,g_terrainWarmMB);
     }
-    if(g_gog || g_terrainCompress!=1 || g_terrainCacheSpacing!=1 || g_terrainHotMB<128 || g_terrainHotMB>8192 || g_terrainWarmMB<0 || g_terrainWarmMB>8192) {
-        H->log("terrain compression: requires Steam, spacing=1, compress=1, hot_mb=128..8192, warm_mb=0..8192; OFF");return false;
+    if(g_terrainCompress!=1 || g_terrainCacheSpacing!=1 || g_terrainHotMB<128 || g_terrainHotMB>8192 || g_terrainWarmMB<0 || g_terrainWarmMB>8192) {
+        H->log("terrain compression: requires spacing=1, compress=1, hot_mb=128..8192, warm_mb=0..8192; OFF");return false;
     }
     if(!H->verifyBytes(0x1d5c50,kTerrainResizeBytes,sizeof kTerrainResizeBytes) ||
        !H->verifyBytes(0x1dedd0,kTerrainCopyBytes,sizeof kTerrainCopyBytes) ||
        !H->verifyBytes(0x33de30,kTerrainDestroyBytes,sizeof kTerrainDestroyBytes) ||
        !H->verifyBytes(0x33cca5,kTerrainResizeCall,sizeof kTerrainResizeCall) ||
        !H->verifyBytes(0x33dd8c,kTerrainCopyCall,sizeof kTerrainCopyCall)) {
-        H->log("terrain compression: Steam byte mismatch; OFF");return false;
+        H->log("terrain compression: byte mismatch; OFF");return false;
     }
     if(!TerrainPager::Init(size_t(g_terrainHotMB)*1024*1024)) {
         H->log("terrain compression: placeholder/handler initialization failed; OFF");return false;
@@ -509,6 +573,9 @@ static bool InstallTerrainCompression() {
     if(g_terrainDedup && !TerrainPager::EnableDedup()){H->log("terrain compression: dedup index allocation failed; dedup OFF");g_terrainDedup=0;}
     if(g_terrainLazyZero && !TerrainPager::EnableLazyZero()){H->log("terrain compression: zero blob encode failed; lazy zero OFF");g_terrainLazyZero=0;}
     g_terrainCompressionBase=H->moduleBase();
+    g_terrainRetAlignResult=g_terrainCompressionBase+GameRva(0xaac4d9);
+    g_terrainRetAddTile=g_terrainCompressionBase+GameRva(0x33ccaa);
+    g_terrainRetCopy=g_terrainCompressionBase+GameRva(0x33dd91);
     // Destruction first; allocation remains disabled until EVERY hook and the
     // worker succeed. Partial installation cannot create managed allocations.
     if(!H->installHook(H->moduleBase()+0x33de30,reinterpret_cast<void*>(TerrainCompressedDestroy),sizeof kTerrainDestroyBytes,reinterpret_cast<void**>(&g_originalTerrainDestroy)) ||
@@ -546,11 +613,13 @@ extern "C" __declspec(dllexport) unsigned BigmapTestUiStalls(const uint64_t* sta
     UiStallMeter m;for(int i=0;i<n;++i)m.Sample(stamps[i]);return m.Take();
 }
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical,unsigned share){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available,physical,share);}
+extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteadySoft(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical,unsigned share,uint64_t softPerSec,uint64_t residentMB,int* wsFloor){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available,physical,share,wsFloor,softPerSec,residentMB);}
 extern "C" __declspec(dllexport) uint64_t BigmapTestPagerHeadroom(uint64_t physical){return PagerHeadroom(physical);}
 extern "C" __declspec(dllexport) uint64_t BigmapTestCommitTightBytes(uint64_t physical){return CommitTightBytes(physical);}
+extern "C" __declspec(dllexport) int BigmapTestTightBudgetMB(int effectiveMB,uint64_t residentBytes,uint64_t availPageFile,uint64_t threshold,int loading){return TightBudgetMB(effectiveMB,residentBytes,availPageFile,threshold,loading!=0);}
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetLive(int hot,int warm,int busy,int bulk,uint64_t available,uint64_t liveMB,uint64_t physical){return TerrainBudgetMB(hot,warm,busy!=0,bulk!=0,available,liveMB,physical);}
 extern "C" __declspec(dllexport) int BigmapTestWarmUpdate(TerrainWarmup* state,uint64_t now,int busy,uint64_t bulk,uint64_t ui,int signal){return state->Update(now,busy!=0,bulk,ui,signal!=0);}
 extern "C" __declspec(dllexport) int BigmapTestInstallCompression(const Tpf2mpHost* host,int gog,int spacing,int enabled,int hotMB) {
     H=host;g_gog=gog!=0;g_terrainCacheSpacing=spacing;g_terrainCompress=enabled;g_terrainHotMB=hotMB;
-    return InstallTerrainCompression();
+    return RunWithSteamSites([]{return InstallTerrainCompression();});
 }

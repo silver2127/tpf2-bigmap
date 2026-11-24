@@ -14,6 +14,11 @@
     res\config\base_mod.lua              NOT installed: the plugin patches it at game start
                                          for the New Game density levels, and a full
                                          uninstall puts the stock file back
+    mods\bigmap_fade_fix_1\              the street fade fix shader mod (mod\bigmap_fade_fix_1
+                                         in the repository; docs\street-fade-fix.md). It
+                                         only appears in the game's mod list: enable it
+                                         there. Uninstall removes exactly these files and
+                                         leaves the rest of the game's mods folder alone.
 
   COEXISTENCE WITH TpF2 MULTIPLAYER
   Both packages need the alut.dll proxy and the plugin host, and both put
@@ -40,6 +45,7 @@
   <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
   <?ifndef BigmapDll ?><?define BigmapDll = "..\out\tpf2_bigmap.dll" ?><?endif?>
   <?ifndef BigmapCfg ?><?define BigmapCfg = "..\cfg\tpf2_bigmap.cfg" ?><?endif?>
+  <?ifndef FadeFixDir ?><?define FadeFixDir = "..\mod\bigmap_fade_fix_1" ?><?endif?>
 
   <Package Name="TpF2 Big Maps"
            Manufacturer="silver2127"
@@ -67,6 +73,19 @@
          lets them cross into the elevated half of a UAC-prompted install. -->
     <Property Id="TPF2_SKIP_GAMEDIR_CHECK" Secure="yes" />
 
+    <!-- Tells tpf2ca.dll's game-folder check that the GOG build of the game is
+         a supported target. The check knows the Steam 35924 executable values
+         and, with this set, the GOG 2024-12-12 ones as well; without it a GOG
+         folder is refused with GOG_MSG and TPF2_GAMEDIR_OK=0, after which the
+         wizard's Next button does nothing whatever the user does. The GOG
+         package sets it up front; a standard install can still opt in from the
+         command line with TPF2_ALLOW_GOG=1. -->
+    <?ifdef GogVariant ?>
+    <Property Id="TPF2_ALLOW_GOG" Value="1" Secure="yes" />
+    <?else?>
+    <Property Id="TPF2_ALLOW_GOG" Secure="yes" />
+    <?endif?>
+
     <!-- Default install folder. AppSearch rows for one property run in
          Signature order, last hit wins, hence the 1/2 prefixes: a folder
          remembered from an earlier install beats Steam's registration. -->
@@ -77,6 +96,18 @@
                       Name="InstallLocation"
                       Type="directory"
                       Bitness="always64" />
+      <?ifdef GogVariant ?>
+      <!-- GOG Galaxy and the GOG offline installer register the game here
+           (product 1129986694). "Search1_" sorts after "Search1S", so on the
+           GOG package a GOG copy beats a Steam one, and a remembered folder
+           still beats both. -->
+      <RegistrySearch Id="Search1_GogInstallPath"
+                      Root="HKLM"
+                      Key="SOFTWARE\WOW6432Node\GOG.com\Games\1129986694"
+                      Name="path"
+                      Type="directory"
+                      Bitness="always64" />
+      <?endif?>
       <RegistrySearch Id="Search2RememberedInstallFolder"
                       Root="HKLM"
                       Key="SOFTWARE\silver2127\TpF2 Big Maps"
@@ -93,6 +124,12 @@
           <Directory Name="common">
             <Directory Id="INSTALLFOLDER" Name="Transport Fever 2">
               <Directory Id="PluginsFolder" Name="plugins" />
+              <!-- The game's own mods folder (it holds Urban Games' campaign
+                   missions): no component lives in it directly, so an uninstall
+                   never tries to remove it, only the mod's own subfolders. -->
+              <Directory Id="ModsFolder" Name="mods">
+                <Directory Id="FadeFixFolder" Name="bigmap_fade_fix_1" />
+              </Directory>
             </Directory>
           </Directory>
         </Directory>
@@ -108,6 +145,7 @@
            removed when the last of the two products is uninstalled. -->
       <ComponentGroupRef Id="PluginHostShared" />
       <ComponentGroupRef Id="BigmapFiles" />
+      <ComponentGroupRef Id="FadeFixFiles" />
     </Feature>
 
     <!-- Custom actions and their sequencing: PluginHost.wxs, plus the one below. -->
@@ -151,6 +189,14 @@
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Big Maps" Name="Version" Type="string" Value="$(ProductVersion)" />
       </Component>
     </ComponentGroup>
+
+    <!-- The street fade fix: mod.lua, strings.lua and the five shaders, harvested
+         from the repository's mod folder so a new file there ships with no edit
+         here (components get stable generated GUIDs). It installs into the game's
+         mods folder, where the game lists it; enabling it is the player's step. -->
+    <ComponentGroup Id="FadeFixFiles" Directory="FadeFixFolder">
+      <Files Include="$(FadeFixDir)\**" />
+    </ComponentGroup>
   </Fragment>
 
   <!-- ===== WixUI_InstallDir with a game-folder check =====
@@ -159,7 +205,9 @@
        only moves on when TPF2_GAMEDIR_OK is not "0". The stock set cannot be
        extended in place: its Next-button events carry no condition, so a
        DoAction added beside them could never stop the wizard. Identical to
-       the TpF2 Multiplayer copy. -->
+       the TpF2 Multiplayer copy. The check itself is what differs between the
+       two builds of this package: the GOG variant sets TPF2_ALLOW_GOG so
+       tpf2ca.dll accepts the GOG executable as well as Steam's. -->
   <Fragment>
     <UI Id="WixUI_InstallDir_Tpf2">
       <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />

@@ -290,7 +290,7 @@ def main():
             if other.weights is not None and same.weights is not None:
                 other.weights[:] = same.weights
         compare(case, 'shared geometry')
-    print(f"PASS: identical geometry in all three targets (height ties, weight 1.0 branches)")
+    print("PASS: identical geometry in all three targets (height ties, weight 1.0 branches)")
 
     # 3. Arbitrary block shapes, cells, scales and offsets, many alignments.
     for _ in range(700):
@@ -300,7 +300,7 @@ def main():
         compare(build_case(rng, nrng, sx, sy, mix,
                            scale=rng.choice([0.05, 1.0, 0.001, 7.5, -0.05]),
                            offset=rng.choice([0.0, -1000.0, 1e4, -3.25])), 'random')
-    print(f"PASS: random block shapes 2..199, cell sizes, scales (incl. negative) and offsets")
+    print("PASS: random block shapes 2..199, cell sizes, scales (incl. negative) and offsets")
 
     # 4. Empty work: no alignments, empty triangle lists, alignments outside the block.
     for sx, sy in ((257, 257), (2, 2), (2, 300), (300, 2), (3, 7)):
@@ -333,7 +333,7 @@ def main():
     @FN
     def fallback(*args):
         calls.append(args)
-    base_case = build_case(rng, nrng, 16, 16, [('cover', 'ones', 1, 0)])
+    build_case(rng, nrng, 16, 16, [('cover', 'ones', 1, 0)])   # keeps the random stream the cases below were written against
 
     def forwarded(case, expect, label):
         calls.clear()
@@ -412,7 +412,7 @@ def main():
     install = dll.BigmapTestInstallTerrainAlign
     install.argtypes = [C.POINTER(Host), C.c_int, C.c_int]
     expected_verify = [(FUNC, len(PROLOGUE))] + REGIONS + [(rva, 16) for rva, _ in VTABLES]
-    failures = ['none', 'disabled', 'gog', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
+    failures = ['none', 'disabled', 'hook'] + [('verify', i) for i in range(len(expected_verify))]
     for failure in failures:
         events, errors = [], []
 
@@ -451,7 +451,7 @@ def main():
             assert events == wanted + [('hook',)], events
     print(f'PASS: installer verifies the 21-byte prologue (9 whole instructions, no RIP/branches), '
           f'{sum(n for _, n in REGIONS)} bytes of body/constructor/resize/constants and both predicate '
-          f'vtables at the running base; disabled, GOG, each mismatch and a hook failure refuse')
+          f'vtables at the running base; disabled, each mismatch and a hook failure refuse')
 
     # 9. Warm native microbenchmark (ctypes overhead included, identical for both).
     print(f'benchmark (257x257 block, per call, best of 5 rounds; {trapped} unused imports trapped):')

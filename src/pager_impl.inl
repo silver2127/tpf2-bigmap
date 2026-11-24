@@ -883,7 +883,12 @@ static void Tick(unsigned attempts=0) {
             // Loading: within 15 s of a burst of allocations the second-chance
             // delay (and the full minimum age) would only raise the peak.
             uint64_t tick=GetTickCount64();
-            loading=stats.lastBulkAllocation && tick-stats.lastBulkAllocation<15000;
+            // Faults THROTTLED (a load under a tight commit charge) are loading too:
+            // they sleep until the pool is under budget, and the steady path
+            // (soft block, evict after 3 s, only tiles idle 5 s) left every one
+            // sleeping its full 2 s -- a joiner's load at one tile a second
+            // (2026-09-28: throttle_ms +52 s per 26 tiles, 13k tiles to go).
+            loading=(stats.lastBulkAllocation && tick-stats.lastBulkAllocation<15000) || throttle;
             pressure=stats.resident>3*budgetSlots;
             if(tick-rateWindow>=1000){rateWindow=tick;rateCount=0;}
             limited=evictPerSecond && !loading && !urgent;
