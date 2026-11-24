@@ -147,11 +147,12 @@ static DWORD WINAPI MaterialCompressionWorker(void*) {
             // snapping (MEASURED 2026-09-17: the snap evicted 93,000 cells in 30 s
             // and the game stuttered), hold or grow while cells fault back in.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
+            static uint64_t lastSoft=0;uint64_t softPerSec=s.softRescues-lastSoft;lastSoft=s.softRescues;
             MaterialPager::SetUrgent(commitTight||pressure);
             // the throttle is for load bursts only (terrain_compression.h, same date)
             MaterialPager::SetThrottle(commitTight && (busy||bulk));
             if(commitTight)next=TightBudgetMB(effectiveMB,s.resident*MaterialPager::SlotBytes,m.ullAvailPageFile,CommitTightBytes(physical),busy||bulk);
-            else if(!(busy||bulk)){ static int wsFloor=0; next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2,&wsFloor); }
+            else if(!(busy||bulk)){ static int wsFloor=0; next=TerrainBudgetSteady(effectiveMB,next,g_materialHotMB,decodesPerSec,available,physical,2,&wsFloor,softPerSec,(s.resident*MaterialPager::SlotBytes)>>20); }
             { int cap=PagerCapMB(g_materialMaxMB,g_materialHotMB,physical,1); if(cap && next>cap)next=cap; }
             MaterialPager::SetBudget(size_t(next)*1024*1024);
             if(next!=effectiveMB && (next==g_materialHotMB||effectiveMB==g_materialHotMB||next-effectiveMB>=1024||effectiveMB-next>=1024))H->log("material compression: resident target %d -> %d MiB (generation=%d bulk_allocation=%d commit_tight=%d pressure=%d free=%llu MiB)",effectiveMB,next,int(busy),int(bulk),int(commitTight),int(pressure),(unsigned long long)(m.ullAvailPhys>>20));

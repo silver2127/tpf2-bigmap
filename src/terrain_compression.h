@@ -348,15 +348,28 @@ static int TerrainBudgetMB(int hot,int warm,bool busy,bool bulk,uint64_t availab
 //   1.6 GiB under 1,000-2,100 cold restores/s -- each quiet second drifted
 //   1/16 toward hot, the next burst grew 1/8, and the engine faulted the same
 //   tiles back in over and over. A real 32 GiB machine runs exactly that.
+// - Second chances count (2026-11-22): `softPerSec` is the faults a protection
+//   change alone satisfied (an aged tile the engine touched again), weighted
+//   1/8 of a decode. MEASURED on a 224 x 224 GOG save: the target sat at the
+//   1055 MiB hot budget under ~17,000 tiles (2.2 GiB) in use, with ~2,800
+//   faults/s, 95% of them second chances the rules above never saw, so the
+//   pager never grew; a 2560 MiB budget cut that to ~350/s.
+// - Room counts what is resident (`residentMB`) when that exceeds the target:
+//   tiles in their second chance are still in RAM, so keeping them costs
+//   nothing. (On that save the second-chance demand was what was missing; the
+//   ceiling grows with the target anyway, so this only matters for a first step.)
 // The result never goes below `next`, so the configured budget stays a floor.
-static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical=0,unsigned shareQuarters=2,int* wsFloor=nullptr) {
+static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical=0,unsigned shareQuarters=2,int* wsFloor=nullptr,uint64_t softPerSec=0,uint64_t residentMB=0) {
     uint64_t headroom=PagerHeadroom(physical);
+    const uint64_t coldPerSec=decodesPerSec;
+    decodesPerSec+=softPerSec/8;   // demand, in decode equivalents
     // RAM this pager could own: what is free now PLUS what it holds itself.
     // Counting free RAM alone starved the pager on a full machine: its own
     // resident set made "free" small, the ceiling fell to the hot budget, the
     // pager evicted, and the engine faulted the evicted tiles back in through
     // a decode each (the 32 GiB case of 2026-09-17).
-    uint64_t room=available+(uint64_t(prev)<<20);
+    uint64_t held=residentMB>uint64_t(prev)?residentMB:uint64_t(prev);
+    uint64_t room=available+(held<<20);
     uint64_t reserve=room/4>headroom?room/4:headroom;
     // The terrain pager takes 3/4 of the spare, the material pager 1/2 (their
     // sum overshoots by a quarter at most; the pressure rule below takes it back).
@@ -371,6 +384,14 @@ static int TerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,
     // per second whatever the decode feedback says. Paging the engine out is
     // worse than any decode.
     if(available<headroom){int cut=prev/8>128?prev/8:128;int forced=prev-cut>next?prev-cut:next;if(target>forced)target=forced;}
+    // Second chances under pressure (MEASURED the same day, free RAM 4.0-4.5 GiB
+    // under a 4.57 GiB headroom): the pressure cut held the target at 1055 MiB
+    // while ~17,000 tiles (2.2 GiB) stayed resident anyway -- the engine touched
+    // each again inside its second chance, so the cut freed nothing and cost
+    // ~2,900 protection faults/s. When the demand is nearly all second chances
+    // (few cold restores), the target may cover what is already resident, never
+    // more and never above the ceiling: no RAM is taken, only the churn stops.
+    if(softPerSec/8>=300 && coldPerSec<100 && residentMB>uint64_t(target) && residentMB<=uint64_t(ceiling))target=int(residentMB);
     if(target>ceiling)target=ceiling;
     if(wsFloor) {
         if(decodesPerSec>=300 && target>*wsFloor)*wsFloor=target;
@@ -441,6 +462,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             // Cold restores in the last second: faults minus the ones a
             // protection change alone satisfied.
             uint64_t decodes=s.faults-s.softRescues,decodesPerSec=decodes-lastDecodes;lastDecodes=decodes;
+            static uint64_t lastSoft=0;uint64_t softPerSec=s.softRescues-lastSoft;lastSoft=s.softRescues;
             TerrainPager::SetUrgent(commitTight||pressure);
             // THE THROTTLE IS FOR LOAD BURSTS (2026-09-22). It makes a fault that needs a
             // new section sleep, up to 2 s, while the pool is over budget -- the answer to
@@ -466,7 +488,7 @@ static DWORD WINAPI TerrainCompressionWorker(void*) {
             if(commitTight)next=TightBudgetMB(effectiveMB,s.resident*TerrainPager::SlotBytes,m.ullAvailPageFile,CommitTightBytes(physical),busy||bulk||loading);
             else if(!(busy||bulk||loading)) {
                 static int wsFloor=0;
-                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3,&wsFloor);
+                int steady=TerrainBudgetSteady(effectiveMB,next,g_terrainHotMB,decodesPerSec,available,physical,3,&wsFloor,softPerSec,(s.resident*TerrainPager::SlotBytes)>>20);
                 if(steady>effectiveMB && decodesPerSec>=300 && now-lastStutterLog>=10000) {
                     lastStutterLog=now;
                     H->log("terrain compression: %llu cold restores/s, resident target %d -> %d MiB (working set exceeds the budget)",decodesPerSec,effectiveMB,steady);
@@ -591,6 +613,7 @@ extern "C" __declspec(dllexport) unsigned BigmapTestUiStalls(const uint64_t* sta
     UiStallMeter m;for(int i=0;i<n;++i)m.Sample(stamps[i]);return m.Take();
 }
 extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteady(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical,unsigned share){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available,physical,share);}
+extern "C" __declspec(dllexport) int BigmapTestTerrainBudgetSteadySoft(int prev,int next,int hot,uint64_t decodesPerSec,uint64_t available,uint64_t physical,unsigned share,uint64_t softPerSec,uint64_t residentMB,int* wsFloor){return TerrainBudgetSteady(prev,next,hot,decodesPerSec,available,physical,share,wsFloor,softPerSec,residentMB);}
 extern "C" __declspec(dllexport) uint64_t BigmapTestPagerHeadroom(uint64_t physical){return PagerHeadroom(physical);}
 extern "C" __declspec(dllexport) uint64_t BigmapTestCommitTightBytes(uint64_t physical){return CommitTightBytes(physical);}
 extern "C" __declspec(dllexport) int BigmapTestTightBudgetMB(int effectiveMB,uint64_t residentBytes,uint64_t availPageFile,uint64_t threshold,int loading){return TightBudgetMB(effectiveMB,residentBytes,availPageFile,threshold,loading!=0);}
