@@ -644,6 +644,16 @@ New Game ratios can now extend through **1:20** with `max_ratio=20` (Steam).
 Both stock and added size rows are supported; map-edge and heightmap limits
 still apply. See [map-ratios.md](docs/map-ratios.md) for dimensions and validation.
 
+## Street fade fix (a separate mod)
+
+Streets whiten, or turn into coloured speckles under Vulkan on AMD, when the
+camera is far from the map centre -- on vanilla maps too: five material shaders
+fade an object by its distance to a bounding box that falls back to a point at
+the map centre. `mod\bigmap_fade_fix_1` measures the distance to the object
+instead. It is client-side shaders only, not part of the MSI: copy the folder
+into `%APPDATA%\Transport Fever 2\mods\`. Cause, measurements and how to
+regenerate it: [street-fade-fix.md](docs/street-fade-fix.md).
+
 ## Performance optimizations
 
 **Native Linux scope:** the tables below describe Windows switches, shipped
