@@ -127,6 +127,13 @@ if ($extList -notmatch "WixToolset\.UI\.wixext") {
     if ($LASTEXITCODE -ne 0) { Fail "wix extension add failed" }
 }
 
+# The street fade fix mod ships in the same package (mods\bigmap_fade_fix_1 of the
+# game folder); Package.wxs harvests every file of this folder.
+$fadeFixDir = Join-Path $Repo 'mod\bigmap_fade_fix_1'
+foreach ($f in @('mod.lua', 'strings.lua', 'res\shaders2\mat\vs\std\normal.vs')) {
+    if (-not (Test-Path (Join-Path $fadeFixDir $f))) { Fail "missing $f in $fadeFixDir -- the street fade fix mod ships in the MSI (tools\build_fade_fix_mod.py regenerates its shaders)" }
+}
+
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $wixArgs = @("build") + $eula + @(
     "-arch", "x64",
@@ -134,6 +141,7 @@ $wixArgs = @("build") + $eula + @(
     "-d", "ProductVersion=$Version",
     "-d", "BigmapDll=$bigmapDll",
     "-d", "BigmapCfg=$(Join-Path $Repo 'cfg\tpf2_bigmap.cfg')",
+    "-d", "FadeFixDir=$fadeFixDir",
     "-d", "ProxyDll=$proxyDll",
     "-d", "HostDll=$hostDll",
     "-d", "CaDll=$caDll",

@@ -14,6 +14,11 @@
     res\config\base_mod.lua              NOT installed: the plugin patches it at game start
                                          for the New Game density levels, and a full
                                          uninstall puts the stock file back
+    mods\bigmap_fade_fix_1\              the street fade fix shader mod (mod\bigmap_fade_fix_1
+                                         in the repository; docs\street-fade-fix.md). It
+                                         only appears in the game's mod list: enable it
+                                         there. Uninstall removes exactly these files and
+                                         leaves the rest of the game's mods folder alone.
 
   COEXISTENCE WITH TpF2 MULTIPLAYER
   Both packages need the alut.dll proxy and the plugin host, and both put
@@ -40,6 +45,7 @@
   <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
   <?ifndef BigmapDll ?><?define BigmapDll = "..\out\tpf2_bigmap.dll" ?><?endif?>
   <?ifndef BigmapCfg ?><?define BigmapCfg = "..\cfg\tpf2_bigmap.cfg" ?><?endif?>
+  <?ifndef FadeFixDir ?><?define FadeFixDir = "..\mod\bigmap_fade_fix_1" ?><?endif?>
 
   <Package Name="TpF2 Big Maps"
            Manufacturer="silver2127"
@@ -118,6 +124,12 @@
           <Directory Name="common">
             <Directory Id="INSTALLFOLDER" Name="Transport Fever 2">
               <Directory Id="PluginsFolder" Name="plugins" />
+              <!-- The game's own mods folder (it holds Urban Games' campaign
+                   missions): no component lives in it directly, so an uninstall
+                   never tries to remove it, only the mod's own subfolders. -->
+              <Directory Id="ModsFolder" Name="mods">
+                <Directory Id="FadeFixFolder" Name="bigmap_fade_fix_1" />
+              </Directory>
             </Directory>
           </Directory>
         </Directory>
@@ -133,6 +145,7 @@
            removed when the last of the two products is uninstalled. -->
       <ComponentGroupRef Id="PluginHostShared" />
       <ComponentGroupRef Id="BigmapFiles" />
+      <ComponentGroupRef Id="FadeFixFiles" />
     </Feature>
 
     <!-- Custom actions and their sequencing: PluginHost.wxs, plus the one below. -->
@@ -175,6 +188,14 @@
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Big Maps" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Big Maps" Name="Version" Type="string" Value="$(ProductVersion)" />
       </Component>
+    </ComponentGroup>
+
+    <!-- The street fade fix: mod.lua, strings.lua and the five shaders, harvested
+         from the repository's mod folder so a new file there ships with no edit
+         here (components get stable generated GUIDs). It installs into the game's
+         mods folder, where the game lists it; enabling it is the player's step. -->
+    <ComponentGroup Id="FadeFixFiles" Directory="FadeFixFolder">
+      <Files Include="$(FadeFixDir)\**" />
     </ComponentGroup>
   </Fragment>
 

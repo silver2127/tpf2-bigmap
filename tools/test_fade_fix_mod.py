@@ -5,8 +5,8 @@ Without a game install:
     longer holds the stock statement;
   * undoing the patch (the block back to the one stock line) leaves a shader
     whose only difference from itself is that statement, with balanced braces;
-  * mod.lua and strings.lua parse, and every string key mod.lua uses exists in
-    en and fr (under Lua, when `lupa` is installed).
+  * mod.lua and strings.lua load (with `lua` on PATH, or LUA=; skipped without
+    one), mod.lua's description key exists, and the 16 languages each hold it.
 With the game installed (TPF2_GAME, or C:\\Games\\Transport Fever 2, or the Steam
 default): the builder's output, regenerated into a temp folder, equals the
 committed shaders byte for byte, and the stock shaders are recovered exactly by
@@ -16,6 +16,8 @@ undoing the patch. Without it, those two checks are skipped, not failed.
 """
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -66,20 +68,29 @@ def main():
         assert text.count('calcDistToBox(u_view.viewInverse[3].xyz, instAttrBbox)') == 1, rel
     print('shaders: patched once each, undo restores the stock statement')
 
-    try:
-        import lupa
-    except ImportError:
-        print('lupa not installed: mod.lua / strings.lua not parsed (pip install lupa)')
+    lua_exe = os.environ.get('LUA') or shutil.which('lua')
+    if not lua_exe:
+        print('no Lua interpreter (lua on PATH, or LUA=): mod.lua / strings.lua not loaded')
     else:
-        lua = lupa.LuaRuntime(unpack_returned_tuples=True)
-        strings = lua.execute((MOD / 'strings.lua').read_text(encoding='utf-8') + '\nreturn data()')
-        lua.execute('function _(k) return k end')
-        info = lua.execute((MOD / 'mod.lua').read_text(encoding='utf-8') + '\nreturn data()')['info']
-        assert info['name'] == 'mod_name' and info['description'] == 'mod_desc'
-        for lang in ('en', 'fr'):
-            for key in ('mod_name', 'mod_desc'):
-                assert strings[lang][key], (lang, key)
-        print('mod.lua / strings.lua: parse, en and fr hold mod_name and mod_desc')
+        snippet = r'''
+function _(k) return k end
+dofile("%s")
+local info = data().info
+assert(info.name == "Big Maps: street fade fix", "mod name")
+assert(info.description == "mod_desc", "description key")
+dofile("%s")
+local langs, n = data(), 0
+for code, t in pairs(langs) do
+    n = n + 1
+    assert(type(t.mod_desc) == "string" and t.mod_desc ~= "", code .. " lacks mod_desc")
+end
+assert(langs.en and langs.fr, "en and fr")
+print(n)
+''' % ((MOD / 'mod.lua').as_posix(), (MOD / 'strings.lua').as_posix())
+        r = subprocess.run([lua_exe, '-e', snippet], capture_output=True, text=True, encoding='utf-8')
+        assert r.returncode == 0, r.stderr.strip()
+        assert int(r.stdout.strip()) == 16, f'expected 16 languages, got {r.stdout.strip()}'
+        print('mod.lua / strings.lua: load, and the 16 languages each hold mod_desc')
 
     game = game_dir()
     if not game:

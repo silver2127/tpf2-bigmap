@@ -50,8 +50,22 @@ nothing needed on other multiplayer peers.
 
 ## Install
 
-The MSI does not install it. Copy `mod\bigmap_fade_fix_1` into
-`%APPDATA%\Transport Fever 2\mods\` and enable it for the game.
+The Big Maps MSI (both the standard and the GOG package) installs it, with the
+plugin, into the game's own mods folder: `<game>\mods\bigmap_fade_fix_1\`
+(`mod.lua`, `strings.lua` and the five shaders). **Enabling it is still your
+step**: it appears as "Big Maps: street fade fix" in the game's mod list, and a
+mod is switched on per game, like any other. Uninstalling Big Maps removes
+exactly those files and leaves the rest of the mods folder (Urban Games' campaign
+missions live there) alone.
+
+Without the MSI, copy `mod\bigmap_fade_fix_1` into
+`%APPDATA%\Transport Fever 2\mods\` or into `<game>\mods\`. Do not keep both
+copies: the game would list the same mod twice.
+
+The mod's description is translated into 16 languages (`strings.lua`); apart from
+English and French they are machine-written and not reviewed by native speakers.
+The same mod is also published on its own, with its history, at
+<https://github.com/Kalemillion/tpf2-street-fade-fix>.
 
 ## Rebuilding the shaders
 
@@ -71,8 +85,8 @@ kept by hand. The shipped copies were generated from the GOG 2024-12-12 install.
 distance once and no longer the stock statement, that undoing the patch gives
 back the stock line, and (with a game install, `TPF2_GAME` or the default
 folders) that regenerating gives the committed files byte for byte and that undo
-recovers the installed shaders exactly. It parses `mod.lua` and `strings.lua`
-when `lupa` is installed.
+recovers the installed shaders exactly. It loads `mod.lua` and `strings.lua`
+with a Lua interpreter (`lua` on PATH, or `LUA=`) and checks the 16 languages.
 
 ## Verification
 

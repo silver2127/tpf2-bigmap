@@ -524,6 +524,7 @@ asks you to confirm it, and puts these in place (besides the multiplayer files):
 | `tpf2_pluginhost.dll` | the plugin host the proxy loads |
 | `plugins\tpf2_bigmap.dll` | this plugin |
 | `plugins\tpf2_bigmap.cfg` | its settings — the size ladder, `octree`, `street_raster`. Replaced on install, upgrade and repair with the release settings |
+| `mods\bigmap_fade_fix_1\` | the [street fade fix](docs/street-fade-fix.md), a shader mod: it appears in the game's mod list as "Big Maps: street fade fix"; enable it there. Uninstall removes only these files |
 
 At game start the plugin also adds the density levels to the game's own
 `res\config\base_mod.lua`, keeping the stock file beside it as
@@ -644,15 +645,16 @@ New Game ratios can now extend through **1:20** with `max_ratio=20` (Steam).
 Both stock and added size rows are supported; map-edge and heightmap limits
 still apply. See [map-ratios.md](docs/map-ratios.md) for dimensions and validation.
 
-## Street fade fix (a separate mod)
+## Street fade fix (installed with Big Maps)
 
 Streets whiten, or turn into coloured speckles under Vulkan on AMD, when the
 camera is far from the map centre -- on vanilla maps too: five material shaders
 fade an object by its distance to a bounding box that falls back to a point at
 the map centre. `mod\bigmap_fade_fix_1` measures the distance to the object
-instead. It is client-side shaders only, not part of the MSI: copy the folder
-into `%APPDATA%\Transport Fever 2\mods\`. Cause, measurements and how to
-regenerate it: [street-fade-fix.md](docs/street-fade-fix.md).
+instead. It is client-side shaders only. The MSI installs it with the plugin into
+`<game>\mods\bigmap_fade_fix_1`; it then shows in the game's mod list as "Big Maps:
+street fade fix", and enabling it there is the one step left. Cause, measurements
+and how to regenerate it: [street-fade-fix.md](docs/street-fade-fix.md).
 
 ## Performance optimizations
 
